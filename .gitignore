@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+# 注：Cargo.lock 选择提交（应用项目，保证可复现构建），故不忽略
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 前端 / Tauri（M2 后生效）
+node_modules/
+dist/
+
+# 本地环境与日志
+.env
+*.log

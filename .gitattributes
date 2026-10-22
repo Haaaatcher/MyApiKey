@@ -1,0 +1,8 @@
+# 统一换行符：仓库内一律 LF，跨平台协作避免 CRLF 噪音
+* text=auto eol=lf
+
+# 二进制文件
+*.png binary
+*.ico binary
+*.exe binary
+*.msi binary
