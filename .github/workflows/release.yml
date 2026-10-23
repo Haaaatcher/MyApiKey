@@ -1,0 +1,109 @@
+# 三平台发布流水线（M3 提前落地）。
+#
+# 触发方式：
+# - 推送 v* 标签：构建三平台二进制并创建 GitHub Release；
+# - 手动触发（workflow_dispatch）：只构建并上传 artifact（不打 Release）。
+#
+# 产物：每个目标平台一个压缩包，内含 mak 与 myapikey 两个等价二进制。
+# macOS 提供 aarch64（Apple Silicon）与 x86_64 两个包。
+#
+# 已知限制（如实记录）：未购买 Apple 开发者账号，产物未签名/公证，
+# 浏览器下载的文件带隔离属性，首次运行需 `xattr -d com.apple.quarantine <文件>`；
+# 用 curl 下载则无此问题（README 指引用 curl）。
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux 的 keyring 后端（Secret Service）编译期依赖 dbus
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (release)
+        run: cargo build --release -p myapikey-cli --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          name="myapikey-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}"
+          mkdir -p "pkg/$name"
+          cp "target/${{ matrix.target }}/release/mak" "pkg/$name/"
+          cp "target/${{ matrix.target }}/release/myapikey" "pkg/$name/"
+          tar -czf "pkg/$name.tar.gz" -C pkg "$name"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          $name = "myapikey-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "pkg/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mak.exe" "pkg/$name/"
+          Copy-Item "target/${{ matrix.target }}/release/myapikey.exe" "pkg/$name/"
+          Compress-Archive -Path "pkg/$name" -DestinationPath "pkg/$name.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: myapikey-${{ matrix.target }}
+          path: pkg/*.tar.gz
+          if-no-files-found: ignore
+      - name: Upload artifact (zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: myapikey-${{ matrix.target }}-zip
+          path: pkg/*.zip
+          if-no-files-found: ignore
+
+  # 仅打标签时创建 Release 并挂上全部产物
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: false
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip

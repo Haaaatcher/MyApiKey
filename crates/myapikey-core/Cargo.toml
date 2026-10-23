@@ -1,0 +1,24 @@
+[package]
+name = "myapikey-core"
+description = "MyApiKey 核心逻辑库：数据模型、vault 加解密、git 同步、key 校验"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+argon2.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+dirs.workspace = true
+fd-lock.workspace = true
+keyring.workspace = true
+toml.workspace = true
+reqwest.workspace = true

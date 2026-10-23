@@ -40,10 +40,11 @@ MyApiKey 是一个跨平台（Linux / Windows / macOS）的 AI API 凭证记录�
 | D6 | 冲突策略：按 `updated_at` last-write-wins | 数据量小，简单够用 |
 | D7 | 架构：Rust workspace，core 纯逻辑库 + cli 二进制 + Tauri 2 GUI 二进制 | 一套逻辑两种形态；产物小、无运行时依赖 |
 | D8 | git 操作先直接 shell 调系统 `git` | 目标用户必有 git，行为与预期一致；后续可换 gitoxide |
-| D9 | 主密码输入一次即记住（CLI/GUI 一致），存 OS 凭据库；密码验证失败或用户修改时自动失效 | 体验优先；凭据库是本机唯一落点，可随时清除（§9.1） |
+| D9 | 主密码输入一次即记住（CLI/GUI 一致），存 OS 凭据库，**默认 7 天有效（`remember_days` 可配，0=禁用）**；每次输入续期；密码验证失败自动失效；`forget` = 立即锁定 | 体验优先（至多每周输一次）；到期时间存配置目录 `remember.json`（仅时间戳）；2026-10-24 由永久记住改为 TTL |
 | D10 | vault 格式自研（Argon2id + AES-256-GCM + 版本/AAD 头） | 30 行格式换完全可控的演进与防降级 |
 | D11 | 命令同时提供长名 `myapikey` 与短名 `mak` | 同一实现，两个 bin 入口 |
 | D12 | GUI 首发只做 Windows；Linux/macOS 暂时 CLI-only | 集中火力；Tauri 代码保持跨平台，后续可补齐 |
+| D13 | GitHub 一键初始化：`mak init --github [仓库名]`，OAuth Device Flow（RFC 8628）鉴权后自动创建/识别私有仓库；token 存 OS 凭据库（account=github），经环境变量注入 git Authorization 头（不进命令行/不落盘）；`mak forget --github` 可清除 | 免去用户手动建仓库+复制 URL；browser 授权一次即可；scope 仅 `repo`（GitHub 模型限制，无法按单仓库收窄，需文档明示） |
 
 ---
 

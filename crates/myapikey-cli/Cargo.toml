@@ -1,0 +1,30 @@
+[package]
+name = "myapikey-cli"
+description = "MyApiKey 终端前端（同时产出 myapikey 与 mak 两个二进制）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "myapikey_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "myapikey"
+path = "src/main.rs"
+
+[[bin]]
+name = "mak"
+path = "src/bin/mak.rs"
+
+[dependencies]
+myapikey-core.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+arboard.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

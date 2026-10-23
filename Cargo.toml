@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/myapikey-core", "crates/myapikey-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+authors = ["Hang Luo (Haaaatcher)"]
+repository = "https://github.com/Haaaatcher/MyApiKey"
+
+[workspace.dependencies]
+# core 依赖
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+argon2 = "0.5"
+aes-gcm = "0.10"
+rand = "0.8"
+zeroize = "1"
+dirs = "6"
+fd-lock = "4"
+keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+
+# cli 依赖
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+arboard = "3"
+
+# 内部 crate 互相引用
+myapikey-core = { path = "crates/myapikey-core" }
+
+[profile.release]
+lto = "thin"
+strip = true
