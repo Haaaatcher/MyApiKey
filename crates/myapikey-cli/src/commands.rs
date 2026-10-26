@@ -65,7 +65,7 @@ fn save_and_report(c: &Ctx, passphrase: &str, data: &VaultData) -> Result<()> {
 fn report_push(out: &SyncOutcome) {
     if let Some(err) = &out.push_error {
         println!("⚠ Saved locally, but push failed: {err}");
-        println!("  The remote usually has new changes — run `mak sync` to merge and push.");
+        println!("  The remote usually has new changes.\n  Run `mak sync` to merge and push.");
     } else if out.pushed {
         println!("✓ Pushed to remote");
     }
@@ -84,6 +84,19 @@ fn report_push(out: &SyncOutcome) {
 pub fn init(remote: Option<&str>, github: Option<&str>) -> Result<()> {
     let mut c = ctx()?;
     if c.dirs.is_initialized() {
+        // 已初始化 + --github：授权刷新路径（token 失效自愈）。不动 vault，
+        // 只重走鉴权并把 remote 重新指向同步仓库。
+        if let Some(name) = github {
+            let (url, token) = github_setup(name)?;
+            c.store = c
+                .store
+                .clone()
+                .with_auth(myapikey_core::github::GitAuth::github_token(&token));
+            c.store.set_remote(&url)?;
+            println!("✓ GitHub authorization ready, remote re-bound: {url}");
+            println!("  Run `mak sync` to sync now.");
+            return Ok(());
+        }
         return Err(Error::Usage(
             "already initialized on this machine; to reset, delete the config directory manually"
                 .into(),
@@ -93,7 +106,7 @@ pub fn init(remote: Option<&str>, github: Option<&str>) -> Result<()> {
     // 环境变量提供了主密码则跳过交互（脚本化初始化/CI 场景）
     let passphrase = match std::env::var(prompt::PASSPHRASE_ENV) {
         Ok(p) if !p.is_empty() => {
-            println!("(using the passphrase from {})", prompt::PASSPHRASE_ENV);
+            println!("Using the passphrase from {}.", prompt::PASSPHRASE_ENV);
             p
         }
         _ => new_passphrase()?,
@@ -155,23 +168,29 @@ pub fn init(remote: Option<&str>, github: Option<&str>) -> Result<()> {
         match keychain::set_ttl(&c.dirs, &passphrase, days) {
             Ok(()) => {}
             Err(e) => {
-                eprintln!("⚠ Cannot remember the passphrase ({e}); it will be asked every time.")
+                eprintln!("⚠ Cannot remember the passphrase: {e}\n  It will be asked every time.")
             }
         }
     }
 
-    println!("\n✓ Initialized — {record_count} record(s)");
+    println!(
+        "✓ Initialized with {}.",
+        plural(record_count as u32, "record")
+    );
     if joined_existing {
         println!("  Joined an existing vault; run `mak sync` to get the latest.");
     }
     if days > 0 {
-        println!("  Passphrase remembered for {days} day(s) — lock any time with `mak forget`.");
+        println!(
+            "  Passphrase remembered for {}.\n  Lock any time with `mak forget`.",
+            plural(days, "day")
+        );
     } else {
         println!("  Passphrase remembering is disabled (remember_days = 0).");
     }
     println!("  Repository: {}", c.dirs.repo_dir.display());
     if remote.is_none() {
-        println!("  No remote yet — for multi-device sync run: mak remote set <url>");
+        println!("  No remote yet.\n  For multi-device sync run: mak remote set <url>");
     }
     Ok(())
 }
@@ -182,8 +201,9 @@ fn join_existing(c: &Ctx, url: &str, passphrase: &str) -> Result<usize> {
     let bytes = std::fs::read(&c.dirs.vault_path)?;
     let data = vault::decrypt(&bytes, passphrase).map_err(|_| {
         Error::Usage(
-            "远端 vault 无法用输入的主密码解密。所有设备必须使用同一个主密码；\
-             若这是你的首次部署，请确认仓库地址是一个 MyApiKey 同步仓库"
+            "cannot decrypt the remote vault with the given passphrase. All devices \
+             must share one master passphrase. Make sure the URL points to a MyApiKey \
+             sync repository"
                 .into(),
         )
     })?;
@@ -198,10 +218,11 @@ fn github_setup(repo_name: &str) -> Result<(String, String)> {
     use myapikey_core::github;
     let client_id = github::effective_client_id()?;
 
-    // token：优先复用凭据库里已存的（每台设备只在第一次走浏览器授权）
-    let token = match github::keychain_token()? {
+    // token：优先复用凭据库里**确认仍有效**的（失效条目会被顺手清除并重新授权——
+    // 授权被撤销/过期是同步报 "Repository not found" 的最常见原因）
+    let token = match github::valid_keychain_token()? {
         Some(t) => {
-            println!("(using the saved GitHub authorization)");
+            println!("Using the saved GitHub authorization.");
             t
         }
         None => {
@@ -210,12 +231,12 @@ fn github_setup(repo_name: &str) -> Result<(String, String)> {
             println!("  1. Open: {}", dc.verification_uri);
             println!("  2. Enter this code: {}", dc.user_code);
             if github::open_browser(&dc.verification_uri).is_err() {
-                println!("  (could not open a browser automatically — copy the link above)");
+                println!("  Could not open a browser automatically. Copy the link above.");
             }
             println!("Waiting for authorization… this continues automatically.");
             let t = github::poll_device_token(&dc, &client_id)?;
             github::keychain_set_token(&t)?;
-            println!("✓ Authorized — token saved to the credential store (clear with `mak forget --github`)");
+            println!("✓ Authorized. Token saved to the credential store.\n  Clear it with `mak forget --github`.");
             t
         }
     };
@@ -229,6 +250,52 @@ fn github_setup(repo_name: &str) -> Result<(String, String)> {
 // ---------------------------------------------------------------------------
 // add
 // ---------------------------------------------------------------------------
+
+/// 解析 add 的三个字段。顺序即交互顺序：**协议三选一菜单第一步**
+/// （上下键，选 Custom label 才追问标签，2026-10-25 主人定稿），
+/// 之后名称、Base URL 必填。命令行给过的项始终优先直填。
+fn resolve_add_fields(
+    name: Option<String>,
+    protocol: Option<String>,
+    base_url: Option<String>,
+) -> Result<(String, myapikey_core::model::Protocol, String)> {
+    let all_given = [&name, &protocol, &base_url]
+        .iter()
+        .all(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()));
+    if all_given {
+        return Ok((
+            name.unwrap().trim().to_string(),
+            prompt::parse_protocol(&protocol.unwrap()),
+            base_url.unwrap().trim().to_string(),
+        ));
+    }
+    // 顺序即交互顺序：协议三选一菜单第一步（选 Custom 才追问标签），
+    // 之后名称、Base URL 必填；命令行给过的项始终优先直填
+    let protocol = match protocol {
+        Some(p) if !p.trim().is_empty() => prompt::parse_protocol(&p),
+        _ => prompt::select_protocol(None)?,
+    };
+    let name = match name {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => prompt::prompt_required("Record name (e.g. OpenAI primary)")?,
+    };
+    let base_url = match base_url {
+        Some(b) if !b.trim().is_empty() => {
+            let b = b.trim().to_string();
+            // 命令行参数直填：非法仍直接报错退出（脚本场景，无交互可回）
+            if !myapikey_core::store::is_valid_http_url(&b) {
+                return Err(Error::Usage(
+                    "invalid base URL: must start with http:// or https:// followed by a host"
+                        .into(),
+                ));
+            }
+            b
+        }
+        // 交互输入：校验失败原地重问，不丢已填内容（2026-10-26 反馈）
+        _ => prompt::prompt_http_url("Base URL (stored as-is, no normalization)")?,
+    };
+    Ok((name, protocol, base_url))
+}
 
 /// `add`：交互式添加记录。命令行给了的字段不再询问。
 pub fn add(
@@ -244,34 +311,12 @@ pub fn add(
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
     let mut data = load_vault(&c, &passphrase)?;
 
-    let name = match name {
-        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
-        _ => loop {
-            let n = prompt_line("Record name (e.g. OpenAI primary): ");
-            if !n.is_empty() {
-                break n;
-            }
-            println!("Name must not be empty.");
-        },
-    };
-    let protocol = match protocol {
-        Some(p) if !p.trim().is_empty() => prompt::parse_protocol(&p),
-        _ => prompt::select_protocol(None),
-    };
-    let base_url = match base_url {
-        Some(b) if !b.trim().is_empty() => b.trim().to_string(),
-        _ => loop {
-            let b = prompt_line("Base URL (stored as-is, no normalization): ");
-            if !b.is_empty() {
-                break b;
-            }
-            println!("Base URL must not be empty.");
-        },
-    };
+    let (name, protocol, base_url) = resolve_add_fields(name, protocol, base_url)?;
+
     let api_key = match api_key {
         Some(k) if !k.trim().is_empty() => k.trim().to_string(),
         _ => {
-            let k = prompt::prompt_hidden("API Key: ");
+            let k = prompt::prompt_hidden("API key");
             if k.is_empty() {
                 return Err(Error::Usage("API key must not be empty".into()));
             }
@@ -283,7 +328,7 @@ pub fn add(
     if let Some(n) = notes {
         record.notes = if n.is_empty() { None } else { Some(n) };
     } else {
-        let n = prompt_line("Notes (Enter to skip): ");
+        let n = prompt_line("Notes (optional, Enter to skip): ");
         record.notes = if n.is_empty() { None } else { Some(n) };
     }
 
@@ -305,19 +350,33 @@ pub fn add(
 // list / show / edit / delete
 // ---------------------------------------------------------------------------
 
-/// `list`：掩码表格。
-pub fn list() -> Result<()> {
+/// `list` / `search` 共用的表格输出：`list` = 无查询全量（按更新时间倒序），
+/// `search` = 模糊过滤并按相关度排序（core::search，与 GUI 搜索同一套
+/// 规则：协议不参与、URL 分词、短查询只做子串）。
+/// 2026-10-26 拆分为两个命令，语义各自独立；实现共享。
+pub fn list(query: Option<&str>) -> Result<()> {
     let c = ctx()?;
     require_init(&c)?;
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
     let data = load_vault(&c, &passphrase)?;
     let cache = check_cache::CheckCache::load(&c.dirs);
 
-    let mut rows: Vec<&Record> = data.alive_records().collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+    let all: Vec<&Record> = data.alive_records().collect();
+    let query = query.unwrap_or("").trim();
+    let rows: Vec<&Record> = if query.is_empty() {
+        let mut r = all;
+        r.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+        r
+    } else {
+        myapikey_core::search::search(all, query)
+    };
 
     if rows.is_empty() {
-        println!("No records yet — add the first one with `mak add`.");
+        if query.is_empty() {
+            println!("No records yet. Add the first one with `mak add`.");
+        } else {
+            println!("No records match your search.");
+        }
         return Ok(());
     }
 
@@ -327,8 +386,8 @@ pub fn list() -> Result<()> {
         table::pad_to("#", 4),
         table::pad_to("Name", 18),
         table::pad_to("Protocol", 12),
-        table::pad_to("BASE URL", 34),
-        table::pad_to("KEY", 20),
+        table::pad_to("Base URL", 34),
+        table::pad_to("Key", 20),
         table::pad_to("Check", 10),
     );
     println!("{}", "-".repeat(104));
@@ -338,16 +397,23 @@ pub fn list() -> Result<()> {
             "{} {} {} {} {} {}",
             table::pad_to(&(i + 1).to_string(), 4),
             table::pad_to(&table::truncate_width(&r.name, 18), 18),
-            table::pad_to(&table::truncate_width(&r.protocol.to_string(), 12), 12),
+            table::pad_to(&table::truncate_width(&r.protocol.display_label(), 12), 12),
             table::pad_to(&table::truncate_width(&r.base_url, 34), 34),
             table::pad_to(&r.masked_key(), 20),
             table::pad_to(check, 10),
         );
     }
     println!("{}", "-".repeat(104));
+    // 序号定位（#index）只对 `mak list` 的顺序有效；search 按相关度排序，
+    // 行首序号是显示行号——提示用户用名称或 id 定位，避免对错记录操作
+    let locator_hint = if query.is_empty() {
+        "<name|#index|id>"
+    } else {
+        "<name|id>"
+    };
     println!(
-        "{} record(s) — `mak show <name|#index|id>` for full details",
-        rows.len()
+        "{}. Use `mak show {locator_hint}` for full details",
+        plural(rows.len() as u32, "record")
     );
     Ok(())
 }
@@ -385,7 +451,7 @@ pub fn show(target: &str, copy: bool) -> Result<()> {
         .ok_or_else(|| Error::NotFound(target.into()))?;
 
     println!("Name       : {}", r.name);
-    println!("Protocol   : {}", r.protocol);
+    println!("Protocol   : {}", r.protocol.display_label());
     println!("Base URL   : {}", r.base_url);
     // 安全红线（AGENTS.md）：完整 key 永远不出现在终端输出中——
     // 终端会留在滚动缓冲/录屏/截图里；明文只进剪贴板（--copy）或显式导出文件
@@ -415,11 +481,11 @@ pub fn show(target: &str, copy: bool) -> Result<()> {
 fn copy_to_clipboard(text: &str) -> Result<()> {
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string())) {
         Ok(()) => {
-            println!("✓ API key copied to the clipboard\n  (the CLI cannot auto-clear it — clear the clipboard history after pasting)");
+            println!("✓ API key copied to the clipboard.\n  The CLI cannot auto-clear it. Clear the clipboard history after pasting.");
             Ok(())
         }
         Err(e) => {
-            println!("⚠ Clipboard copy failed ({e}) — copy the API key above manually.");
+            println!("⚠ Clipboard copy failed: {e}\n  Try again, or use `mak export` (asks twice) to write it to a file.");
             Ok(())
         }
     }
@@ -436,30 +502,35 @@ pub fn edit(target: &str) -> Result<()> {
     let record = &mut data.records[idx];
 
     println!(
-        "Editing \"{}\" — press Enter to keep each current value.",
+        "Editing \"{}\". Press Enter to keep each current value.",
         record.name
     );
-    let name = prompt_line(&format!("Name [{}]: ", record.name));
-    if !name.is_empty() {
-        record.name = name;
+    // 各字段带当前值作默认（回车即保留）；key 是敏感值不显示默认，
+    // 空输入 = 保留；备注输入 “-” 表示清空
+    record.name = prompt::prompt_default("Name", &record.name);
+    // edit 的 URL 输入：回车 = 保留原值（原值当初已过校验）；新值非法原地重问
+    loop {
+        let raw = prompt::prompt_line(&format!("Base URL [{}]: ", record.base_url));
+        if raw.is_empty() {
+            break; // 保留原值
+        }
+        if myapikey_core::store::is_valid_http_url(&raw) {
+            record.base_url = raw;
+            break;
+        }
+        println!("Must start with http:// or https:// followed by a host; try again.");
     }
-    let url = prompt_line(&format!("Base URL [{}]: ", record.base_url));
-    if !url.is_empty() {
-        record.base_url = url;
-    }
-    let key = prompt::prompt_hidden("API key (Enter keeps current): ");
+    let key = prompt::prompt_hidden("API key (Enter keeps current)");
     if !key.is_empty() {
         record.api_key = key;
     }
     let notes_cur = record.notes.clone().unwrap_or_default();
-    let notes = prompt_line(&format!("Notes [{notes_cur}]: "));
-    // 输入 “-” 表示清空备注
-    if notes == "-" {
-        record.notes = None;
-    } else if !notes.is_empty() {
-        record.notes = Some(notes);
-    }
-    record.protocol = prompt::select_protocol(Some(&record.protocol));
+    let notes = prompt::prompt_default("Notes, - clears", &notes_cur);
+    record.notes = match notes.as_str() {
+        "-" | "" => None,
+        n => Some(n.to_string()),
+    };
+    record.protocol = prompt::select_protocol(Some(&record.protocol))?;
 
     record.updated_at = chrono::Utc::now();
     let id = record.id;
@@ -479,7 +550,10 @@ pub fn delete(target: &str) -> Result<()> {
     let idx = resolve_target(&data, target)?;
     let name = data.records[idx].name.clone();
 
-    if !confirm(&format!("Delete \"{name}\"? (recoverable via sync history within the grace period, then purged)"), false) {
+    if !confirm(
+        &format!("Delete \"{name}\"? (recoverable within the grace period, then purged)"),
+        false,
+    ) {
         println!("Cancelled.");
         return Ok(());
     }
@@ -528,6 +602,12 @@ pub fn check(target: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// 数量 + 单词的英文复数（1 record / 3 records）。用户可见输出禁止
+/// record(s) 这种括号缩写（AGENTS.md 提示词规则，2026-10-25）。
+fn plural(n: u32, word: &str) -> String {
+    format!("{n} {word}{s}", s = if n == 1 { "" } else { "s" })
+}
+
 /// 对单条记录探测并落缓存（add/edit 后自动调用）。
 fn run_probe(c: &Ctx, data: &VaultData, id: &uuid::Uuid) {
     let Some(r) = data.records.iter().find(|r| r.id == *id) else {
@@ -561,12 +641,12 @@ pub fn sync() -> Result<()> {
 
     match (&out.remote, out.pulled, out.pushed) {
         (None, _, _) => println!(
-            "Standalone mode (no remote) — nothing to sync.\n  Bind one with: mak remote set <url>"
+            "Standalone mode, no remote. Nothing to sync.\n  Bind one with: mak remote set <url>"
         ),
         (_, true, true) => println!(
             "✓ Synced: pulled remote changes{} and pushed",
             if out.merged {
-                " (merged divergent edits)"
+                ", merged divergent edits"
             } else {
                 ""
             }
@@ -578,7 +658,7 @@ pub fn sync() -> Result<()> {
     if let Some(err) = &out.push_error {
         println!("⚠ Push failed: {err}");
     }
-    println!("{} active record(s)", out.alive_records);
+    println!("{}", plural(out.alive_records as u32, "active record"));
 
     // 更新“上次同步时间”
     let mut cfg = c.config.clone();
@@ -591,7 +671,7 @@ pub fn sync() -> Result<()> {
 pub fn status() -> Result<()> {
     let c = ctx()?;
     if !c.dirs.is_initialized() {
-        println!("Not initialized — start with: mak init");
+        println!("Not initialized. Start with: mak init");
         return Ok(());
     }
     let info = sync::status_summary(&c.store)?;
@@ -601,8 +681,8 @@ pub fn status() -> Result<()> {
         Some(u) => println!("Remote     : {u}"),
         None => println!("Remote     : none (standalone mode)"),
     }
-    println!("Unpushed   : {} commit(s)", info.ahead);
-    println!("To pull    : {} commit(s)", info.behind);
+    println!("Unpushed   : {}", plural(info.ahead as u32, "commit"));
+    println!("To pull    : {}", plural(info.behind as u32, "commit"));
     println!(
         "Last sync  : {}",
         c.config.last_sync_at.as_deref().unwrap_or("never")
@@ -625,7 +705,7 @@ pub fn status() -> Result<()> {
             }
         }
     } else {
-        println!("Records    : hidden (passphrase not remembered; run `mak sync` to see)");
+        println!("Records    : hidden (passphrase not remembered; unlock via any command to see)");
     }
     Ok(())
 }
@@ -642,7 +722,7 @@ pub fn remote(action: RemoteAction) -> Result<()> {
         }
         RemoteAction::Show => match c.store.remote_url()? {
             Some(u) => println!("{u}"),
-            None => println!("(no remote bound)"),
+            None => println!("no remote bound"),
         },
     }
     Ok(())
@@ -666,7 +746,7 @@ pub fn passwd() -> Result<()> {
     // 凭据库同步：统一按 TTL 模型记住新密码（remember_days = 0 时跳过）
     let remembered = c.config.remember_days > 0
         && keychain::set_ttl(&c.dirs, &new, c.config.remember_days).is_ok();
-    println!("✓ Master passphrase changed — vault re-encrypted and saved");
+    println!("✓ Master passphrase changed. Vault re-encrypted and saved");
     if remembered {
         println!("  Credential store updated.");
     }
@@ -681,16 +761,16 @@ pub fn passwd() -> Result<()> {
 pub fn forget(github: bool) -> Result<()> {
     if github {
         match myapikey_core::github::keychain_delete_token()? {
-            true => println!(
-                "✓ GitHub authorization cleared — git now uses your local git credentials."
-            ),
+            true => {
+                println!("✓ GitHub authorization cleared. Git now uses your local git credentials.")
+            }
             false => println!("No saved GitHub authorization on this machine."),
         }
         return Ok(());
     }
     let c = ctx()?;
     match keychain::delete(&c.dirs)? {
-        true => println!("✓ Locked — the passphrase was cleared from this machine.\n  The next command asks for it once, then remembers it again."),
+        true => println!("✓ Locked. The passphrase was cleared from this machine.\n  The next command asks for it once, then remembers it again."),
         false => println!("No remembered passphrase on this machine."),
     }
     Ok(())
@@ -700,8 +780,33 @@ pub fn forget(github: bool) -> Result<()> {
 // export / import
 // ---------------------------------------------------------------------------
 
+/// 在目录下生成不冲突的导出文件名：myapikey-export.json，已存在则
+/// myapikey-export-2.json、-3 递增——绝不覆盖用户已有的导出。
+fn unique_export_path(dir: &Path) -> std::path::PathBuf {
+    let base = dir.join("myapikey-export.json");
+    if !base.exists() {
+        return base;
+    }
+    for i in 2u32.. {
+        let p = dir.join(format!("myapikey-export-{i}.json"));
+        if !p.exists() {
+            return p;
+        }
+    }
+    unreachable!("序号递增必然找到空位")
+}
+
 /// `export`：明文导出（两次确认 + 0600 权限）。
 pub fn export(path: &Path) -> Result<()> {
+    // 目标是目录：自动生成不冲突的文件名并告知（2026-10-26 主人决议：
+    // 不报错、不覆盖已有文件——已存在时递增序号）
+    let out_path = if path.is_dir() {
+        let p = unique_export_path(path);
+        println!("Output path is a directory; exporting to: {}", p.display());
+        p
+    } else {
+        path.to_path_buf()
+    };
     let c = ctx()?;
     require_init(&c)?;
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
@@ -714,11 +819,11 @@ pub fn export(path: &Path) -> Result<()> {
     }
 
     println!(
-        "⚠ About to write {} record(s) with PLAINTEXT API keys to:",
-        alive.len()
+        "⚠ About to write {} with PLAINTEXT API keys to:",
+        plural(alive.len() as u32, "record")
     );
-    println!("  {}", path.display());
-    println!("  A plaintext file is a leak risk — delete it as soon as you are done.");
+    println!("  {}", out_path.display());
+    println!("  A plaintext file is a leak risk. Delete it as soon as you are done.");
     if !confirm("Export plaintext?", false)
         || !confirm("Really continue despite the leak risk?", false)
     {
@@ -728,11 +833,11 @@ pub fn export(path: &Path) -> Result<()> {
 
     let json = serde_json::to_vec_pretty(&alive)
         .map_err(|e| Error::Serde(format!("export serialization failed: {e}")))?;
-    std::fs::write(path, &json)?;
-    restrict_permissions(path);
+    std::fs::write(&out_path, &json)?;
+    restrict_permissions(&out_path);
     println!(
-        "✓ Exported to {}\n  Contains plaintext keys — delete it when done",
-        path.display()
+        "✓ Exported to {}.\n  Contains plaintext keys. Delete it when done",
+        out_path.display()
     );
     Ok(())
 }
@@ -793,7 +898,7 @@ pub fn import(path: &Path) -> Result<()> {
         }
     }
     save_and_report(&c, &passphrase, &data)?;
-    println!("✓ Import done — added {added}, updated {updated} (newer updated_at wins)");
+    println!("✓ Import done. Added {added}, updated {updated}. Newer updated_at wins.");
     Ok(())
 }
 
@@ -801,3 +906,71 @@ pub fn import(path: &Path) -> Result<()> {
 // 小工具
 // ---------------------------------------------------------------------------
 // 表格对齐与截断统一在 table 模块（按显示宽度，中文占 2 列）。
+
+// ---------------------------------------------------------------------------
+// 版本（D16：CLI 不自替换，只提示新版本 + 下载指引）
+// ---------------------------------------------------------------------------
+
+/// `version`：只打印当前版本，不联网（2026-10-26 拆分：联网检查归 update）。
+pub fn version() -> Result<()> {
+    println!("myapikey {}", env!("CARGO_PKG_VERSION"));
+    Ok(())
+}
+
+/// `update`：联网查最新 Release 并提示升级命令。
+/// 网络失败/无 Release 都不报错——检查只是增强，不该让命令失败。
+pub fn update() -> Result<()> {
+    match myapikey_core::github::latest_release_tag() {
+        Ok(Some(tag)) => {
+            let latest = tag.trim_start_matches('v');
+            let current = env!("CARGO_PKG_VERSION");
+            if is_newer(latest, current) {
+                // 目前唯一实际可用的更新通道是 cargo（2026-10-26 主人确认：
+                // Release 二进制分发尚未启用）。--tag 锁定与提示一致的版本，
+                // 避免装到 main 分支未发布的代码
+                println!("New version {latest} is available.");
+                println!("  Upgrade: cargo install --git https://github.com/Haaaatcher/MyApiKey --tag {tag} myapikey-cli");
+            } else {
+                println!("Up to date.");
+            }
+        }
+        Ok(None) => println!("No releases published yet."),
+        Err(e) => println!("Could not check for updates: {e}"),
+    }
+    Ok(())
+}
+
+/// 语义化版本比较：`candidate` 是否严格新于 `current`。
+/// 逐段数字比较，段数不足按 0 补（0.2 > 0.1.9；0.1.0 == 0.1）。
+/// 解析失败的段按 0 处理（宁可漏报，不误报新版本）。
+fn is_newer(candidate: &str, current: &str) -> bool {
+    fn seg(v: &str) -> std::iter::Map<std::str::Split<'_, char>, fn(&str) -> u64> {
+        v.split('.').map(|p| p.parse::<u64>().unwrap_or(0))
+    }
+    let c = seg(candidate);
+    let cur = seg(current);
+    // 逐段比较，第一个不相等的段决定结果（semver 语义：高位相同才看低位）
+    c.zip(cur.chain(std::iter::repeat(0)))
+        .find(|(a, b)| a != b)
+        .is_some_and(|(a, b)| a > b)
+}
+
+#[cfg(test)]
+mod tests {
+    //! 版本比较回归（D16）：提示新版本的前提是比较不误报。
+    use super::is_newer;
+
+    #[test]
+    fn semver_compare() {
+        assert!(is_newer("0.2.0", "0.1.9"));
+        assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(is_newer("0.1.10", "0.1.9"));
+        // 段数不足按 0 补
+        assert!(is_newer("0.2", "0.1.9"));
+        assert!(!is_newer("0.1", "0.1.0"));
+        assert!(!is_newer("0.1.0", "0.1.0"));
+        assert!(!is_newer("0.0.9", "0.1.0"));
+        // 非数字段按 0：不误报
+        assert!(!is_newer("x.y", "0.0.0"));
+    }
+}

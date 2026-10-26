@@ -22,9 +22,15 @@ path = "src/bin/mak.rs"
 [dependencies]
 myapikey-core.workspace = true
 clap.workspace = true
-rpassword.workspace = true
 arboard.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+dialoguer = "0.12.0"
+
+[features]
+default = ["secret-service"]
+# 透传 myapikey-core 的 secret-service 后端开关，让
+# `cargo install --no-default-features myapikey-cli` 在无头 Linux 上可用。
+secret-service = ["myapikey-core/secret-service"]

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[command(
     name = "myapikey",
     version,
-    about = "Record and sync AI API credentials (base_url + api_key) — encrypted, git-backed, multi-device",
+    about = "Record and sync AI API credentials. Encrypted, git-backed, multi-device",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -31,13 +31,13 @@ pub enum Command {
         /// 远端仓库地址（也可以之后再 `remote set`）。
         #[arg(
             long,
-            help = "Remote repository URL (or bind it later via `remote set`)"
+            help = "Remote repository URL. You can also bind it later via `remote set`"
         )]
         remote: Option<String>,
         /// GitHub 一键模式。
         #[arg(
             long,
-            help = "One-click GitHub mode: authorize in a browser, then auto-create/reuse a private sync repo (optional value = repo name, default myapikey-vault)",
+            help = "One-click GitHub mode: authorize in a browser, then auto-create/reuse a private sync repo. Optional value is the repo name, default myapikey-vault",
             num_args = 0..=1,
             default_missing_value = "myapikey-vault"
         )]
@@ -45,7 +45,7 @@ pub enum Command {
     },
 
     /// 交互式添加一条记录（缺省的参数会逐项询问）。
-    #[command(about = "Add a record interactively (omitted fields are prompted)")]
+    #[command(about = "Add a record interactively. Omitted fields are prompted")]
     Add {
         /// 记录名称。
         #[arg(short, long, help = "Record name")]
@@ -64,25 +64,41 @@ pub enum Command {
         #[arg(
             short = 'k',
             long,
-            help = "API key (hidden input if omitted — recommended)"
+            help = "API key. Hidden input if omitted, recommended"
         )]
         api_key: Option<String>,
         /// 备注。
-        #[arg(long, help = "Notes (optional)")]
+        #[arg(long, help = "Notes, optional")]
         notes: Option<String>,
     },
 
+    /// 只显示当前版本（不联网）。
+    #[command(about = "Show the current version")]
+    Version,
+
+    /// 联网检查新 Release 并提示升级命令。
+    #[command(about = "Check for a newer release and print the upgrade command")]
+    Update,
+
     /// 列出全部记录（key 掩码显示）。
-    #[command(about = "List all records (keys are masked)")]
+    #[command(about = "List all records. Keys are masked")]
     List,
+
+    /// 模糊搜索记录（名称 / Base URL / 备注）。
+    #[command(about = "Search records (fuzzy match on name, URL, notes)")]
+    Search {
+        /// 查询词：模糊匹配名称、Base URL、备注。
+        #[arg(help = "Search query")]
+        query: String,
+    },
 
     /// 查看单条记录详情（key 永远掩码）。
     #[command(
-        about = "Show one record (key is always masked; use --copy to put it on the clipboard)"
+        about = "Show one record. Key is always masked; use --copy to put it on the clipboard"
     )]
     Show {
         /// 记录的 id（前缀即可）或名称。
-        #[arg(help = "Record id (prefix ok) or name")]
+        #[arg(help = "Record id, prefix ok, or name")]
         target: String,
         /// 复制 key。
         #[arg(long, help = "Copy the API key to the clipboard")]
@@ -90,26 +106,26 @@ pub enum Command {
     },
 
     /// 编辑一条记录。
-    #[command(about = "Edit a record field by field (Enter keeps the current value)")]
+    #[command(about = "Edit a record field by field. Enter keeps the current value")]
     Edit {
         /// 记录的 id（前缀即可）或名称。
-        #[arg(help = "Record id (prefix ok) or name")]
+        #[arg(help = "Record id, prefix ok, or name")]
         target: String,
     },
 
     /// 删除一条记录（墓碑）。
-    #[command(about = "Delete a record (tombstone; purged after the grace period)")]
+    #[command(about = "Delete a record. Keeps a tombstone, purged after the grace period")]
     Delete {
         /// 记录的 id（前缀即可）或名称。
-        #[arg(help = "Record id (prefix ok) or name")]
+        #[arg(help = "Record id, prefix ok, or name")]
         target: String,
     },
 
     /// 校验 key 有效性。
-    #[command(about = "Check key validity via GET /models (all records if no target)")]
+    #[command(about = "Check key validity via GET /models. Checks all records if no target given")]
     Check {
         /// 记录的 id（前缀即可）或名称。
-        #[arg(help = "Record id (prefix ok) or name")]
+        #[arg(help = "Record id, prefix ok, or name")]
         target: Option<String>,
     },
 
@@ -138,13 +154,13 @@ pub enum Command {
         /// 只清 GitHub token。
         #[arg(
             long,
-            help = "Clear only the GitHub token (keeps the remembered passphrase)"
+            help = "Clear only the GitHub token. Keeps the remembered passphrase"
         )]
         github: bool,
     },
 
     /// 明文导出。
-    #[command(about = "Export all records to a JSON file in PLAINTEXT (double confirmation)")]
+    #[command(about = "Export all records to a JSON file in PLAINTEXT. Asks twice before writing")]
     Export {
         /// 导出文件路径。
         #[arg(help = "Output file path")]
@@ -190,7 +206,10 @@ pub fn run() -> myapikey_core::Result<()> {
             api_key,
             notes,
         } => commands::add(name, protocol, base_url, api_key, notes),
-        Command::List => commands::list(),
+        Command::Version => commands::version(),
+        Command::Update => commands::update(),
+        Command::List => commands::list(None),
+        Command::Search { query } => commands::list(Some(&query)),
         Command::Show { target, copy } => commands::show(&target, copy),
         Command::Edit { target } => commands::edit(&target),
         Command::Delete { target } => commands::delete(&target),
