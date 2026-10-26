@@ -12,19 +12,22 @@
 ```console
 $ mak init --github
 Set the master passphrase.
-  If you forget it, ALL data is unrecoverable — keep it in a password manager.
+  If you forget it, ALL data is unrecoverable.
+  Keep it in a password manager.
 New master passphrase: ********
 Confirm passphrase: ********
 GitHub authorization (one-time only):
   1. Open: https://github.com/login/device
   2. Enter this code: 8163-2A61
 Waiting for authorization… this continues automatically.
-✓ Authorized — token saved to the credential store (clear with `mak forget --github`)
+✓ Authorized. Token saved to the credential store.
+  Clear it with `mak forget --github`.
 ✓ Sync repository ready (private): https://github.com/<你>/myapikey-vault.git
-Remember the passphrase in the system credential store? (no re-entry next time) [Y/n] y
 
-✓ Initialized — 0 record(s)
+✓ Initialized with 0 records.
   Repository: ~/.config/myapikey/repo
+  Passphrase remembered for 7 days.
+  Lock any time with `mak forget`.
 ```
 
 它会自动在你的 GitHub 账号下创建私有同步仓库（默认名 `myapikey-vault`）。不想用 GitHub 自动创建？[自己建一个空仓库](#安装)后用 `mak init --remote <地址>`。
@@ -36,14 +39,25 @@ Remember the passphrase in the system credential store? (no re-entry next time) 
 
 ```console
 $ mak add
+? Select protocol
+> 1) OpenAI
+  2) Anthropic
+  3) Custom label
 Record name (e.g. OpenAI primary): OpenAI 主力号
-Protocol [1]openai [2]anthropic [3]custom text (Enter keeps openai): 1
 Base URL (stored as-is, no normalization): https://api.openai.com/v1
-API Key: sk-proj-********
-Notes (Enter to skip):
+API key: sk-proj-********
+Notes (optional, Enter to skip):
 ✓ Pushed to remote
 ✓ Added "OpenAI 主力号" (id: 01a1683f…)
 Key check: invalid (HTTP 401)
+```
+
+第一步是上下键选协议（回车取默认 OpenAI；选 Custom label 才追问自定义标签），之后名称与 Base URL 必填、key 隐藏输入。**Base URL 填错不会丢掉已填内容**：格式不合规则原地重问，改对了继续。
+
+```console
+Base URL (stored as-is, no normalization): sss
+Must start with http:// or https:// followed by a host; try again.
+Base URL (stored as-is, no normalization): https://api.openai.com/v1
 ```
 
 保存时自动校验一次 key（这里因为是假 key 所以显示 invalid，不影响保存）。
@@ -52,14 +66,14 @@ Key check: invalid (HTTP 401)
 
 ```console
 $ mak list
-#    Name               Protocol     BASE URL                           KEY                  Check
+#    Name               Protocol     Base URL                           Key                  Check
 --------------------------------------------------------------------------------------------------------
-1    OpenAI 主力号      openai       https://api.openai.com/v1          sk-p...0000          invalid
+1    OpenAI 主力号      OpenAI       https://api.openai.com/v1          sk-p...0000          invalid
 --------------------------------------------------------------------------------------------------------
 
 $ mak show 1
 Name       : OpenAI 主力号
-Protocol   : openai
+Protocol   : OpenAI
 Base URL   : https://api.openai.com/v1
 API Key    : sk-p...0000
 （……其余字段……）
@@ -78,10 +92,10 @@ $ mak sync
 
 ```console
 $ mak init --github
-(using the saved GitHub authorization)
+Using the saved GitHub authorization.
 ✓ Sync repository ready (private): https://github.com/<你>/myapikey-vault.git
 ✓ Joined from remote: https://github.com/<你>/myapikey-vault.git
-✓ Initialized — 1 record(s)
+✓ Initialized with 1 record.
 ```
 
 之后：改完自动推送，开机 `mak sync` 一次拿最新。两台设备离线各改各的也没关系，`sync` 会按最后修改时间自动合并。
@@ -102,6 +116,23 @@ mak check OpenAI主力号  # 单条
 ```
 
 结论对照：`valid` 有效 / `invalid` 无效 / `no permission` 有效但无权限 / `rate limited` 有效但限额 / `unverifiable` 平台不支持探测。
+
+**搜索记录**（fzf 风格模糊匹配：名称 / Base URL / 备注可搜，URL 按斜线分词，协议不参与；结果按相关度排序）：
+
+```bash
+mak search openai        # 也试试缩写，如 mak search gtw
+```
+
+> [!NOTE]
+> `search` 结果里的行首序号是显示序号，与 `list` 的顺序不同——
+> 后续 `show` / `delete` 定位请用名称或 id，别用 `#序号`。
+
+**检查新版本**（联网比对 GitHub 最新 Release，只提示不自动改文件）：
+
+```bash
+mak version              # 只看当前版本，不联网
+mak update               # 检查新版本，有则给出升级命令
+```
 
 **修改一条记录**（逐项询问，回车保留原值，备注输 `-` 清空）：
 
@@ -131,6 +162,8 @@ mak passwd
 
 ```bash
 mak export backup.json
+mak export "C:\Users\you\Downloads"   # 目录也行：自动生成 myapikey-export.json，
+                                        # 已存在则 -2/-3 递增，绝不覆盖旧导出
 mak import backup.json
 ```
 
@@ -159,18 +192,21 @@ Usage: mak <COMMAND>
 
 Commands:
   init    Initialize: set the master passphrase, create the local repo, optionally bind a remote
-  add     Add a record interactively (omitted fields are prompted)
-  list    List all records (keys are masked)
-  show    Show one record (key is always masked; use --copy to put it on the clipboard)
-  edit    Edit a record field by field (Enter keeps the current value)
-  delete  Delete a record (tombstone; purged after the grace period)
-  check   Check key validity via GET /models (all records if no target)
+  add     Add a record interactively. Omitted fields are prompted
+  version Show the current version
+  update  Check for a newer release and print the upgrade command
+  list    List all records. Keys are masked
+  search  Search records (fuzzy match on name, URL, notes)
+  show    Show one record. Key is always masked; use --copy to put it on the clipboard
+  edit    Edit a record field by field. Enter keeps the current value
+  delete  Delete a record. Keeps a tombstone, purged after the grace period
+  check   Check key validity via GET /models. Checks all records if no target given
   sync    Sync: pull + merge + push
   status  Show repository and sync status
   remote  Manage the remote repository
   passwd  Change the master passphrase
   forget  Clear the remembered passphrase
-  export  Export all records to a JSON file in PLAINTEXT (double confirmation)
+  export  Export all records to a JSON file in PLAINTEXT. Asks twice before writing
   import  Import records from a JSON file
 
 Options:
@@ -200,8 +236,16 @@ Options:
 # 方式一：源码安装（当前可用，需要 Rust 工具链）
 cargo install --git https://github.com/Haaaatcher/MyApiKey
 
+# 无桌面环境的 Linux 服务器（无 D-Bus / libdbus 开发库）：
+cargo install --git https://github.com/Haaaatcher/MyApiKey --no-default-features
+
 # 方式二：下载预编译可执行文件（发布后可用，零依赖）
 # → GitHub Releases: https://github.com/Haaaatcher/MyApiKey/releases
 ```
 
 安装后得到两个等价命令：`mak`（短）与 `myapikey`（全称）。
+
+> [!NOTE]
+> `--no-default-features` 关闭的是 Linux 的 Secret Service 密码记忆后端：
+> 代价是这类机器上不记住主密码（每次手动输入），其余功能完全一致。
+> 桌面 Linux 不需要也不建议加这个参数。

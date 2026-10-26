@@ -19,3 +19,7 @@ dist/
 # 本地环境与日志
 .env
 *.log
+
+# 防御性兜底：签名私钥类文件永不入库（updater 私钥应在 %USERPROFILE%\.tauri）
+*.pem
+*.key

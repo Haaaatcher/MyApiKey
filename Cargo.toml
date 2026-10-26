@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/myapikey-core", "crates/myapikey-cli"]
+members = ["crates/myapikey-core", "crates/myapikey-cli", "crates/myapikey-gui"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 authors = ["Hang Luo (Haaaatcher)"]
@@ -22,17 +22,28 @@ rand = "0.8"
 zeroize = "1"
 dirs = "6"
 fd-lock = "4"
-keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+# keyring 的 Linux secret-service 后端会拉入 dbus 系链（需要 libdbus-1-dev + pkg-config），
+# 因此不放进基础依赖，由 myapikey-core 的 "secret-service" feature 按需启用；
+# 无头 Linux 可用 --no-default-features 编译安装。
+keyring = { version = "3", features = ["windows-native", "apple-native"] }
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 
 # cli 依赖
 clap = { version = "4", features = ["derive"] }
-rpassword = "7"
 arboard = "3"
 
-# 内部 crate 互相引用
-myapikey-core = { path = "crates/myapikey-core" }
+# gui 依赖（仅 Windows 发布）
+# tray-icon：系统托盘常驻（最小化/关闭均收进托盘，2026-10-25 需求）
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-build = { version = "2", features = [] }
+# 单实例（2026-10-25 需求）：二次启动聚焦已有窗口，官方插件
+tauri-plugin-single-instance = "2"
+
+# 内部 crate 互相引用。
+# core 关闭默认特性继承：是否启用 secret-service 由各前端自己的 feature 决定，
+# 这样 `cargo install --no-default-features myapikey-cli` 才能真正裁掉 dbus 系链。
+myapikey-core = { path = "crates/myapikey-core", default-features = false }
 
 [profile.release]
 lto = "thin"
