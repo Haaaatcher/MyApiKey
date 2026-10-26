@@ -16,6 +16,7 @@
 
 use crate::error::{Error, Result};
 use crate::github::GitAuth;
+use crate::subprocess::no_window;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -70,7 +71,7 @@ impl Store {
                 Ok(out)
             } else {
                 Err(Error::Git(format!(
-                    "`git {}` failed (exit code {}): {}",
+                    "`git {}` failed, exit {}: {}",
                     args.join(" "),
                     code,
                     truncate(&err, 500)
@@ -84,7 +85,13 @@ impl Store {
     fn git_allow_fail(&self, args: &[&str]) -> Result<(i32, String, String)> {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(&self.repo_dir).args(args);
+        no_window(&mut cmd);
         self.apply_auth(&mut cmd);
+        // 网络黑洞保底（2026-10-26 用户反馈排查时实测：代理异常时
+        // fetch/push 对 github.com 无限挂起，GUI 同步按钮永远转圈）。
+        // 低速限制：速度低于 1KB/s 持续 15 秒即主动失败，错误可读可重试
+        cmd.env("GIT_HTTP_LOW_SPEED_LIMIT", "1000");
+        cmd.env("GIT_HTTP_LOW_SPEED_TIME", "15");
         let output = cmd.output().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::GitUnavailable
@@ -132,11 +139,26 @@ impl Store {
 
     /// 设置（或覆盖）origin 远端。
     pub fn set_remote(&self, url: &str) -> Result<()> {
+        if !is_valid_remote_url(url) {
+            return Err(crate::error::Error::Usage(
+                "invalid remote URL: expected a scheme like https:// or an absolute local path"
+                    .into(),
+            ));
+        }
         if self.remote_url()?.is_some() {
             self.git(&["remote", "set-url", "origin", url]).map(|_| ())
         } else {
             self.git(&["remote", "add", "origin", url]).map(|_| ())
         }
+    }
+
+    /// 解绑 origin 远端（设置页清空 remote 时调用；本地 vault 与提交
+    /// 历史保留，只是不再参与推送/拉取）。幂等：没有远端时静默成功。
+    pub fn remove_remote(&self) -> Result<()> {
+        if self.remote_url()?.is_some() {
+            self.git(&["remote", "remove", "origin"]).map(|_| ())?;
+        }
+        Ok(())
     }
 
     /// 把工作区的 vault 文件提交入库（若确有变化）。
@@ -282,6 +304,7 @@ impl Store {
     fn git_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(&self.repo_dir).args(args);
+        no_window(&mut cmd);
         self.apply_auth(&mut cmd);
         let output = cmd.output().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -317,6 +340,7 @@ impl Store {
 pub fn remote_has_main(url: &str, auth: Option<&GitAuth>) -> Result<bool> {
     let mut cmd = Command::new("git");
     cmd.args(["ls-remote", url, "refs/heads/main"]);
+    no_window(&mut cmd);
     if let Some(a) = auth {
         cmd.envs(a.git_envs());
     }
@@ -329,7 +353,7 @@ pub fn remote_has_main(url: &str, auth: Option<&GitAuth>) -> Result<bool> {
     })?;
     if !output.status.success() {
         return Err(Error::Git(format!(
-            "cannot reach the remote repository (git ls-remote failed): {}",
+            "cannot reach the remote repository: {}",
             truncate(&String::from_utf8_lossy(&output.stderr), 300)
         )));
     }
@@ -346,7 +370,12 @@ pub fn remote_has_main(url: &str, auth: Option<&GitAuth>) -> Result<bool> {
 /// - [`Error::Git`]：克隆失败（网络、权限、目录非空等）。
 pub fn clone_into(url: &str, dir: &std::path::Path, auth: Option<&GitAuth>) -> Result<()> {
     let mut cmd = Command::new("git");
-    cmd.arg("clone").arg(url).arg(dir);
+    // 显式检出 main：远端仓库的默认分支（HEAD）不一定是 main——比如某些平台
+    // 预置 master、或空仓库的 HEAD 指向尚不存在的分支。此时普通 clone 会
+    // 检出一个空工作区且**不报错**，后续读 vault 直接失败。接入路径只在
+    // remote_has_main 为真时走到这里，main 必然存在，显式指定是安全的。
+    cmd.args(["clone", "--branch", "main"]).arg(url).arg(dir);
+    no_window(&mut cmd);
     if let Some(a) = auth {
         cmd.envs(a.git_envs());
     }
@@ -376,10 +405,85 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// HTTP(S) URL 的基础格式校验（2026-10-26 需求）：只拒绝明显非法的
+/// 输入，**不做任何归一化**（协议红线：URL 原样存储）。规则：
+/// - 以 `http://` 或 `https://` 开头；
+/// - 主机段非空（`://` 之后到首个 `/` `?` `:` 之前至少一个字符）；
+/// - 全串无空白。
+pub fn is_valid_http_url(s: &str) -> bool {
+    let t = s.trim();
+    let Some(rest) = t
+        .strip_prefix("https://")
+        .or_else(|| t.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    if t.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let host_end = rest.find(['/', '?', ':']).unwrap_or(rest.len());
+    !rest[..host_end].is_empty()
+}
+
+/// 远端地址的宽松校验：任何显式 scheme（`http://`、`ssh://`、`git://`、
+/// `file://`…）与本地绝对路径（`/…`、盘符 `C:\…`、UNC `\…`）都放行
+/// ——自建内网/本地裸仓库是合法场景（同步测试也依赖本地路径远端）；
+/// 只拒"裸域名"形态（`github.com/u/r`），那几乎必是漏写 scheme 的笔误。
+/// 与 base_url 的严格规则（[`is_valid_http_url`]，仅 http/https）区分。
+pub fn is_valid_remote_url(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if t.contains("://") {
+        return true;
+    }
+    // 本地绝对路径：POSIX /、Windows 盘符、UNC
+    let b = t.as_bytes();
+    t.starts_with('/') || t.starts_with('\\') || {
+        b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
+    }
+}
 #[cfg(test)]
 mod tests {
-    //! Store 层集成测试：真实 git 命令、临时目录，不碰网络。
+    //! URL 基础校验回归（2026-10-26）：只拒明显非法，不做归一化。
+    use super::is_valid_http_url;
 
+    #[test]
+    fn http_url_validation() {
+        assert!(is_valid_http_url("https://github.com/u/r.git"));
+        assert!(is_valid_http_url("http://host:8080/path"));
+        assert!(is_valid_http_url("https://host"));
+        // 拒：非 http(s)、空主机、空白、空串
+        assert!(!is_valid_http_url("ftp://host/x"));
+        assert!(!is_valid_http_url("https:///path"));
+        assert!(!is_valid_http_url("https:// /x"));
+        assert!(!is_valid_http_url("github.com/u/r")); // 缺 scheme——用户最常见笔误
+        assert!(!is_valid_http_url("https://ha te.com"));
+        assert!(!is_valid_http_url(""));
+    }
+
+    #[test]
+    fn remote_url_validation() {
+        // 显式 scheme 全放行（http/git/ssh/file 均合法 git 远端形态）
+        for u in [
+            "https://github.com/u/r.git",
+            "ssh://git@host:22/u/r.git",
+            "git://host/r",
+            "file:///C:/repos/r",
+        ] {
+            assert!(is_valid_remote_url(u), "应放行: {u}");
+        }
+        // 本地绝对路径放行（测试与自建裸仓库依赖）
+        assert!(is_valid_remote_url("/tmp/bare-repo"));
+        assert!(is_valid_remote_url("C:\\repos\\bare"));
+        // 裸域名 = 漏写 scheme 的笔误，拒
+        assert!(!is_valid_remote_url("github.com/u/r"));
+        assert!(!is_valid_remote_url(""));
+        assert!(!is_valid_remote_url("https://ha te.com"));
+    }
+
+    // Store 层集成测试：真实 git 命令、临时目录，不碰网络。
     use super::*;
 
     fn tmp_store(tag: &str) -> Store {

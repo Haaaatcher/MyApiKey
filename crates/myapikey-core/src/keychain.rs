@@ -31,8 +31,22 @@ use serde::{Deserialize, Serialize};
 
 /// 凭据库 service 名（github.rs 的 token 条目共用同一 service）。
 pub(crate) const SERVICE: &str = "myapikey";
+/// `MYAPIKEY_HOME` 覆盖（测试/便携）环境使用的隔离 service 名。
+///
+/// 这些环境的凭据条目必须与正式安装分开：不仅避免测试互相串扰，
+/// 更防止隔离环境里的清理操作（如锁定清除记住密码）误删真实条目。
+const SERVICE_ISOLATED: &str = "myapikey-isolated";
 /// 凭据库 account 名（多 vault 预留）。
 const ACCOUNT: &str = "default";
+
+/// 按 home 来源解析实际使用的 service（见 [`SERVICE_ISOLATED`]）。
+fn service_of(dirs: &AppDirs) -> &'static str {
+    if dirs.from_env {
+        SERVICE_ISOLATED
+    } else {
+        SERVICE
+    }
+}
 
 /// 到期时间记录文件（放在配置目录，内容只有一个时间戳）。
 const EXPIRY_FILE: &str = "remember.json";
@@ -55,7 +69,7 @@ pub fn set_ttl(dirs: &AppDirs, passphrase: &str, days: u32) -> Result<()> {
     if days == 0 {
         return Ok(());
     }
-    set_raw(passphrase)?;
+    set_raw(dirs, passphrase)?;
     let exp = Expiry {
         expires_at: (Utc::now() + chrono::Duration::days(i64::from(days))).to_rfc3339(),
     };
@@ -71,10 +85,10 @@ pub fn set_ttl(dirs: &AppDirs, passphrase: &str, days: u32) -> Result<()> {
 /// - `Ok(Some(passphrase))`：有未过期的记住密码；
 /// - `Ok(None)`：没记住 / 已过期（已顺手清理）/ 凭据库不可用。
 ///
-/// # Errors
-/// - [`Error::Serde`]：到期文件损坏（不含凭据，损坏即视为过期清理）。
+/// 文件损坏（JSON 非法或时间戳解析失败）一律视为过期：清理条目并
+/// 返回 `Ok(None)` 降级到重新输入——到期文件不含凭据，不值得为它失败。
 pub fn get_with_expiry(dirs: &AppDirs) -> Result<Option<String>> {
-    let Some(passphrase) = get_raw() else {
+    let Some(passphrase) = get_raw(dirs) else {
         return Ok(None);
     };
     // 没有到期文件（旧版本写入的永久条目）：视为已过期，走清理 + 重输
@@ -82,8 +96,13 @@ pub fn get_with_expiry(dirs: &AppDirs) -> Result<Option<String>> {
         let _ = delete(dirs);
         return Ok(None);
     };
-    let exp: Expiry = serde_json::from_str(&raw)
-        .map_err(|e| Error::Serde(format!("failed to parse {EXPIRY_FILE}: {e}")))?;
+    // JSON 本身损坏：与"到期文件缺失"同语义——清理 + 重输（2026-10-26
+    // 修复：曾返回 Err 卡住调用方且坏文件永久留存，与文档"损坏即视为
+    // 过期清理"矛盾）
+    let Ok(exp) = serde_json::from_str::<Expiry>(&raw) else {
+        let _ = delete(dirs);
+        return Ok(None);
+    };
     let Ok(expires_at) = DateTime::parse_from_rfc3339(&exp.expires_at) else {
         let _ = delete(dirs);
         return Ok(None);
@@ -105,7 +124,7 @@ pub fn get_with_expiry(dirs: &AppDirs) -> Result<Option<String>> {
 /// - [`Error::Keyring`]：条目存在但删除失败（真实异常，值得报告）。
 pub fn delete(dirs: &AppDirs) -> Result<bool> {
     let _ = std::fs::remove_file(dirs.config_dir.join(EXPIRY_FILE));
-    delete_raw()
+    delete_raw(dirs)
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +132,8 @@ pub fn delete(dirs: &AppDirs) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 /// 从凭据库读密码；后端不可用或无条目一律 `Ok(None)`（降级为手动输入）。
-fn get_raw() -> Option<String> {
-    let entry = keyring::Entry::new(SERVICE, ACCOUNT).ok()?;
+fn get_raw(dirs: &AppDirs) -> Option<String> {
+    let entry = keyring::Entry::new(service_of(dirs), ACCOUNT).ok()?;
     match entry.get_password() {
         Ok(p) => Some(p),
         Err(keyring::Error::NoEntry) => None,
@@ -126,8 +145,8 @@ fn get_raw() -> Option<String> {
 ///
 /// # Errors
 /// - [`Error::Keyring`]：后端不可用或写入失败。
-fn set_raw(passphrase: &str) -> Result<()> {
-    let entry = keyring::Entry::new(SERVICE, ACCOUNT)
+fn set_raw(dirs: &AppDirs, passphrase: &str) -> Result<()> {
+    let entry = keyring::Entry::new(service_of(dirs), ACCOUNT)
         .map_err(|e| Error::Keyring(format!("failed to open credential store entry: {e}")))?;
     entry
         .set_password(passphrase)
@@ -138,8 +157,8 @@ fn set_raw(passphrase: &str) -> Result<()> {
 ///
 /// # Errors
 /// - [`Error::Keyring`]：条目存在但删除失败。
-fn delete_raw() -> Result<bool> {
-    let entry = keyring::Entry::new(SERVICE, ACCOUNT)
+fn delete_raw(dirs: &AppDirs) -> Result<bool> {
+    let entry = keyring::Entry::new(service_of(dirs), ACCOUNT)
         .map_err(|e| Error::Keyring(format!("failed to open credential store entry: {e}")))?;
     match entry.delete_credential() {
         Ok(()) => Ok(true),

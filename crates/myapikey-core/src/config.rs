@@ -30,6 +30,11 @@ pub struct AppConfig {
     /// 设为 `0` = 永不记住（每次命令都手动输入）。
     pub remember_days: u32,
 
+    /// GUI 空闲自动锁定分钟数（软锁：销毁内存中的解锁状态）。
+    ///
+    /// 锁定后回到解锁页；若主密码仍在记忆有效期内，一键解锁即可恢复。
+    pub auto_lock_minutes: u32,
+
     /// 最近一次成功同步的时间（RFC 3339，本机展示用，非精确账本）。
     pub last_sync_at: Option<String>,
 }
@@ -40,6 +45,7 @@ impl Default for AppConfig {
             tombstone_days: 30,
             auto_push: true,
             remember_days: 7,
+            auto_lock_minutes: 10,
             last_sync_at: None,
         }
     }
@@ -93,6 +99,7 @@ mod tests {
             config_path: tmp.join("config.toml"),
             check_cache_path: tmp.join("check_cache.json"),
             lock_path: tmp.join("vault.lock"),
+            from_env: false,
         };
 
         // 文件不存在 → 默认值

@@ -40,7 +40,8 @@ pub fn acquire(dirs: &AppDirs) -> Result<InstanceLock> {
     match lock.try_write() {
         Ok(guard) => Ok(InstanceLock { _guard: guard }),
         Err(_) => Err(Error::Usage(
-            "另一个 MyApiKey 实例正在运行（vault.lock 被占用），请先完成或关闭它".into(),
+            "another MyApiKey instance is running and holds vault.lock; finish or close it first"
+                .into(),
         )),
     }
 }
@@ -64,6 +65,7 @@ mod tests {
             config_path: tmp.join("config.toml"),
             check_cache_path: tmp.join("check_cache.json"),
             lock_path: tmp.join("vault.lock"),
+            from_env: false,
         };
         let first = acquire(&dirs).expect("首次加锁必须成功");
         match acquire(&dirs) {

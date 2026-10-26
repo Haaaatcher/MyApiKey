@@ -15,6 +15,7 @@
 //! | [`lock`] | 实例文件锁：防止 CLI 与 GUI 同时写坏 vault |
 //! | [`keychain`] | 系统凭据库（记住主密码）的读写封装 |
 //! | [`store`] | 本地 git 仓库管理（`git init` / commit / remote），通过 shell 调用系统 git |
+//! | [`subprocess`] | 子进程启动工具：Windows GUI 下消除子进程控制台闪窗 |
 //! | [`sync`] | 同步引擎：fetch → 解密合并 → commit → push |
 //! | [`probe`] | key 有效性探测：按协议调用 `GET /models` |
 //! | [`check_cache`] | 校验结果的本地缓存（不参与同步） |
@@ -35,7 +36,9 @@ pub mod merge;
 pub mod model;
 pub mod paths;
 pub mod probe;
+pub mod search;
 pub mod store;
+pub mod subprocess;
 pub mod sync;
 pub mod vault;
 

@@ -178,9 +178,7 @@ pub fn decrypt(bytes: &[u8], passphrase: &str) -> Result<VaultData> {
         )));
     }
     if &bytes[0..4] != MAGIC {
-        return Err(Error::Format(
-            "bad magic — not a MyApiKey vault file".into(),
-        ));
+        return Err(Error::Format("bad magic, not a MyApiKey vault file".into()));
     }
 
     // ---- 逐字段解析头部（全部小端） ----

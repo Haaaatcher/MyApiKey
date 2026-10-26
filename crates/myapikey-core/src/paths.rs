@@ -40,6 +40,12 @@ pub struct AppDirs {
     pub check_cache_path: PathBuf,
     /// 实例锁文件（`<config_dir>/vault.lock`）。
     pub lock_path: PathBuf,
+    /// 是否来自 `MYAPIKEY_HOME` 覆盖（测试/便携部署）。
+    ///
+    /// keychain 据此把凭据条目切到隔离命名空间：隔离环境绝不读写、
+    /// 更不会在清理时误删正式安装记住的密码（2026-10-24 锁定语义变更
+    /// 后锁定会删凭据条目，测试安全性依赖这个隔离）。
+    pub from_env: bool,
 }
 
 /// 环境变量名：覆盖配置根目录（测试 / 便携模式）。
@@ -52,6 +58,7 @@ impl AppDirs {
     /// - [`Error::Usage`]：`MYAPIKEY_HOME` 已设置但值是空的；
     /// - [`Error::Io`]：系统无法给出配置目录（极端情况，如 HOME 丢失）。
     pub fn load() -> Result<Self> {
+        let overridden = std::env::var(HOME_ENV).is_ok();
         let base = match std::env::var(HOME_ENV) {
             Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
             Ok(_) => {
@@ -76,6 +83,7 @@ impl AppDirs {
             lock_path: base.join("vault.lock"),
             repo_dir,
             config_dir: base,
+            from_env: overridden,
         })
     }
 

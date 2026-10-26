@@ -34,6 +34,44 @@ pub enum Protocol {
     },
 }
 
+impl Protocol {
+    /// 解析用户输入的协议标签：`openai` / `anthropic`（含缩写 `o` / `a` / `1` / `2`）
+    /// 之外的任意文本都视为自定义协议；已带 `custom:` 前缀的会被剥掉，
+    /// 避免 `custom:custom:x` 双重前缀。CLI 与 GUI 共用本实现。
+    pub fn from_label(label: &str) -> Self {
+        let trimmed = label.trim();
+        // 内置标签大小写不敏感匹配；自定义标签保留用户输入的原始大小写
+        // （2026-10-26 修复：整串 lowercase 会把 "Custom:Azure" 静默存成
+        // custom:azure，用户命名信息丢失且无提示）
+        match trimmed.to_ascii_lowercase().as_str() {
+            "1" | "o" | "openai" => Protocol::OpenAi,
+            "2" | "a" | "anthropic" => Protocol::Anthropic,
+            _ => Protocol::Custom {
+                name: trimmed
+                    .strip_prefix("custom:")
+                    .or_else(|| trimmed.strip_prefix("Custom:"))
+                    .unwrap_or(trimmed)
+                    .to_string(),
+            },
+        }
+    }
+
+    /// 展示名：内置两家用公司规范大小写（协议名实为公司名，2026-10-25
+    /// 与 GUI 徽标同步），自定义标签带 `custom:` 前缀原样展示。
+    ///
+    /// 与 [`std::fmt::Display`] 的分工：Display 输出**小写存储标签**，
+    /// 它被当作 `from_label` 的合法输入（roundtrip），改大写会让
+    /// `"OpenAI"` 被解析成自定义协议、并破坏 vault 数据与 GUI 契约；
+    /// 人眼看的输出一律走本方法。
+    pub fn display_label(&self) -> String {
+        match self {
+            Protocol::OpenAi => "OpenAI".to_string(),
+            Protocol::Anthropic => "Anthropic".to_string(),
+            Protocol::Custom { name } => format!("custom:{name}"),
+        }
+    }
+}
+
 impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -233,6 +271,55 @@ mod tests {
         let mut uni = sample();
         uni.api_key = "密钥密钥密钥密钥".into();
         assert!(uni.masked_key().ends_with("..."));
+    }
+
+    #[test]
+    fn custom_label_keeps_original_case() {
+        // 内置标签大小写不敏感；自定义保留原始大小写（2026-10-26 修复）
+        assert_eq!(Protocol::from_label("OpenAI"), Protocol::OpenAi);
+        assert_eq!(Protocol::from_label("ANTHROPIC"), Protocol::Anthropic);
+        assert_eq!(
+            Protocol::from_label("Custom:Azure"),
+            Protocol::Custom {
+                name: "Azure".into()
+            }
+        );
+        assert_eq!(
+            Protocol::from_label("custom:Azure"),
+            Protocol::Custom {
+                name: "Azure".into()
+            }
+        );
+    }
+
+    /// 展示名与存储标签的分工契约（2026-10-25，与 GUI 徽标同步）：
+    /// display_label 给人看（公司规范大写）；Display 保持小写并可与
+    /// from_label 往返——这是 vault 数据与前端契约的根基，不能漂移。
+    #[test]
+    fn protocol_display_label_vs_roundtrip() {
+        assert_eq!(Protocol::OpenAi.display_label(), "OpenAI");
+        assert_eq!(Protocol::Anthropic.display_label(), "Anthropic");
+        assert_eq!(
+            Protocol::Custom {
+                name: "gateway".into()
+            }
+            .display_label(),
+            "custom:gateway"
+        );
+        // Display 输出必须仍能被 from_label 解析回同一变体
+        for p in [
+            Protocol::OpenAi,
+            Protocol::Anthropic,
+            Protocol::Custom {
+                name: "gateway".into(),
+            },
+        ] {
+            assert_eq!(
+                Protocol::from_label(&p.to_string()),
+                p,
+                "Display 输出必须与 from_label 往返一致"
+            );
+        }
     }
 
     #[test]

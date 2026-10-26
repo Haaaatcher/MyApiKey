@@ -55,7 +55,7 @@ pub enum Error {
     NotFound(String),
 
     /// 本机尚未初始化（没有 vault / git 仓库），需要先运行 `init`。
-    #[error("not initialized yet — run `mak init` first")]
+    #[error("not initialized yet, run `mak init` first")]
     NotInitialized,
 
     /// 调用方使用错误（参数缺失、导入文件内容不对等）。

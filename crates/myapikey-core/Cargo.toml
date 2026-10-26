@@ -22,3 +22,11 @@ fd-lock.workspace = true
 keyring.workspace = true
 toml.workspace = true
 reqwest.workspace = true
+
+[features]
+default = ["secret-service"]
+# 启用 keyring 的 Linux secret-service 后端（经 D-Bus 访问 GNOME Keyring/KWallet）。
+# 桌面发行版默认开启；无头服务器（无 libdbus-1-dev）安装时用
+# `cargo install --no-default-features myapikey-cli` 关闭，
+# 代价是 Linux 上不持久记住密码（每次手动输入），其余功能不受影响。
+secret-service = ["keyring/sync-secret-service"]

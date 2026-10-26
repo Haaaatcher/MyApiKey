@@ -58,7 +58,15 @@ pub fn save(
 ) -> Result<SyncOutcome> {
     let mut out = SyncOutcome::default();
     let bytes = vault::encrypt(data, passphrase)?;
-    std::fs::write(&dirs.vault_path, &bytes)?;
+    // 原子写（tmp + rename，与 config.rs 同法）：直写中途崩溃/断电会留下
+    // 半截 vault，加密文件损坏即数据全失——tmp 未 rename 完成前旧文件
+    // 完好（2026-10-26 采纳审查建议；git 历史是第二道兜底，这里是第一道）
+    let tmp = dirs.vault_path.with_extension("mkv.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    if dirs.vault_path.exists() {
+        std::fs::remove_file(&dirs.vault_path)?;
+    }
+    std::fs::rename(&tmp, &dirs.vault_path)?;
     store.commit_vault(count_alive(data))?;
     out.alive_records = count_alive(data);
 
@@ -106,7 +114,9 @@ pub fn sync(
     }
 
     // 3) 拉取远端引用
-    store.fetch()?;
+    store
+        .fetch()
+        .map_err(|e| auth_hint(e, store.auth().is_some()))?;
 
     if store.remote_branch_exists() {
         let behind = store.behind_count();
@@ -143,18 +153,53 @@ pub fn sync(
                 out.merged = true;
                 out.alive_records = count_alive(&merged);
             }
-        }
 
-        // 场景 3（或合并后）：本地有未推送提交 → 推送
-        if store.ahead_count() > 0 {
+            // 场景 3（或合并后）：本地有未推送提交 → 推送
+            if store.ahead_count() > 0 {
+                match store.push() {
+                    Ok(()) => out.pushed = true,
+                    Err(e) => {
+                        out.push_error = Some(auth_hint(e, store.auth().is_some()).to_string())
+                    }
+                }
+            }
+        } else if store.ahead_count() > 0 {
+            // 场景 3：仅本地有新数据 → 直接推送
             match store.push() {
                 Ok(()) => out.pushed = true,
-                Err(e) => out.push_error = Some(e.to_string()),
+                Err(e) => out.push_error = Some(auth_hint(e, store.auth().is_some()).to_string()),
             }
+        }
+    } else {
+        // 远端仓库还是空的（没有 main 分支）：场景 3 的边界——本地必然
+        // 领先（vault 已提交），直接推送建分支。不补这个分支的话，
+        // "绑定空仓库后靠 sync 推送"永远推不上去且不报任何错误。
+        match store.push() {
+            Ok(()) => out.pushed = true,
+            Err(e) => out.push_error = Some(auth_hint(e, store.auth().is_some()).to_string()),
         }
     }
 
     Ok(out)
+}
+
+/// git 远端操作失败且本次带认证时，在错误后附加自愈指引。
+///
+/// GitHub 对私有仓库在凭据失效时统一报 "Repository not found"（避免泄露
+/// 仓库存在性），用户无法从字面看出是 token 过期。此处提示重新授权命令。
+/// 只有错误文本里出现这两类关键词才附加，避免误导无关错误。
+fn auth_hint(e: Error, has_auth: bool) -> Error {
+    const HINT: &str = ", your saved GitHub authorization may have expired. \
+                        Run `mak init --github` to re-authorize";
+    if !has_auth {
+        return e;
+    }
+    let msg = e.to_string();
+    if msg.contains("Repository not found") || msg.contains("Authentication failed") {
+        Error::Usage(format!("{msg}{HINT}"))
+    } else {
+        e
+    }
 }
 
 /// 远端 vault 解密失败时的错误转换：给出“两台设备必须同密码”的明确指引。
@@ -232,6 +277,7 @@ mod tests {
             config_path,
             check_cache_path,
             lock_path,
+            from_env: false,
         };
         let store = Store::new(&repo_dir);
         store.ensure_init().expect("git init 失败");
@@ -318,6 +364,7 @@ mod tests {
             config_path: b_config,
             check_cache_path: b_cache,
             lock_path: b_lock,
+            from_env: false,
         };
         let b = Device {
             store: Store::new(&b_repo),

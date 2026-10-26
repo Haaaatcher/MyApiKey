@@ -91,6 +91,8 @@ pub fn open_browser(url: &str) -> Result<()> {
         let mut c = std::process::Command::new("cmd");
         // start 的第一个引号参数是窗口标题，必须给一个空标题占位
         c.args(["/c", "start", "", url]);
+        // GUI 程序里 cmd 会闪一个控制台黑窗（浏览器本身照常打开），消除它
+        crate::subprocess::no_window(&mut c);
         c
     };
     #[cfg(target_os = "macos")]
@@ -139,12 +141,13 @@ pub fn poll_device_token(code: &DeviceCode, client_id: &str) -> Result<String> {
         std::time::Instant::now() + std::time::Duration::from_secs(code.expires_in.max(60));
     let mut interval = code.interval.max(1);
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(interval));
+        // 先查 deadline 再 sleep：过期立即返回，不多等一轮 interval
         if std::time::Instant::now() > deadline {
             return Err(Error::Usage(
                 "device code expired; please run the command again".into(),
             ));
         }
+        std::thread::sleep(std::time::Duration::from_secs(interval));
         let resp = http_post_form(
             "https://github.com/login/oauth/access_token",
             &[
@@ -321,6 +324,52 @@ pub fn keychain_delete_token() -> Result<bool> {
     }
 }
 
+/// 探测 token 当前是否有效（GET /user，只关心 HTTP 状态码）。
+/// - `Some(true)`：有效；
+/// - `Some(false)`：401，token 已失效（授权被撤销 / 过期）；
+/// - `None`：网络等未知错误——不能断定失效，调用方应保留 token 不动作。
+fn token_is_valid(token: &str) -> Option<bool> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client
+        .get("https://api.github.com/user")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "MyApiKey")
+        .send()
+        .ok()?;
+    match resp.status().as_u16() {
+        200 => Some(true),
+        401 => Some(false),
+        _ => None,
+    }
+}
+
+/// 取"确认仍有效"的 GitHub token。
+///
+/// 与 [`keychain_token`] 的差别：读出后先验证。已存的 token 失效（401）时
+/// **顺手清除条目**并返回 `None`，让调用方回落到重新设备授权——否则每次
+/// 都带着坏 token 撞 401，且 git 对私有仓库只报语焉不详的
+/// "Repository not found"。网络异常等无法判定的情况按"有效"处理，不误删。
+///
+/// # Errors
+/// - [`Error::Keyring`]：凭据库本身异常。
+pub fn valid_keychain_token() -> Result<Option<String>> {
+    let Some(token) = keychain_token()? else {
+        return Ok(None);
+    };
+    match token_is_valid(&token) {
+        Some(false) => {
+            let _ = keychain_delete_token();
+            Ok(None)
+        }
+        // 有效，或网络原因无法判定：交给调用方使用
+        _ => Ok(Some(token)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // git 认证注入（详见 store::GitAuth；本模块只负责描述“给 git 用什么”）
 // ---------------------------------------------------------------------------
@@ -452,6 +501,47 @@ pub fn base64_encode(data: &[u8]) -> String {
         });
     }
     out
+}
+
+/// 源码仓库的 Releases API（版本检查用，公开端点无需认证）。
+pub const SOURCE_RELEASES_API: &str =
+    "https://api.github.com/repos/Haaaatcher/MyApiKey/releases/latest";
+
+/// 查询源码仓库的最新 Release tag（如 `v0.2.0`）。
+///
+/// 匿名调用 GitHub API 的限额是 60 次/小时/IP——个人工具的检查频率
+/// 远够；若将来提示频繁失败，考虑带 token 或降低检查频率。
+///
+/// 返回 `Ok(None)` = 还没有发布过任何 Release（404）。CLI 的 `mak version`
+/// 用它提示新版本；查询失败由调用方降级为"无法检查"，不阻塞命令本身。
+///
+/// # Errors
+/// 网络 / 超时（15 秒）/ 响应解析失败。
+pub fn latest_release_tag() -> Result<Option<String>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| Error::Usage(format!("failed to build the HTTP client: {e}")))?;
+    let resp = client
+        .get(SOURCE_RELEASES_API)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "MyApiKey-CLI")
+        .send()
+        .map_err(|e| Error::Usage(format!("release check request failed: {e}")))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    let text = resp
+        .error_for_status()
+        .map_err(|e| Error::Usage(e.to_string()))?
+        .text()
+        .map_err(|e| Error::Usage(format!("failed to read the release info: {e}")))?;
+    let tag = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| Error::Usage(format!("failed to parse the release info: {e}")))?
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok(tag)
 }
 
 #[cfg(test)]
