@@ -1,0 +1,546 @@
+/* MyApiKey GUI — 深色主题 v2（2026-10-24 美化重构）。
+ *
+ * 设计依据（调研结论，见当次会话汇报）：
+ * - 暗色分层：不用纯黑/纯白，页面 → 卡片 → 悬浮层逐级提亮（Material/Smashing 暗色规范）
+ * - 语义色统一：成功/警告/危险全局一致，状态用色点 + 文字（1Password item overview 模式）
+ * - 4/8px 间距栅格、3-4 档字阶、凭证一律等宽字体
+ * - 150ms 基线过渡 + 抽屉滑入（240ms）；focus-visible 焦点环保证键盘可达
+ * - 操作图标化：copy/check/edit/delete 用图标按钮 + title 提示（1Password/Bitwarden 惯例）
+ * 界面文案英文（AGENTS.md 语言分层），本注释面向开发者。
+ */
+
+:root {
+  /* 表面分层（由暗到亮） */
+  --bg: #0f131a;        /* 页面背景 */
+  --bg-soft: #151b26;   /* 输入/内嵌区域 */
+  --card: #171e2a;      /* 卡片 */
+  --card-2: #1e2736;    /* 按钮/悬浮件 */
+  --card-3: #252f42;    /* hover 提亮层 */
+  --line: #2a3550;      /* 常规描边 */
+  --line-bright: #3a4763; /* hover 描边 */
+
+  /* 文字（避免纯白，降低暗底光晕） */
+  --text: #e8edf6;
+  --muted: #8d97ac;
+  --faint: #5d6880;
+
+  /* 语义色（暗底降饱和，防"振动"） */
+  --accent: #4f8cff;
+  --accent-2: #3a6fd8;
+  --ok: #34b06f;
+  --warn: #d8a03a;
+  --err: #e06060;
+
+  --radius: 10px;
+  --radius-lg: 14px;
+  --t-fast: 150ms ease;
+  --t-drawer: 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+* { box-sizing: border-box; }
+
+/* ---------------------------------------------------------------------------
+ * 亮色主题（D14）：整套令牌覆盖 + 少量组件级微调。
+ * JS 在 <html data-theme="light|dark"> 上切换；"跟随系统"由 JS 解析
+ * prefers-color-scheme 后同样落到 data-theme（CSS 不用 media 查询，
+ * 保证用户显式选择永远优先于系统）。
+ * ------------------------------------------------------------------------- */
+html[data-theme="light"] {
+  --bg: #f2f5fa;
+  --bg-soft: #e9edf5;
+  --card: #ffffff;
+  --card-2: #eef2f9;
+  --card-3: #e2e8f3;
+  --line: #d6ddea;
+  --line-bright: #b7c2d8;
+  --text: #1d2636;
+  /* 亮色下 muted/faint 必须比暗色深一档：浅底上灰字的观感"褪色"，
+   * 对比度按 WCAG AA 校准（muted ≈ 6.4:1，faint ≈ 4.6:1） */
+  --muted: #4a5568;
+  --faint: #6b7689;
+  --accent: #2f6fe4;
+  --accent-2: #2456c2;
+  --ok: #1e9e5a;
+  --warn: #96700f;
+  --err: #cc4444;
+}
+html[data-theme="light"] body { background: var(--bg); }
+/* 亮色下的阴影/浮层对比（深色阴影在白底上会显脏，改用低透明度蓝灰） */
+html[data-theme="light"] .card { box-shadow: 0 14px 40px rgba(28, 45, 80, 0.10); }
+html[data-theme="light"] .drawer { box-shadow: -16px 0 44px rgba(28, 45, 80, 0.16); }
+html[data-theme="light"] .toast {
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 8px 24px rgba(28, 45, 80, 0.16);
+}
+html[data-theme="light"] .toast-err { color: #a53232; }
+html[data-theme="light"] .badge-openai { color: #0a7a5a; }
+html[data-theme="light"] .badge-anthropic { color: #96700f; }
+html[data-theme="light"] .device-code { background: var(--bg-soft); }
+html[data-theme="light"] ::-webkit-scrollbar-thumb { border-color: var(--bg); }
+html[data-theme="light"] ::selection { background: rgba(47, 111, 228, 0.22); }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  user-select: none;
+}
+
+/* 键盘可达性：焦点环统一且可见（不占用鼠标用户的视觉——仅 focus-visible） */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+::selection { background: rgba(79, 140, 255, 0.35); }
+
+/* 暗色滚动条（默认亮色滚动条在深色应用里非常刺眼） */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 8px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--line-bright); }
+::-webkit-scrollbar-track { background: transparent; }
+
+#app { min-height: 100vh; }
+
+/* ---------------------------------------------------------------------------
+ * 通用控件
+ * ------------------------------------------------------------------------- */
+
+.input {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--bg-soft);
+  color: var(--text);
+  outline: none;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+.input:hover { border-color: var(--line-bright); }
+.input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(79, 140, 255, 0.15);
+}
+.input::placeholder { color: var(--faint); }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 9px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--card-2);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--t-fast), border-color var(--t-fast), transform var(--t-fast);
+}
+.btn:hover { background: var(--card-3); border-color: var(--line-bright); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: 0.45; cursor: default; transform: none; }
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) { background: var(--accent-2); border-color: var(--accent-2); }
+.btn-ghost { background: transparent; }
+.btn-ghost:hover { background: var(--card-2); }
+.btn-danger { color: var(--err); }
+.btn-danger:hover { border-color: var(--err); background: rgba(224, 96, 96, 0.08); }
+.btn-small { padding: 5px 11px; font-size: 12.5px; }
+
+/* 图标按钮：卡片行内的紧凑操作（copy/check/edit/delete）。
+ * 图标来自 main.ts 的内联 SVG，颜色跟随 currentColor。 */
+.btn-icon {
+  padding: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  color: var(--muted);
+}
+.btn-icon:hover { color: var(--text); }
+.btn-icon.danger:hover { color: var(--err); }
+.btn-icon svg { width: 16px; height: 16px; }
+
+/* 按钮内 SVG 与文字的对齐基线。
+ * 必须显式给尺寸：SVG 元素不带 width/height 属性时按替换元素的
+ * 默认尺寸（约 300×150）渲染，会把按钮撑爆（2026-10-24 实测翻车）。 */
+.btn svg { width: 15px; height: 15px; flex: none; }
+.btn-icon svg { width: 16px; height: 16px; }
+
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.mono { font-family: Consolas, "Cascadia Mono", monospace; }
+.hidden { display: none; }
+.warn { color: var(--warn); font-size: 12.5px; }
+.link { color: var(--accent); }
+
+/* ---------------------------------------------------------------------------
+ * 居中卡（初始化 / 解锁 / 设备授权）
+ * ------------------------------------------------------------------------- */
+
+.center-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.card {
+  width: 460px;
+  max-width: 94vw;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  animation: card-in 0.22s ease-out;
+}
+@keyframes card-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 品牌行：小 logo + 名称 */
+.brand-row { display: flex; align-items: center; gap: 10px; margin: 0; }
+.brand-row svg { width: 26px; height: 26px; color: var(--accent); }
+.brand { font-size: 21px; margin: 0; letter-spacing: 0.4px; font-weight: 650; }
+
+/* 居中卡内的主按钮全宽（表单卡的主 CTA 惯例，视觉重量与其职责匹配） */
+.init-card .btn-primary { width: 100%; }
+
+/* 搜索框：内嵌放大镜 */
+.search-wrap { position: relative; }
+.search-wrap svg {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 15px;
+  height: 15px;
+  color: var(--faint);
+  pointer-events: none;
+}
+.search-wrap .input { padding-left: 33px; }
+
+.device-code {
+  font: 700 30px/1.2 Consolas, monospace;
+  letter-spacing: 4px;
+  text-align: center;
+  background: var(--bg-soft);
+  border: 1px dashed var(--line-bright);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+/* 授权页：标题行（左侧标题 + 右侧语言切换）与授权码行（码框 + 复制按钮） */
+.device-head { display: flex; align-items: center; }
+.device-head h2 { margin: 0; flex: 1; }
+.code-row { display: flex; align-items: center; gap: 8px; }
+.code-row .device-code { flex: 1; }
+/* 快捷语言切换：品牌行/标题行右端的紧凑控件。
+ * 尺寸刻意比 btn-small 更小（2026-10-25 反馈：默认小按钮仍偏大）——
+ * 它是角落辅助控件，不应与品牌名争视觉焦点。 */
+.lang-toggle {
+  margin-left: auto;
+  padding: 3px 9px;
+  font-size: 12px;
+}
+.lang-toggle svg { width: 13px; height: 13px; }
+.steps { padding-left: 20px; display: grid; gap: 6px; }
+
+/* ---------------------------------------------------------------------------
+ * 主界面骨架
+ * ------------------------------------------------------------------------- */
+
+/* 宽屏自适应（2026-10-26 主人选定多列网格）：内容上限放宽，记录列表
+ * 按容器宽度自动排 1/2/3 列；顶栏/工具栏始终横跨全宽 */
+.shell { max-width: 1400px; margin: 0 auto; padding: 20px 24px 48px; }
+.topbar { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+.topbar-brand { flex: 1; display: flex; align-items: center; gap: 9px; }
+.topbar-brand svg { width: 22px; height: 22px; color: var(--accent); }
+.chips { display: flex; gap: 6px; }
+.chip {
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+.chip-warn { color: var(--warn); border-color: rgba(216, 160, 58, 0.5); }
+
+.toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
+.search { flex: 1; }
+
+.record-list {
+  display: grid;
+  gap: 10px;
+  /* 卡片最小 420px：≥~900px 窗口两列，≥~1330px 三列，窄窗口单列；
+   * align-items:start 让各卡片按自身内容高，不互相拉伸 */
+  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  align-items: start;
+}
+
+/* 空状态：描边大图标 + 主提示（1Password/Bitwarden 的空库提示范式） */
+.empty {
+  text-align: center;
+  color: var(--muted);
+  border: 1px dashed var(--line-bright);
+  border-radius: var(--radius-lg);
+  padding: 44px 0 36px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.empty svg { width: 40px; height: 40px; color: var(--faint); }
+.empty .empty-title { color: var(--text); font-weight: 600; }
+
+/* ---------------------------------------------------------------------------
+ * 记录卡片
+ * ------------------------------------------------------------------------- */
+
+.record {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  display: grid;
+  gap: 6px;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+.record:hover { border-color: var(--line-bright); background: var(--card-2); }
+.record-head { display: flex; align-items: center; gap: 10px; }
+.record-name { font-weight: 600; font-size: 15px; }
+.record-url { color: var(--muted); font-size: 12.5px; word-break: break-all; }
+/* 字段行：内容 + 行内复制按钮。按钮始终紧跟字段值（1Password 模式），
+ * 不推到行尾——两条行共用同一视觉规则；长 URL 自然把按钮挤到右边。 */
+.record-url-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.record-url-row .record-url { flex: 0 1 auto; min-width: 0; }
+/* 行内复制按钮：比右侧操作簇更小更淡（半透明），悬停/卡片悬停时提亮，
+ * 静置时不与内容抢视觉焦点 */
+.btn-inline {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  opacity: 0.55;
+  transition: opacity var(--t-fast);
+}
+.btn-inline svg { width: 13px; height: 13px; }
+.btn-inline:hover, .record:hover .btn-inline { opacity: 1; }
+.record-key { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.record-key code {
+  color: var(--text);
+  background: var(--bg-soft);
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+.notes { color: var(--muted); font-size: 12.5px; }
+.record-foot { display: flex; align-items: center; gap: 10px; }
+.record-actions { margin-left: auto; display: flex; gap: 4px; }
+
+.badge {
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 2px 9px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.badge-openai { color: #19b58a; border-color: rgba(25, 181, 138, 0.45); }
+.badge-anthropic { color: var(--warn); border-color: rgba(216, 160, 58, 0.45); }
+
+/* 校验状态：色点 + 文字（点在暗底上的辨识度高于纯文字色） */
+.check {
+  font-size: 12px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.check::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.check-valid { color: var(--ok); }
+.check-valid::before { background: var(--ok); }
+.check-invalid { color: var(--err); }
+.check-invalid::before { background: var(--err); }
+.check-no_permission, .check-rate_limited { color: var(--warn); }
+.check-no_permission::before, .check-rate_limited::before { background: var(--warn); }
+
+/* ---------------------------------------------------------------------------
+ * 编辑抽屉（右侧滑入）
+ * ------------------------------------------------------------------------- */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 9, 14, 0.62);
+  display: flex;
+  justify-content: flex-end;
+  z-index: 50;
+  animation: overlay-in 0.2s ease-out;
+}
+@keyframes overlay-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* 居中确认弹窗（自绘替代 window.confirm——WebView2 给原生对话框硬塞
+ * "tauri" 标题且样式不受主题控制，2026-10-25 反馈） */
+.confirm-overlay { justify-content: center; align-items: center; }
+.dialog {
+  width: 360px;
+  max-width: 92vw;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  animation: card-in 0.22s ease-out;
+}
+.dialog-msg { margin: 0; font-size: 14px; line-height: 1.55; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+.drawer {
+  width: 440px;
+  max-width: 96vw;
+  height: 100%;
+  background: var(--card);
+  border-left: 1px solid var(--line);
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  box-shadow: -16px 0 48px rgba(0, 0, 0, 0.5);
+  animation: drawer-in var(--t-drawer);
+}
+@keyframes drawer-in {
+  from { transform: translateX(48px); opacity: 0.4; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.drawer h2, .settings h2 { margin: 8px 0 2px; font-size: 16px; }
+.field-row { display: flex; gap: 8px; }
+.field-row .input:not(.grow) { width: 40%; flex: none; }
+.grow { flex: 1; }
+/* 校验失败的输入框：红边 + 聚焦，修正输入立即恢复（2026-10-26 主人
+ * 要求"圈红不合规范的输入框"，比纯文字提示直观） */
+.input-invalid,
+.input-invalid:focus {
+  border-color: var(--err) !important;
+}
+/* 行内字段错误：紧贴所属输入框下方（2026-10-26 主人要求：哪个框
+ * 失败提示就贴着哪个框，不再统一甩到表单底部） */
+.field-err {
+  color: var(--err);
+  font-size: 12.5px;
+  margin: 2px 0 0;
+  grid-column: 1 / -1;
+}
+/* 密码行：输入框 + 眼睛按钮，按钮相对较高的输入框垂直居中 */
+.pass-row { align-items: center; }
+
+/* WebView2（Edge 内核）给 type=password 渲染原生"眼睛"按钮（::-ms-reveal）：
+ * 只在悬停时出现、点击一次即消失，行为不受页面控制（2026-10-25 实测）。
+ * 全局隐藏，密码可见性统一由应用自己的眼睛按钮切换。 */
+input[type="password"]::-ms-reveal,
+input[type="password"]::-ms-clear {
+  display: none;
+}
+.drawer-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+/* ---------------------------------------------------------------------------
+ * 设置
+ * ------------------------------------------------------------------------- */
+
+.settings { display: grid; gap: 10px; }
+/* 设置页保存按钮右对齐（表单操作区的常规位置） */
+.settings .btn-primary { justify-self: end; }
+.setting-row { display: flex; align-items: center; gap: 10px; }
+.setting-row label { flex: 1; }
+.num { width: 90px; }
+/* 设置行的下拉框（主题/语言）：显式高特异性宽度，绝不回退到 .input 的 100%。
+ * 200px 容纳"跟随系统 / Follow system" + 下拉箭头；flex:none 保证不被压缩。 */
+.setting-row select.input {
+  width: 200px;
+  flex: none;
+}
+
+/* ---------------------------------------------------------------------------
+ * toast 与忙碌态
+ * ------------------------------------------------------------------------- */
+
+.toast-wrap {
+  position: fixed;
+  bottom: 26px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  z-index: 100;
+  pointer-events: none;
+}
+.toast {
+  background: rgba(30, 39, 54, 0.92);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 9px 18px;
+  font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  animation: toast-in 0.18s ease-out;
+}
+.toast-ok { border-color: rgba(52, 176, 111, 0.55); }
+/* 错误 toast：红字 + 红边 + 微红底，与成功 toast 叠放时一眼可分
+ * （曾只有红字，暗色背景上与成功 toast 观感接近，叠放像同一条提示） */
+.toast-err {
+  border-color: rgba(224, 96, 96, 0.6);
+  color: #f0b9b9;
+  background: rgba(96, 34, 34, 0.92);
+}
+/* 亮色主题的 .toast 背景优先级更高（html[data-theme] 前缀），错误红底需同前缀覆盖 */
+html[data-theme="light"] .toast-err {
+  background: rgba(253, 235, 235, 0.97);
+  border-color: rgba(190, 60, 60, 0.45);
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 忙碌按钮：旋转指示 + 文案由 JS 替换为 "Xxx…" */
+.btn-busy { pointer-events: none; }
+.btn-busy::before {
+  content: "";
+  width: 11px;
+  height: 11px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  display: inline-block;
+  vertical-align: -1px;
+  margin-right: 7px;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+/* 图标按钮忙碌时只有旋转指示，去掉文字版的多余右边距 */
+.btn-icon.btn-busy::before { margin-right: 0; }

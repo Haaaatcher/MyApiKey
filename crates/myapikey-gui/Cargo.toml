@@ -1,0 +1,36 @@
+[package]
+name = "myapikey-gui"
+description = "MyApiKey 窗口前端（Tauri 2，仅发布 Windows）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# 发布版隐藏控制台窗口（开发版保留便于看日志）
+[lib]
+name = "myapikey_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "myapikey-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+myapikey-core.workspace = true
+tauri.workspace = true
+tauri-plugin-single-instance.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+arboard.workspace = true
+tauri-plugin-updater = "2.14.0"
+
+[features]
+default = ["secret-service"]
+# GUI 只发布 Windows（keyring 走 windows-native），此开关仅为与 CLI 行为对齐。
+secret-service = ["myapikey-core/secret-service"]

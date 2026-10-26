@@ -1,0 +1,16 @@
+{
+  "name": "myapikey-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "icon": "tauri icon ../../assets/logo.png"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  }
+}
