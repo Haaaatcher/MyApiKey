@@ -905,11 +905,13 @@ pub fn sync() -> Result<()> {
 
 /// `status`：仓库与同步状态总览。
 pub fn status() -> Result<()> {
-    let c = ctx()?;
+    let mut c = ctx()?;
     if !c.dirs.is_initialized() {
         println!("Not initialized. Start with: mak init");
         return Ok(());
     }
+    // 1.0.0 → 1.1.0 升级迁移（幂等）：升级用户跑一次 status 即恢复绑定
+    sync::migrate_legacy_git(&c.dirs, &mut c.config);
     let info = sync::status_summary(&c.dirs, &c.config)?;
 
     match &info.remote {

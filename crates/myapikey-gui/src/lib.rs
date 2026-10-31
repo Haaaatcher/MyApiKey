@@ -290,6 +290,16 @@ fn session_of(g: &mut Inner) -> std::result::Result<&mut Session, Error> {
 /// # Errors
 /// 目录解析类错误（极少）。
 pub fn state_view(sh: &Shared) -> Result<GuiState> {
+    // 1.0.0 → 1.1.0 升级迁移（幂等，进程内一次）：repo/.git 里的旧
+    // 绑定抢救到应用 config——必须在读取绑定状态之前完成，否则升级后
+    // 设置页显示未绑定（2026-10-31 v1.1.0 升级反馈）。gui_state 是
+    // GUI 启动的第一个命令，迁移挂这里。
+    static LEGACY_MIGRATED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !LEGACY_MIGRATED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let mut cfg = sh.config();
+        myapikey_core::sync::migrate_legacy_git(&sh.dirs, &mut cfg);
+    }
     let has_remembered = keychain::get_with_expiry(&sh.dirs).ok().flatten().is_some();
     let unlocked = enter(&sh.inner).session.is_some();
     Ok(GuiState {

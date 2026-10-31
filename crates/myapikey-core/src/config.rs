@@ -86,7 +86,14 @@ impl AppConfig {
             return Ok(Self::default());
         }
         let raw = std::fs::read_to_string(&dirs.config_path)?;
-        toml::from_str(&raw).map_err(|e| Error::Serde(format!("failed to parse config.toml: {e}")))
+        toml::from_str(&raw).map_err(|e| {
+            // 解析失败留档（config.toml.bad）：调用方随后任何 save 都会
+            // 以默认值覆盖本文件，没有这份副本用户配置就真丢了
+            // （2026-10-31 升级丢绑定事故的防丢加固）
+            let bak = dirs.config_path.with_extension("toml.bad");
+            let _ = std::fs::copy(&dirs.config_path, &bak);
+            Error::Serde(format!("failed to parse config.toml: {e}"))
+        })
     }
 
     /// 写回 `config.toml`（原子写：先写临时文件再改名，避免半截文件）。

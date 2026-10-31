@@ -350,32 +350,45 @@ pub fn sync(
 ///
 /// 迁移读取用一次性 git 子进程调用（本模块唯一的 spawn——仅服务
 /// 存量迁移，新装机器 `.git` 不存在自然跳过；未来版本可移除）。
-fn migrate_legacy_git(dirs: &AppDirs, cfg: &mut AppConfig) {
+pub fn migrate_legacy_git(dirs: &AppDirs, cfg: &mut AppConfig) {
     let git_dir = dirs.repo_dir.join(".git");
     if !git_dir.is_dir() {
         return;
     }
     // config 已有绑定（可能用户在新版里改过）：以新值为准，直接清理
-    if cfg.remote_repo.is_none() {
-        let url = std::process::Command::new("git")
-            .args([
-                "-C",
-                &dirs.repo_dir.to_string_lossy(),
-                "remote",
-                "get-url",
-                "origin",
-            ])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|u| !u.is_empty());
-        if let Some(Ok(repo)) = url.as_deref().map(crate::remote::parse_github_repo) {
+    if cfg.remote_repo.is_some() {
+        let _ = std::fs::remove_dir_all(&git_dir);
+        return;
+    }
+    let url = std::process::Command::new("git")
+        .args([
+            "-C",
+            &dirs.repo_dir.to_string_lossy(),
+            "remote",
+            "get-url",
+            "origin",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|u| !u.is_empty());
+    match url.as_deref().map(crate::remote::parse_github_repo) {
+        Some(Ok(repo)) => {
             cfg.remote_repo = Some(repo);
             let _ = cfg.save(dirs);
+            // 抢救成功才清理 .git；失败保留待下次重试——
+            // 无 git 命令的环境里贸然删除 = 绑定永久丢失
+            // （2026-10-31 升级迁移审查修复）
+            let _ = std::fs::remove_dir_all(&git_dir);
+        }
+        _ => {
+            // 抢救失败（git 不可用 / 非 GitHub 形态）：保留现场，
+            // 并把原 config 留档以防后续写入覆盖（用户可对照恢复）
+            let bak = dirs.config_path.with_extension("toml.migrated-bad");
+            let _ = std::fs::copy(&dirs.config_path, &bak);
         }
     }
-    let _ = std::fs::remove_dir_all(&git_dir);
 }
 
 /// 判断错误文本是否属于"认证/授权失败"（HTTP 401/403 的结构化
