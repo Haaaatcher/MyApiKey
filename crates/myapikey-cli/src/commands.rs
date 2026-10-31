@@ -3,13 +3,12 @@
 //! 每个命令的套路一致：组装上下文 → 获取实例锁 → 解锁 vault →
 //! 调 core 完成业务 → 打印结果。交互（提问/确认/隐藏输入）只发生在这里。
 
-use crate::cli::RemoteAction;
+use crate::cli::{PasswdAction, RemoteAction};
 use crate::prompt::{self, confirm, new_passphrase, prompt_line};
 use crate::table;
 use myapikey_core::model::{Protocol, Record, VaultData};
 use myapikey_core::paths::AppDirs;
 use myapikey_core::probe;
-use myapikey_core::store::Store;
 use myapikey_core::sync::{self, SyncOutcome};
 use myapikey_core::{check_cache, config::AppConfig, keychain, lock, vault, Error, Result};
 use std::path::Path;
@@ -17,7 +16,6 @@ use std::path::Path;
 /// 一条命令执行期的公共上下文。
 struct Ctx {
     dirs: AppDirs,
-    store: Store,
     config: AppConfig,
 }
 
@@ -29,15 +27,26 @@ struct Ctx {
 fn ctx() -> Result<Ctx> {
     let dirs = AppDirs::load()?;
     let config = AppConfig::load(&dirs)?;
-    let mut store = Store::new(&dirs.repo_dir);
-    if let Ok(Some(token)) = myapikey_core::github::keychain_token() {
-        store = store.with_auth(myapikey_core::github::GitAuth::github_token(&token));
-    }
-    Ok(Ctx {
-        store,
-        dirs,
-        config,
-    })
+    Ok(Ctx { dirs, config })
+}
+
+/// 组装同步通道：config 里的远端仓库 + keychain 现读 token（D25）。
+///
+/// 返回 `None` = 未绑定远端（单机模式）。
+///
+/// # Errors
+/// remote 地址不是 GitHub 形态；绑定了远端但无授权。
+fn remote_of(c: &Ctx) -> Result<Option<Box<dyn myapikey_core::remote::SyncStore>>> {
+    let Some(url) = c.config.remote_repo.clone() else {
+        return Ok(None);
+    };
+    let Some(token) = myapikey_core::github::keychain_token()? else {
+        return Err(Error::Usage(
+            "a remote is bound but no GitHub authorization exists on this machine.              Run `mak init` to re-authorize"
+                .into(),
+        ));
+    };
+    Ok(Some(myapikey_core::sync::open_remote(&url, &token)?))
 }
 
 /// 未初始化时的统一报错。
@@ -54,39 +63,64 @@ fn load_vault(c: &Ctx, passphrase: &str) -> Result<VaultData> {
     vault::decrypt(&bytes, passphrase)
 }
 
-/// 保存 + 提交 +（按配置）自动推送，并打印同步摘要。
-fn save_and_report(c: &Ctx, passphrase: &str, data: &VaultData) -> Result<()> {
-    // 自动推送走网络，同样给等待指示（未绑远端/关闭推送时瞬间通过）
-    let run = |c: &Ctx| -> Result<SyncOutcome> {
-        let _spin = prompt::wait_spinner("Saving & syncing…");
-        let out = sync::save(&c.store, &c.dirs, passphrase, data, c.config.auto_push);
+/// 保存与推送是两个独立感知的阶段：
+/// - "Saving…" → 本地加密落盘（成功即数据安全，与网络无关）；
+/// - "Syncing to GitHub…" → 上传（可能因网络失败，失败后本地仍可用，
+///   `mak sync` 补推）。令牌现读现用（重试自然用续期后的新凭据）。
+fn save_and_report(c: &mut Ctx, passphrase: &str, data: &VaultData) -> Result<()> {
+    let run = |c: &mut Ctx| -> Result<()> {
+        // ---- 阶段 1：本地保存（毫秒级，无网络）----
+        let bytes = {
+            let _spin = prompt::wait_spinner("Saving…");
+            sync::save_local(&c.dirs, passphrase, data, &mut c.config)?
+        };
+        prompt::ok("Saved locally");
+
+        // ---- 阶段 2：推送（auto_push 且已绑远端才执行）----
+        if !c.config.auto_push {
+            println!("  Auto-push is off; run `mak sync` to sync manually.");
+            return Ok(());
+        }
+        let remote = remote_of(c)?;
+        let Some(remote) = remote else {
+            println!("  Standalone mode: nothing to sync.");
+            return Ok(());
+        };
+        let _spin = prompt::wait_spinner("Syncing to GitHub…");
+        let expect = c.config.last_sync_sha.clone();
+        // 推送失败不整体报错（2026-10-31 审查修复 M2）：本地阶段 1 已
+        // 保存成功，push_pending 已置位，`mak sync` 会补推——两阶段解耦
+        // 的语义就是网络失败不掩盖保存成功
+        if let Err(e) = push_initialized(
+            remote.as_ref(),
+            &c.dirs,
+            &mut c.config,
+            &bytes,
+            expect,
+            data.alive_records().count(),
+        ) {
+            drop(_spin);
+            prompt::warn(&format!(
+                "Sync failed: {e}\n  Data is saved locally; run `mak sync` to retry."
+            ));
+            return Ok(());
+        }
         drop(_spin);
-        out
+        prompt::ok("Synced to GitHub");
+        Ok(())
     };
     // 认证失败 → 刷新令牌静默续期后重试一次（与 sync 同策略）
-    let out = match run(c) {
+    match run(c) {
         Err(e)
             if sync::is_auth_error(&e.to_string())
                 && myapikey_core::github::try_refresh_and_store(
-                    myapikey_core::github::CLIENT_ID,
+                    &myapikey_core::github::effective_client_id()?,
                 ) =>
         {
             println!("⟳ GitHub authorization refreshed; retrying…");
-            run(c)?
+            run(c)
         }
-        other => other?,
-    };
-    report_push(&out);
-    Ok(())
-}
-
-/// 打印推送结果（失败不视为命令失败）。
-fn report_push(out: &SyncOutcome) {
-    if let Some(err) = &out.push_error {
-        println!("⚠ Saved locally, but push failed: {err}");
-        println!("  The remote usually has new changes.\n  Run `mak sync` to merge and push.");
-    } else if out.pushed {
-        println!("✓ Pushed to remote");
+        other => other,
     }
 }
 
@@ -94,177 +128,239 @@ fn report_push(out: &SyncOutcome) {
 // init
 // ---------------------------------------------------------------------------
 
-/// `init`：设主密码、建本地仓库、（可选）绑远端。
+/// `init`：初始化本机（交互式）。
 ///
-/// 远端分两种情况：
-/// - 远端**已有数据**（main 分支存在）→ **克隆接入**：新设备拿到完整历史，
-///   并立即验证主密码能解开远端 vault（所有设备必须同一主密码）；
-/// - 远端为空/未建 → 全新初始化，绑定远端并做首次推送。
-pub fn init(remote: Option<&str>, github: Option<&str>) -> Result<()> {
+/// - 无参：交互询问是否同步到 GitHub 私有仓库；
+/// - 带仓库参数（`owner/name`、完整 URL 或裸名）：跳过询问直接绑定。
+///
+/// 同步路径自动处理：授权（有效令牌复用，否则浏览器 Device Flow）、
+/// 建仓/复用、数据对账（远端有数据 → 输入主密码接入，密码错误原地
+/// 重问；空仓库 → 设置新主密码并上传基线）。
+pub fn init(repo: Option<&str>) -> Result<()> {
     let mut c = ctx()?;
-    if c.dirs.is_initialized() {
-        // 已初始化 + --github：授权刷新路径（token 失效自愈）。不动 vault，
-        // 只重走鉴权并把 remote 重新指向同步仓库。
-        if let Some(name) = github {
-            let (url, token) = github_setup(name)?;
-            c.store = c
-                .store
-                .clone()
-                .with_auth(myapikey_core::github::GitAuth::github_token(&token));
-            c.store.set_remote(&url)?;
-            println!("✓ GitHub authorization ready, remote re-bound: {url}");
-            println!("  Run `mak sync` to sync now.");
-            return Ok(());
-        }
+    let reinit = c.dirs.is_initialized();
+    // 已初始化 + 无参：无法推断意图（改绑？解绑？对账？）——引导到
+    // 各自的正路，绝不静默改状态
+    if reinit && repo.is_none() {
         return Err(Error::Usage(
-            "already initialized on this machine; to reset, delete the config directory manually"
+            "already initialized on this machine.\n  \
+             Re-bind / switch repo: mak remote set <owner/repo>\n  \
+             Unbind (standalone):   mak remote unset\n  \
+             Reconcile with remote: mak sync"
                 .into(),
         ));
     }
 
-    // 环境变量提供了主密码则跳过交互（脚本化初始化/CI 场景）
-    let passphrase = match std::env::var(prompt::PASSPHRASE_ENV) {
-        Ok(p) if !p.is_empty() => {
-            println!("Using the passphrase from {}.", prompt::PASSPHRASE_ENV);
-            p
-        }
-        _ => new_passphrase()?,
-    };
+    // ---- 同步意愿：参数直填 = 同步；无参 = 交互询问 ----
+    let wants_remote =
+        repo.is_some() || prompt::confirm("Sync to a private GitHub repository?", true);
 
-    // --github：Device Flow 鉴权 → 自动创建/识别仓库（ADR D13），
-    // 之后统一走既有的 --remote 流程；token 附到 Store 供本次与后续 push 使用
-    let mut remote = remote.map(str::to_string);
-    if let Some(name) = github {
-        let (url, token) = github_setup(name)?;
-        remote = Some(url);
-        c.store = c
-            .store
-            .clone()
-            .with_auth(myapikey_core::github::GitAuth::github_token(&token));
-    }
-    let remote = remote.as_deref();
-
-    // 分支一：远端已有 vault → 克隆接入（第二台及以后的设备走这条路）
-    let mut record_count = 0usize;
-    let mut joined_existing = false;
-    if let Some(url) = remote {
-        if myapikey_core::store::remote_has_main(url, c.store.auth())? {
-            std::fs::create_dir_all(&c.dirs.config_dir)?;
-            match join_existing(&c, url, &passphrase) {
-                Ok(n) => {
-                    record_count = n;
-                    joined_existing = true;
-                }
-                // 克隆成功但密码解不开远端 vault：删掉刚克隆的目录，
-                // 让用户换正确密码后可以重新 init（避免卡在“已初始化”状态）
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&c.dirs.repo_dir);
-                    return Err(e);
-                }
+    // ---- 分支 A：纯单机（不同步）——设置新的主密码，零远端操作 ----
+    if !wants_remote {
+        let passphrase = match std::env::var(prompt::PASSPHRASE_ENV) {
+            Ok(p) if !p.is_empty() => {
+                println!("Using the passphrase from {}.", prompt::PASSPHRASE_ENV);
+                p
             }
-        }
-    }
-
-    // 分支二：全新初始化（无远端，或远端还是空仓库）
-    if !joined_existing {
+            _ => new_passphrase()?,
+        };
         c.dirs.ensure_dirs()?;
-        c.store.ensure_init()?;
-        // 空 vault 落盘 + 首次提交
-        sync::save(&c.store, &c.dirs, &passphrase, &VaultData::empty(), false)?;
-        if let Some(url) = remote {
-            c.store.set_remote(url)?;
-            match c.store.push() {
-                Ok(()) => println!("✓ Remote bound, first push done: {url}"),
-                Err(e) => println!("⚠ Remote bound, but the first push failed: {e}\n  Run `mak sync` later to retry."),
-            }
+        sync::save(
+            &c.dirs,
+            &passphrase,
+            &VaultData::empty(),
+            None,
+            false,
+            &mut c.config,
+        )?;
+        let days = c.config.remember_days;
+        if days > 0 {
+            let _ = keychain::set_ttl(&c.dirs, &passphrase, days);
         }
+        prompt::ok("Initialized (standalone).");
+        println!("  Vault: {}", c.dirs.vault_path.display());
+        println!("  Bind a remote later: mak remote set <owner/repo>");
+        return Ok(());
     }
 
-    // 按 TTL 记住密码（2026-10-24 决议：默认 7 天，输入一次即可；
-    // remember_days = 0 时跳过）。不再逐次询问——行为由 config.toml 统一控制。
-    let days = c.config.remember_days;
-    if days > 0 {
-        match keychain::set_ttl(&c.dirs, &passphrase, days) {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("⚠ Cannot remember the passphrase: {e}\n  It will be asked every time.")
-            }
-        }
-    }
-
-    println!(
-        "✓ Initialized with {}.",
-        plural(record_count as u32, "record")
-    );
-    if joined_existing {
-        println!("  Joined an existing vault; run `mak sync` to get the latest.");
-    }
-    if days > 0 {
-        println!(
-            "  Passphrase remembered for {}.\n  Lock any time with `mak forget`.",
-            plural(days, "day")
-        );
-    } else {
-        println!("  Passphrase remembering is disabled (remember_days = 0).");
-    }
-    println!("  Repository: {}", c.dirs.repo_dir.display());
-    if remote.is_none() {
-        println!("  No remote yet.\n  For multi-device sync run: mak remote set <url>");
-    }
-    Ok(())
-}
-
-/// 克隆远端并验证主密码，返回接入的记录数。
-fn join_existing(c: &Ctx, url: &str, passphrase: &str) -> Result<usize> {
-    myapikey_core::store::clone_into(url, &c.dirs.repo_dir, c.store.auth())?;
-    let bytes = std::fs::read(&c.dirs.vault_path)?;
-    let data = vault::decrypt(&bytes, passphrase).map_err(|_| {
-        Error::Usage(
-            "cannot decrypt the remote vault with the given passphrase. All devices \
-             must share one master passphrase. Make sure the URL points to a MyApiKey \
-             sync repository"
+    // ---- 分支 B：同步到 GitHub 私有仓库 ----
+    // 已初始化机器到此为止（2026-10-31 审查修复 S1）：接入/建基线分支
+    // 会以远端内容（或空 vault）覆盖本地 vault——本地未推送的记录会
+    // 静默丢失。换绑走 remote set（不动数据），对账走 sync
+    if reinit {
+        return Err(Error::Usage(
+            "already initialized on this machine.\n  \
+             Re-bind / switch repo: mak remote set <owner/repo>\n  \
+             Unbind (standalone):   mak remote unset\n  \
+             Reconcile with remote: mak sync"
                 .into(),
-        )
-    })?;
-    let n = data.alive_records().count();
-    println!("✓ Joined from remote: {url}");
-    Ok(n)
-}
+        ));
+    }
 
-/// `--github` 流程：拿到可用 token（凭据库优先，否则 Device Flow），
-/// 检测/创建私有仓库。返回 (克隆地址, token)——token 由调用方挂到 Store。
-fn github_setup(repo_name: &str) -> Result<(String, String)> {
-    use myapikey_core::github;
-    let client_id = github::effective_client_id()?;
+    // ① 授权：凭据库有效令牌复用；没有/失效 → 浏览器 Device Flow
+    let token = ensure_github_token()?;
 
-    // token：优先复用凭据库里**确认仍有效**的（失效条目会被顺手清除并重新授权——
-    // 授权被撤销/过期是同步报 "Repository not found" 的最常见原因）
-    let token = match github::valid_keychain_token()? {
-        Some(t) => {
-            println!("Using the saved GitHub authorization.");
-            t
+    // ② 解析 owner/name：owner 恒等于授权账号（归属校验 fail fast——
+    // 否则错配 owner 会产出"误建仓 + 绑定错位"的混乱状态）
+    let login = myapikey_core::github::api_login(&token)?;
+    let (owner, name) = match repo {
+        Some(arg) => match myapikey_core::remote::parse_github_repo(arg) {
+            Ok(id) => {
+                let (o, n) = id
+                    .split_once('/')
+                    .expect("parse_github_repo guarantees one slash");
+                (o.to_string(), n.to_string())
+            }
+            // 裸名字 → 归属当前授权账号
+            _ => (login.clone(), arg.to_string()),
+        },
+        None => (
+            login.clone(),
+            myapikey_core::github::DEFAULT_REPO_NAME.to_string(),
+        ),
+    };
+    if owner != login {
+        return Err(Error::Usage(format!(
+            "repo owner `{owner}` does not match the authorized account `{login}`.\n  \
+             mak syncs to a private repo under the authorized account.\n  \
+             Tip: `mak init {name}` places it under your account automatically."
+        )));
+    }
+
+    // ③ 建仓/复用：不存在则自动创建私有仓库
+    let _url = myapikey_core::github::api_ensure_repo(&token, &owner, &name)?;
+    let repo_id = format!("{owner}/{name}");
+    prompt::ok(&format!(
+        "Sync repository ready (private): https://github.com/{repo_id}"
+    ));
+
+    // ④ 数据对账：远端有数据 → 接入；空 → 设置新密码并上传基线
+    let gh = sync::open_remote(&repo_id, &token)?;
+    let gh_dyn: &dyn myapikey_core::remote::SyncStore = &gh;
+    let head = gh_dyn.fetch_head()?;
+
+    let record_count;
+
+    match head {
+        Some(h) => {
+            // 发现远端加密数据 → 此刻才要求输入主密码（解锁语义），
+            // 密码错误原地重问；管道 EOF 直接报错退出。
+            // env 密码只读一次、失败即退（2026-10-31 审查修复 M3：读在
+            // 循环体内时，错误的 env 密码 + 交互终端 = 每轮重读同一个
+            // 错误值无限重问）
+            let remote_data;
+            let pw;
+            let env_pw = match std::env::var(prompt::PASSPHRASE_ENV) {
+                Ok(p) if !p.is_empty() => Some(p),
+                _ => None,
+            };
+            loop {
+                let attempt = match &env_pw {
+                    Some(p) => {
+                        println!("Using the passphrase from {}.", prompt::PASSPHRASE_ENV);
+                        p.clone()
+                    }
+                    None => prompt::prompt_hidden_optional("Master passphrase"),
+                };
+                match vault::decrypt(&h.bytes, &attempt) {
+                    Ok(d) => {
+                        remote_data = d;
+                        pw = attempt;
+                        break;
+                    }
+                    Err(_) => {
+                        if !prompt::is_interactive() {
+                            return Err(Error::Usage(
+                                "cannot decrypt the remote vault with the given passphrase. \
+                                 All devices must use the same master passphrase"
+                                    .into(),
+                            ));
+                        }
+                        // env 密码错误没有重试意义（每轮都是同一个值）
+                        if env_pw.is_some() {
+                            return Err(Error::Usage(
+                                "cannot decrypt the remote vault with the passphrase from \
+                                 the environment variable"
+                                    .into(),
+                            ));
+                        }
+                        println!("Wrong passphrase or corrupted data; try again.");
+                    }
+                }
+            }
+            record_count = remote_data.alive_records().count();
+            sync::atomic_write_vault(&c.dirs, &h.bytes)?;
+
+            let mut cfg = c.config.clone();
+            cfg.remote_repo = Some(repo_id.clone());
+            cfg.save(&c.dirs)?;
+            c.config = cfg;
+            // 接入 = 本地与远端一致：统一走 mark_synced 记账（含
+            // last_sync_at——此前手写漏了这个字段，绑定即同步却显示 never）
+            sync::mark_synced(&c.dirs, &mut c.config, h.sha);
+
+            // ---- 按 TTL 记住密码 ----
+            let days = c.config.remember_days;
+            if days > 0 {
+                match keychain::set_ttl(&c.dirs, &pw, days) {
+                    Ok(()) => {}
+                    Err(e) => prompt::warn(&format!(
+                        "Cannot remember the passphrase: {e}\n  It will be asked every time."
+                    )),
+                }
+            }
+
+            prompt::ok(&format!(
+                "Initialized with {}.",
+                plural(record_count as u32, "record")
+            ));
+            if days > 0 {
+                println!(
+                    "  Passphrase remembered for {} (lock: mak passwd unset).",
+                    plural(days, "day")
+                );
+            } else {
+                println!("  Passphrase remembering is disabled.");
+            }
+            println!("  Vault: {}", c.dirs.vault_path.display());
+            Ok(())
         }
         None => {
-            let dc = github::start_device_flow(&client_id)?;
-            println!("GitHub authorization (one-time only):");
-            println!("  1. Open: {}", dc.verification_uri);
-            println!("  2. Enter this code: {}", dc.user_code);
-            if github::open_browser(&dc.verification_uri).is_err() {
-                println!("  Could not open a browser automatically. Copy the link above.");
-            }
-            println!("Waiting for authorization… this continues automatically.");
-            let t = github::poll_device_token(&dc, &client_id)?;
-            // refresh token 在 poll 内部已入 keychain（有才写）；这里只存 access
-            github::keychain_set_token(&t.access_token)?;
-            println!("✓ Authorized. Token saved to the credential store.\n  Clear it with `mak forget --github`.");
-            t.access_token
-        }
-    };
+            // 远端空仓库：设置新的主密码 → 建 vault 上传基线
+            let passphrase = match std::env::var(prompt::PASSPHRASE_ENV) {
+                Ok(p) if !p.is_empty() => {
+                    println!("Using the passphrase from {}.", prompt::PASSPHRASE_ENV);
+                    p
+                }
+                _ => new_passphrase()?,
+            };
+            c.dirs.ensure_dirs()?;
+            let bytes = vault::encrypt(&VaultData::empty(), &passphrase)?;
+            sync::atomic_write_vault(&c.dirs, &bytes)?;
+            let _new_sha = push_initialized(gh_dyn, &c.dirs, &mut c.config, &bytes, None, 0)?;
+            let mut cfg = c.config.clone();
+            cfg.remote_repo = Some(repo_id.clone());
+            cfg.save(&c.dirs)?;
+            c.config = cfg;
 
-    let owner = github::api_login(&token)?;
-    let url = github::api_ensure_repo(&token, &owner, repo_name)?;
-    println!("✓ Sync repository ready (private): {url}");
-    Ok((url, token))
+            let days = c.config.remember_days;
+            if days > 0 {
+                let _ = keychain::set_ttl(&c.dirs, &passphrase, days);
+            }
+            prompt::ok("Initialized with an empty vault.");
+            println!("  Baseline uploaded to: https://github.com/{repo_id}");
+            if days > 0 {
+                println!(
+                    "  Passphrase remembered for {} (lock: mak passwd unset).",
+                    plural(days, "day")
+                );
+            } else {
+                println!("  Passphrase remembering is disabled.");
+            }
+            println!("  Vault: {}", c.dirs.vault_path.display());
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +423,7 @@ pub fn add(
     models: Vec<String>,
     notes: Option<String>,
 ) -> Result<()> {
-    let c = ctx()?;
+    let mut c = ctx()?;
     require_init(&c)?;
     let _guard = lock::acquire(&c.dirs)?;
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
@@ -384,7 +480,7 @@ pub fn add(
     let id = record.id;
     let shown_name = record.name.clone();
     data.records.push(record);
-    save_and_report(&c, &passphrase, &data)?;
+    save_and_report(&mut c, &passphrase, &data)?;
     println!(
         "✓ Added \"{shown_name}\" (id: {}…)",
         &id.simple().to_string()[..8]
@@ -535,7 +631,7 @@ pub fn show(target: &str, copy: bool) -> Result<()> {
 fn copy_to_clipboard(text: &str) -> Result<()> {
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string())) {
         Ok(()) => {
-            println!("✓ API key copied to the clipboard.\n  The CLI cannot auto-clear it. Clear the clipboard history after pasting.");
+            println!("✓ API key copied.\n  The CLI cannot auto-clear it — clear the clipboard history after pasting.");
             Ok(())
         }
         Err(e) => {
@@ -547,7 +643,7 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 
 /// `edit`：逐项询问，回车保留原值。
 pub fn edit(target: &str) -> Result<()> {
-    let c = ctx()?;
+    let mut c = ctx()?;
     require_init(&c)?;
     let _guard = lock::acquire(&c.dirs)?;
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
@@ -614,14 +710,14 @@ pub fn edit(target: &str) -> Result<()> {
     }
     record.updated_at = chrono::Utc::now();
     let id = record.id;
-    save_and_report(&c, &passphrase, &data)?;
+    save_and_report(&mut c, &passphrase, &data)?;
     println!("✓ Updated \"{}\"", data.records[idx].name);
     run_probe(&c, &data, &id);
     Ok(())
 }
 /// `delete`：墓碑删除，需确认。
 pub fn delete(target: &str) -> Result<()> {
-    let c = ctx()?;
+    let mut c = ctx()?;
     require_init(&c)?;
     let _guard = lock::acquire(&c.dirs)?;
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
@@ -637,7 +733,7 @@ pub fn delete(target: &str) -> Result<()> {
         return Ok(());
     }
     data.records[idx].mark_deleted();
-    save_and_report(&c, &passphrase, &data)?;
+    save_and_report(&mut c, &passphrase, &data)?;
     println!("✓ Deleted \"{name}\"");
     Ok(())
 }
@@ -666,7 +762,9 @@ pub fn check(target: Option<&str>) -> Result<()> {
     }
 
     let mut cache = check_cache::CheckCache::load(&c.dirs);
-    for r in &targets {
+    if targets.len() == 1 {
+        // 单条：原地检测（带 spinner 指示）
+        let r = &targets[0];
         let (status, http) = probe::probe(r);
         cache.put(r.id, status, http);
         println!(
@@ -676,6 +774,25 @@ pub fn check(target: Option<&str>) -> Result<()> {
             r.base_url,
             http.map(|h| format!("(HTTP {h})")).unwrap_or_default()
         );
+    } else {
+        // 全部：核心层并发探测（2026-10-31 一键检测全部）——总耗时从
+        // "逐条之和"降为约最慢一条；结果与输入同序，输出表格不变
+        let _spin = prompt::wait_spinner(&format!(
+            "Checking {} concurrently…",
+            plural(targets.len() as u32, "record")
+        ));
+        let results = probe::probe_all(&targets);
+        drop(_spin);
+        for (r, (_id, status, http)) in targets.iter().zip(&results) {
+            cache.put(r.id, *status, *http);
+            println!(
+                "{} {} {} {}",
+                table::pad_to(status.label(), 12),
+                table::pad_to(&table::truncate_width(&r.name, 18), 18),
+                r.base_url,
+                http.map(|h| format!("(HTTP {h})")).unwrap_or_default()
+            );
+        }
     }
     cache.save(&c.dirs)?;
     Ok(())
@@ -714,59 +831,75 @@ fn run_probe(c: &Ctx, data: &VaultData, id: &uuid::Uuid) {
 
 /// `sync`：完整同步。
 pub fn sync() -> Result<()> {
-    let c = ctx()?;
+    let mut c = ctx()?;
     require_init(&c)?;
     let _guard = lock::acquire(&c.dirs)?;
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
 
-    // 网络等待指示器（2026-10-27 用户反馈）：fetch/push 可能数秒乃至
-    // 更久（坏网络下低速超时 15s），转轮让等待可感知
+    // 网络等待指示器（2026-10-27 用户反馈）：下载/上传可能数秒乃至更久，
+    // 转轮让等待可感知。连接类失败已由请求通道自动重试（3 次退避）。
     // 认证失败（token 过期/被回收）→ 用刷新令牌静默续期后重试一次；
-    // 刷新失败维持原错误（auth_hint 指向重新授权）
-    let run = |c: &Ctx| -> Result<SyncOutcome> {
-        let _spin = prompt::wait_spinner("Syncing with remote (fetch + push)…");
-        let out = sync::sync(&c.store, &c.dirs, &passphrase, c.config.tombstone_days);
+    // 刷新失败维持原错误（错误文本指向重新授权）
+    let run = |c: &mut Ctx| -> Result<SyncOutcome> {
+        let _spin = prompt::wait_spinner("Syncing with remote…");
+        let remote = remote_of(c)?;
+        let Some(remote) = remote else {
+            return Ok(SyncOutcome {
+                alive_records: std::fs::read(&c.dirs.vault_path)
+                    .ok()
+                    .and_then(|b| vault::decrypt(&b, &passphrase).ok())
+                    .map(|d| d.alive_records().count())
+                    .unwrap_or(0),
+                ..Default::default()
+            });
+        };
+        let out = sync::sync(
+            &c.dirs,
+            &passphrase,
+            remote.as_ref(),
+            c.config.tombstone_days,
+            &mut c.config,
+        );
         drop(_spin);
         out
     };
-    let out = match run(&c) {
+    let out = match run(&mut c) {
         Err(e)
             if sync::is_auth_error(&e.to_string())
                 && myapikey_core::github::try_refresh_and_store(
-                    myapikey_core::github::CLIENT_ID,
+                    &myapikey_core::github::effective_client_id()?,
                 ) =>
         {
             println!("⟳ GitHub authorization refreshed; retrying sync…");
-            run(&c)?
+            run(&mut c)?
         }
         other => other?,
     };
 
     match (&out.remote, out.pulled, out.pushed) {
         (None, _, _) => println!(
-            "Standalone mode, no remote. Nothing to sync.\n  Bind one with: mak remote set <url>"
+            "Standalone mode, no remote. Nothing to sync.\n  Bind one with: mak remote set <owner/repo>"
         ),
-        (_, true, true) => println!(
-            "✓ Synced: pulled remote changes{} and pushed",
+        (_, true, true) => prompt::ok(&format!(
+            "Synced: pulled remote changes{} and pushed",
             if out.merged {
                 ", merged divergent edits"
             } else {
                 ""
             }
-        ),
-        (_, true, false) => println!("✓ Pulled remote changes (nothing local to push)"),
-        (_, false, true) => println!("✓ Pushed local changes to remote"),
-        (Some(_), false, false) => println!("✓ Up to date (local matches remote)"),
+        )),
+        (_, true, false) => prompt::ok("Pulled remote changes"),
+        (_, false, true) => prompt::ok("Pushed to remote"),
+        (Some(_), false, false) => prompt::ok("Up to date"),
     }
     if let Some(err) = &out.push_error {
-        println!("⚠ Push failed: {err}");
+        prompt::warn(&format!("Push failed: {err}"));
     }
     println!("{}", plural(out.alive_records as u32, "active record"));
 
-    // 更新“上次同步时间”
-    let mut cfg = c.config.clone();
-    cfg.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
-    cfg.save(&c.dirs)?;
+    // 同步状态（含 last_sync_at）由 core 的 mark_synced 在"达成一致"
+    // 时记账（上传成功/下载替换/已是最新），此处不再手写——单机模式
+    // 与推送失败不应留下"刚同步过"的痕迹
     Ok(())
 }
 
@@ -777,15 +910,20 @@ pub fn status() -> Result<()> {
         println!("Not initialized. Start with: mak init");
         return Ok(());
     }
-    let info = sync::status_summary(&c.store)?;
+    let info = sync::status_summary(&c.dirs, &c.config)?;
 
-    println!("Repository : {}", c.dirs.repo_dir.display());
     match &info.remote {
         Some(u) => println!("Remote     : {u}"),
         None => println!("Remote     : none (standalone mode)"),
     }
-    println!("Unpushed   : {}", plural(info.ahead as u32, "commit"));
-    println!("To pull    : {}", plural(info.behind as u32, "commit"));
+    println!(
+        "Unpushed   : {}",
+        if info.pending {
+            "yes (run mak sync)"
+        } else {
+            "no"
+        }
+    );
     println!(
         "Last sync  : {}",
         c.config.last_sync_at.as_deref().unwrap_or("never")
@@ -808,48 +946,89 @@ pub fn status() -> Result<()> {
             }
         }
     } else {
-        println!("Records    : hidden (passphrase not remembered; unlock via any command to see)");
+        println!("Records    : hidden (unlock to see)");
     }
     Ok(())
 }
 
-/// `remote set/show`。
+/// `remote set/show/unset`。
 pub fn remote(action: RemoteAction) -> Result<()> {
-    let c = ctx()?;
+    let mut c = ctx()?;
     require_init(&c)?;
     match action {
         RemoteAction::Set { url } => {
-            c.store.set_remote(&url)?;
-            println!("✓ Remote set: {url}");
-            println!("  Sync now with: mak sync");
+            // 统一存 GitHub 形态（owner/name），完整 URL 先归一化
+            let repo = myapikey_core::remote::parse_github_repo(&url)?;
+            let mut cfg = c.config.clone();
+            cfg.remote_repo = Some(repo.clone());
+            cfg.save(&c.dirs)?;
+            c.config = cfg;
+            prompt::ok(&format!("Remote set: {repo}"));
+            // 绑定后确保授权就绪（无有效令牌 → 现场走浏览器授权）：
+            // 用户只感知仓库地址，令牌由 mak 自动打理——set 完 sync 必定可用
+            match ensure_github_token() {
+                Ok(_) => println!("  GitHub ready. Sync now with: mak sync"),
+                Err(e) => prompt::warn(&format!("{e}\n  Sync will fail until authorized.")),
+            }
         }
-        RemoteAction::Show => match c.store.remote_url()? {
-            Some(u) => println!("{u}"),
+        RemoteAction::Show => match c.config.remote_repo.clone() {
+            Some(repo) => println!("https://github.com/{repo}"),
             None => println!("no remote bound"),
         },
+        // 撤销 set：解绑远端并清除本机的 GitHub 授权（回到单机）。
+        // 解绑统一走 core 的 unbind_remote（remote_repo + 记账三件套
+        // 一次写清，与 mark_synced 对称）。vault 原样不动——数据与
+        // 远端仓库都不受影响
+        RemoteAction::Unset => {
+            let mut cfg = c.config.clone();
+            myapikey_core::sync::unbind_remote(&c.dirs, &mut cfg);
+            let token_cleared = myapikey_core::github::keychain_delete_token()?;
+            prompt::ok("Remote unbound; GitHub authorization forgotten.");
+            if token_cleared {
+                println!(
+                    "  The remote repository on GitHub is untouched.\n  Re-bind anytime with: mak remote set <owner/repo>"
+                );
+            }
+        }
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// passwd / forget
+// passwd（set / unset）
 // ---------------------------------------------------------------------------
 
-/// `passwd`：修改主密码（重加密整个 vault 并推送，同步更新凭据库）。
-pub fn passwd() -> Result<()> {
-    let c = ctx()?;
+/// `passwd`：修改主密码（无参 / `set`）；`unset` 清除本机记住的密码
+/// 副本（立即锁定；vault 不动）。
+pub fn passwd(action: Option<PasswdAction>) -> Result<()> {
+    match action {
+        Some(PasswdAction::Unset) => return passwd_unset(),
+        Some(PasswdAction::Set) | None => {}
+    }
+    let mut c = ctx()?;
     require_init(&c)?;
     let _guard = lock::acquire(&c.dirs)?;
-    let (old, _) = prompt::unlock(&c.dirs)?;
-    let data = load_vault(&c, &old)?;
+    let (old_pw, _) = prompt::unlock(&c.dirs)?;
+    let data = load_vault(&c, &old_pw)?;
 
-    let new = new_passphrase()?;
-    sync::save(&c.store, &c.dirs, &new, &data, c.config.auto_push)?;
+    let new_pw = new_passphrase()?;
+    let remote = remote_of(&c)?;
+    let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
+        .as_ref()
+        .map(|r| r as &dyn myapikey_core::remote::SyncStore);
+    sync::save(
+        &c.dirs,
+        &new_pw,
+        &data,
+        remote_dyn,
+        c.config.auto_push,
+        &mut c.config,
+    )?;
 
     // 凭据库同步：统一按 TTL 模型记住新密码（remember_days = 0 时跳过）
     let remembered = c.config.remember_days > 0
-        && keychain::set_ttl(&c.dirs, &new, c.config.remember_days).is_ok();
-    println!("✓ Master passphrase changed. Vault re-encrypted and saved");
+        && keychain::set_ttl(&c.dirs, &new_pw, c.config.remember_days).is_ok();
+    prompt::ok("Master passphrase changed.");
     if remembered {
         println!("  Credential store updated.");
     }
@@ -857,26 +1036,70 @@ pub fn passwd() -> Result<()> {
     Ok(())
 }
 
-/// `forget`：立即锁定（清除记住的主密码）；`--github` 只清除 GitHub token。
+/// `passwd unset`：清除本机记住的主密码（立即锁定）。
 ///
-/// TTL 模型下的语义：forget = "现在锁起来"。下次命令会要求输入一次，
+/// TTL 模型下的语义：unset = "现在锁起来"。下次命令会要求输入一次，
 /// 输入后又开始新的记住周期（默认 7 天）——适合借出电脑前手动上锁。
-pub fn forget(github: bool) -> Result<()> {
-    if github {
-        match myapikey_core::github::keychain_delete_token()? {
-            true => {
-                println!("✓ GitHub authorization cleared. Git now uses your local git credentials.")
-            }
-            false => println!("No saved GitHub authorization on this machine."),
-        }
-        return Ok(());
-    }
+pub fn passwd_unset() -> Result<()> {
     let c = ctx()?;
-    match keychain::delete(&c.dirs)? {
-        true => println!("✓ Locked. The passphrase was cleared from this machine.\n  The next command asks for it once, then remembers it again."),
-        false => println!("No remembered passphrase on this machine."),
+    let cleared = keychain::delete(&c.dirs)?;
+    if cleared {
+        prompt::ok("Locked. Remembered passphrase cleared.\n  The next command asks for it once, then remembers again.");
+    } else {
+        println!("No remembered passphrase on this machine.");
     }
     Ok(())
+}
+
+/// 已初始化语境下的上传（init 自身就是同步点，绕过 save 的置位语义）。
+/// 记账统一走 core 的 push_and_mark（2026-10-31 审查：手写三件套违反
+/// mark_synced 唯一写入口约定）。
+fn push_initialized(
+    remote: &dyn myapikey_core::remote::SyncStore,
+    dirs: &AppDirs,
+    cfg: &mut AppConfig,
+    bytes: &[u8],
+    expect: Option<String>,
+    alive: usize,
+) -> Result<String> {
+    myapikey_core::sync::push_and_mark(remote, dirs, cfg, bytes, expect, alive)
+}
+
+/// 确保存在可用的 GitHub 授权：凭据库里**确认仍有效**的令牌直接复用
+/// （失效条目会被顺手清除）；没有则走浏览器 Device Flow。
+fn ensure_github_token() -> Result<String> {
+    use myapikey_core::github;
+    let client_id = github::effective_client_id()?;
+
+    match github::valid_keychain_token()? {
+        Some(t) => {
+            println!("Using the saved GitHub authorization.");
+            Ok(t)
+        }
+        None => {
+            let dc = github::start_device_flow(&client_id)?;
+            println!("GitHub authorization (one-time only):");
+            println!("  1. Open: {}", dc.verification_uri);
+            println!("  2. Enter this code: {}", dc.user_code);
+            if github::open_browser(&dc.verification_uri).is_err() {
+                println!("  Could not open a browser automatically. Copy the link above.");
+            }
+            println!("Waiting for authorization… this continues automatically.");
+            let t = github::poll_device_token(&dc, &client_id)?;
+            // scope 可见化（2026-10-30 排查教训：零权限令牌是黑盒灾难）；
+            // 输出职责在 CLI——core 只回传数据
+            println!(
+                "  Token scopes: {}",
+                t.scope.as_deref().unwrap_or("(none!)")
+            );
+            // refresh token 在 poll 内部已入 keychain（有才写）；这里只存 access
+            github::keychain_set_token(&t.access_token)?;
+            prompt::ok(
+                "Authorized. Token saved to the credential store.\n  Forget it: mak remote unset.",
+            );
+            Ok(t.access_token)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -926,7 +1149,7 @@ pub fn export(path: &Path) -> Result<()> {
         plural(alive.len() as u32, "record")
     );
     println!("  {}", out_path.display());
-    println!("  A plaintext file is a leak risk. Delete it as soon as you are done.");
+    println!("  Plaintext is a leak risk — delete it when done.");
     if !confirm("Export plaintext?", false)
         || !confirm("Really continue despite the leak risk?", false)
     {
@@ -960,7 +1183,7 @@ fn restrict_permissions(path: &Path) {
 
 /// `import`：从 JSON 导入（兼容导出格式与裸数组）。
 pub fn import(path: &Path) -> Result<()> {
-    let c = ctx()?;
+    let mut c = ctx()?;
     require_init(&c)?;
     let _guard = lock::acquire(&c.dirs)?;
     let raw = std::fs::read_to_string(path)
@@ -1000,8 +1223,8 @@ pub fn import(path: &Path) -> Result<()> {
             }
         }
     }
-    save_and_report(&c, &passphrase, &data)?;
-    println!("✓ Import done. Added {added}, updated {updated}. Newer updated_at wins.");
+    save_and_report(&mut c, &passphrase, &data)?;
+    println!("✓ Import done: {added} added, {updated} updated.");
     Ok(())
 }
 

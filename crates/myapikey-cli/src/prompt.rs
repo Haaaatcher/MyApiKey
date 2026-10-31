@@ -372,6 +372,30 @@ pub fn dim(text: &str) -> String {
     }
 }
 
+/// 成功行标记：绿色 `✔`（与 dialoguer ColorfulTheme 的完成痕迹同色
+/// 同符），非交互态退化为无色 `✓`（管道/重定向不含 ANSI 码）。
+///
+/// 与 [`warn`]、组件主题共同构成三层视觉语言：绿 ✔ = 成功/完成，
+/// 黄 ⚠ = 警告，红 ✗ = 失败。
+pub fn ok(msg: &str) {
+    let mark = if is_interactive() {
+        "\x1b[32m\u{2714}\x1b[0m"
+    } else {
+        "✓"
+    };
+    println!("{mark} {msg}");
+}
+
+/// 警告行标记：黄色 `⚠`（ColorfulTheme 的警告色系），非交互态无色。
+pub fn warn(msg: &str) {
+    let mark = if is_interactive() {
+        "\x1b[33m\u{26a0}\x1b[0m"
+    } else {
+        "⚠"
+    };
+    println!("{mark} {msg}");
+}
+
 /// 是/否确认，回车取默认值；Esc/中断视为否定（保守侧）。
 pub fn confirm(label: &str, default_yes: bool) -> bool {
     interact_or(
@@ -414,11 +438,19 @@ pub fn select_protocol(
     use myapikey_core::model::Protocol;
 
     let default = current.cloned().unwrap_or(Protocol::OpenAi);
-    let items = ["1) OpenAI", "2) Anthropic", "3) Custom label"];
+    let items = [
+        "1) OpenAI Responses (recommended)",
+        "2) OpenAI Chat (widely compatible)",
+        "3) Anthropic Messages (standard)",
+        "4) Anthropic Complete (deprecated)",
+        "5) Custom label",
+    ];
     let default_idx = match default {
         Protocol::OpenAi => 0,
-        Protocol::Anthropic => 1,
-        Protocol::Custom { .. } => 2,
+        Protocol::OpenAiChat => 1,
+        Protocol::Anthropic => 2,
+        Protocol::AnthropicComplete => 3,
+        Protocol::Custom { .. } => 4,
     };
     // interact_opt：Esc/中断 → None（视为保持默认）；非 TTY → Err 走行输入菜单
     let idx = if is_interactive() {
@@ -438,7 +470,8 @@ pub fn select_protocol(
     };
     Ok(match idx {
         0 => Protocol::OpenAi,
-        1 => Protocol::Anthropic,
+        1 => Protocol::OpenAiChat,
+        2 => Protocol::Anthropic,
         _ => loop {
             let name = prompt_line_opt("Custom protocol label: ").ok_or(Error::Usage(
                 "input ended before the label was given".into(),
@@ -456,10 +489,12 @@ pub fn select_protocol(
 /// EOF 返回错误（调用方退出，避免死循环）。
 fn fallback_select(default_idx: usize) -> Result<usize> {
     println!("Select protocol:");
-    println!("  1) OpenAI");
-    println!("  2) Anthropic");
-    println!("  3) Custom label");
-    let default_label = ["1", "2", "3"][default_idx];
+    println!("  1) OpenAI Responses (recommended)");
+    println!("  2) OpenAI Chat (widely compatible)");
+    println!("  3) Anthropic Messages (standard)");
+    println!("  4) Anthropic Complete (deprecated)");
+    println!("  5) Custom label");
+    let default_label = ["1", "2", "3", "4", "5"][default_idx];
     loop {
         let raw = prompt_line_opt(&format!("Choice (Enter for {default_label}): "))
             .ok_or(Error::Usage("input ended before a choice was made".into()))?;
@@ -468,7 +503,9 @@ fn fallback_select(default_idx: usize) -> Result<usize> {
             "1" => return Ok(0),
             "2" => return Ok(1),
             "3" => return Ok(2),
-            _ => println!("Enter 1, 2 or 3."),
+            "4" => return Ok(3),
+            "5" => return Ok(4),
+            _ => println!("Enter 1, 2, 3, 4 or 5."),
         }
     }
 }
