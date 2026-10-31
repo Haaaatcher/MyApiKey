@@ -15,11 +15,11 @@ cargo fmt                      # 格式化（提交前运行）
 
 ## 项目速览
 
-跨平台的 AI API 凭证（`base_url` + `api_key`）记录与同步工具，加密后经用户私有 git 仓库同步多设备。
+跨平台的 AI API 凭证（`base_url` + `api_key`）记录与同步工具，加密后经用户自己的 GitHub 私有仓库同步多设备（Contents API 直连，**零 git 依赖**，D25）。
 
 - 技术栈：Rust stable、clap（CLI）、dialoguer（CLI 交互组件：菜单/确认/隐藏输入）、Tauri 2（仅 GUI crate）
 - 结构：`crates/myapikey-core`（纯逻辑库，无 UI 依赖）· `myapikey-cli`（终端前端）· `myapikey-gui`（Tauri，仅发布 Windows）
-- 平台策略：GUI 首发 Windows；Linux / macOS 仅 CLI
+- 平台策略：GUI 已发布 Windows；下一阶段适配 macOS GUI（仅 Apple Silicon / M 系列，D26）；Linux 仅 CLI
 
 ## 代码风格
 
@@ -33,6 +33,7 @@ cargo fmt                      # 格式化（提交前运行）
   - **禁止**：用圆括号或破折号**夹带补充说明**——"它是什么/为什么"的解释要并入短句，或缩进两空格独立成提示行（GUI 用 hover 提示）
   - **允许且推荐**：用括号**呈现选项与伴随信息**——输入提示的 Enter 语义 `(Enter keeps current)`、示例 `(e.g. OpenAI primary)`、伴随状态 `(HTTP 401)`、默认值/约束标注 `(private)`、`(optional)` 等，这类括号让主信息与伴随信息层次分明，起更好的提示作用
   - 界限：括号内是**同一信息的组成部分**（选项、状态、示例、约束）→ 可用；括号内是**岔开的解释**（原因、后果、指引）→ 改短句或独立行
+- **提示词简约六则**（2026-10-31 定调"简约是设计风格"，CLI 与 GUI 一致执行）：一句一事（现象一句话，出路/细节缩进下一行）；删可推断的（"successfully""可随时重新绑定"这类用户自己能推断的话不写）；动词开头（指令句动词打头，状态句"名词+状态"）；错误 = 现象 + 出路（第一句短现象，紧跟缩进的出路，不铺原因链）；术语统一（bind/unbind、vault、record 全产品一词）；双语各自成文（中文按中文习惯写，不逐字翻译英文）
 - **注释尽可能详细**（我的明确要求，优先于"少注释"的社区习惯）：
   - 所有公开项（pub 函数/类型/常量）必须有 `///` 文档注释，写清用途、参数、返回值，并按惯例补 `# Errors`、`# Panics`、`# Safety` 章节
   - 每个模块/文件以 `//!` 开头说明该模块的职责与边界
@@ -65,7 +66,7 @@ cargo fmt                      # 格式化（提交前运行）
 2. **改中**：core 新行为必须配测试（roundtrip/边界用例）；Rust 改完只跑受影响 crate 的测试，不做无谓全量
 3. **本地验证**：
    - `cargo test`（受影响 crate）+ `cargo clippy --workspace -- -D warnings` 零警告 + `cargo fmt`
-   - 前端改动先在浏览器 mock 验证（vite dev `localhost:5173` + 浏览器自动化），通过后再 `npm run build`
+   - 前端改动先在浏览器 mock 验证（vite dev `localhost:5300`——5173/5188 落 Windows 保留端口段不可用 + 浏览器自动化），通过后再 `npm run build`
 4. **交付（涉及 GUI）**：
    - 先 `taskkill //IM myapikey-gui.exe //F`——旧进程占用 exe，不杀会导致构建 os error 5
    - 在 `crates/myapikey-gui` 下执行 `node ui/node_modules/@tauri-apps/cli/tauri.js build`（crate 根有 `tauri.conf.json`，npm scripts 在 ui/ 下）
