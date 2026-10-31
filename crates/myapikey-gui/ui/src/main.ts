@@ -5,7 +5,7 @@
  * 界面层不包含任何加密/同步逻辑——全部经 bridge 调后端 command。
  */
 
-import { invoke, onLocked } from "./bridge";
+import { invoke, onLocked, ProgressChannel } from "./bridge";
 
 // ---------------------------------------------------------------------------
 // 与 Rust 侧对应的数据形状
@@ -43,7 +43,6 @@ interface GuiState {
   initialized: boolean;
   unlocked: boolean;
   has_remembered: boolean;
-  git_ok: boolean;
 }
 
 interface SyncView {
@@ -56,8 +55,7 @@ interface SyncView {
 
 interface StatusView {
   remote: string | null;
-  ahead: number;
-  behind: number;
+  pending: boolean;
   last_sync: string | null;
   alive: number;
 }
@@ -72,7 +70,8 @@ interface SettingsView {
 
 type InitStage =
   | { stage: "done"; joined: boolean; records: number; refresh?: boolean }
-  | { stage: "device_code"; user_code: string; verification_uri: string };
+  | { stage: "device_code"; user_code: string; verification_uri: string }
+  | { stage: "probe_done"; has_data: boolean; repo: string };
 
 interface RecordInput {
   name: string;
@@ -121,9 +120,9 @@ const ICONS: Record<string, string> = {
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
   inbox: '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
   search: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
-  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
   globe: '<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
   back: '<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>',
+  chevron: '<polyline points="6 9 12 15 18 9"/>',
 };
 
 /** 与 core::store::is_valid_http_url 同规则的 TS 版（前端即时反馈）。
@@ -148,6 +147,7 @@ function checkLabel(raw: string): string {
     "no permission": t("checkNoPerm"),
     "rate limited": t("checkRateLimited"),
     unverifiable: t("checkUnverifiable"),
+    checking: t("checking"),
   };
   return map[raw] ?? raw;
 }
@@ -301,19 +301,25 @@ const STRINGS: Record<string, [string, string]> = {
   passMismatch: ["Passphrases do not match", "两次输入的主密码不一致"],
   remoteRequired: ["Remote URL is required", "请填写仓库地址"],
   vaultCreated: ["Vault created", "保险库已创建"],
-  joinedVault: ["Joined existing vault, {0} records", "已接入现有保险库，{0} 条记录"],
+  joinedVaultPlain: ["Joined the existing vault", "已接入现有保险库"],
   // 设备授权
   githubAuth: ["GitHub authorization", "GitHub 授权"],
   stepOpen: ["Open the page below in your browser", "在浏览器打开下方链接"],
   stepEnter: ["Enter the code below", "在页面中输入下方代码"],
-  deviceNote: ["The code expires in 15 minutes. This window continues automatically after you authorize.", "代码 15 分钟内有效，授权完成后本窗口会自动继续。"],
+  deviceNote: [
+    "Code copied to clipboard · expires in 15 minutes · this page continues automatically once you authorize.",
+    "授权码已自动复制到剪贴板，15 分钟内有效；授权完成后本页面会自动继续。",
+  ],
   iAuthorized: ["I have authorized", "我已完成授权"],
+  retryAuth: ["Retry", "重试"],
   copyCode: ["Copy code", "复制授权码"],
   codeCopied: ["Code copied", "已复制授权码"],
   waitingGithub: ["Waiting for GitHub…", "等待 GitHub 确认…"],
   authFailedHint: ["Authorization failed, try again after authorizing in the browser.", "授权失败，请在浏览器完成授权后重试。"],
   // 主界面
   syncNow: ["Sync now", "立即同步"],
+  checkAll: ["Check all", "检测全部"],
+  checkingAll: ["Checking all…", "正在检测全部…"],
   syncing: ["Syncing…", "正在同步…"],
   lock: ["Lock", "锁定"],
   searchPlaceholder: ["Search records…", "搜索记录…"],
@@ -324,14 +330,16 @@ const STRINGS: Record<string, [string, string]> = {
   syncPulled: ["Pulled remote changes · {0} records", "已拉取远端变更 · {0} 条记录"],
   syncPushed: ["Pushed local changes · {0} records", "已推送本地变更 · {0} 条记录"],
   syncUpToDate: ["Up to date · {0} records", "已是最新 · {0} 条记录"],
+  syncStandaloneHint: [
+    "Standalone mode: bind a remote to enable sync",
+    "单机模式：绑定远端后才能同步",
+  ],
   // 顶栏状态标签（曾长期硬编码英文，中文界面里格外突兀，2026-10-25 修复）
   remoteBound: ["Remote bound", "已绑定远端"],
   standaloneMode: ["Standalone", "单机模式"],
-  nUnpushed: ["{0} unpushed", "{0} 条未推送"],
-  nToPull: ["{0} to pull", "{0} 条待拉取"],
   nRecords: ["{0} records", "{0} 条记录"],
   emptyNoRecords: ["No records yet", "还没有记录"],
-  emptyAddFirst: ["Add the first one, it stays encrypted on this device.", "添加第一条，数据在本机加密存储。"],
+  emptyAddFirst: ["Add your first record — stored encrypted on this device.", "添加第一条，数据在本机加密存储。"],
   emptyNoMatch: ["No records match your search", "没有匹配的记录"],
   emptyTryOther: ["Try a different keyword.", "换个关键词试试。"],
   copyKey: ["Copy key", "复制 key"],
@@ -342,6 +350,7 @@ const STRINGS: Record<string, [string, string]> = {
   deleteRecord: ["Delete record", "删除记录"],
   copying: ["Copying…", "正在复制…"],
   checking: ["Checking…", "正在校验…"],
+  checkDone: ["Done: {0}", "检测完成：{0}"],
   deleting: ["Deleting…", "正在删除…"],
   copied: ["API key copied, clears in 30 s", "已复制 API key，30 秒后自动清除"],
   keyCheck: ["Key check: {0}{1}", "校验结果：{0}{1}"],
@@ -359,17 +368,23 @@ const STRINGS: Record<string, [string, string]> = {
   apiKey: ["API key", "API key"],
   notesOpt: ["Notes", "备注"],
   modelsOpt: ["Models", "模型"],
-  modelsHint: ["e.g. GLM-5.2, then press Enter or +", "如 GLM-5.2，回车或 + 添加"],
+  nameLabel: ["Name", "名称"],
+  protoLabel: ["Type", "类型"],
+  baseUrlLabel: ["Base URL", "Base URL"],
+  apiKeyLabel: ["API key", "API key"],
+  notesLabel: ["Notes (optional)", "备注（可选）"],
+  pickSearch: ["Filter models…", "过滤模型…"],
+  pickAll: ["Select all", "全选"],
+  pickNone: ["Clear", "清空"],
+  pickAdd: ["Add {0} selected", "添加所选 {0} 个"],
+  modelsHint: ["e.g. DeepSeek-V4.1, press Enter or +", "如 DeepSeek-V4.1，回车或 + 添加"],
   addModel: ["+", "+"],
   removeModel: ["Remove model", "删除模型"],
-  modelsEmpty: ["No models yet — add one, or Fetch from the endpoint.", "暂无模型——手动添加，或点「获取」自动拉取。"],
+  modelsEmpty: ["No models yet — add manually or fetch.", "暂无模型——手动添加，或点「获取」拉取。"],
   fetchModels: ["Fetch", "获取"],
   fetchingModels: ["Fetching…", "正在获取…"],
-  fetchModelsDone: ["Fetched {0} models.", "已获取 {0} 个模型。"],
-  fetchModelsEmpty: ["No models returned; type them manually.", "未获取到模型，请手动填写。"],
+  fetchModelsEmpty: ["No models returned — add them manually.", "未获取到模型，请手动添加。"],
   fetchModelsNeedBoth: ["Fill in the base URL and API key first.", "请先填写 Base URL 和 API key。"],
-  reveal: ["Reveal", "查看"],
-  hide: ["Hide", "隐藏"],
   showPass: ["Show password", "显示密码"],
   hidePass: ["Hide password", "隐藏密码"],
   switchToEn: ["Switch to English", "切换到 English"],
@@ -382,34 +397,25 @@ const STRINGS: Record<string, [string, string]> = {
   remotePlaceholder: ["Remote repository URL", "远端仓库地址"],
   remoteHint: ["Leave empty for standalone mode", "留空为单机模式"],
   reauthorizeGithub: ["Re-authorize GitHub", "重新授权 GitHub"],
-  // M5 配置到应用（D21）
-  applyToApp: ["Apply to app", "配置到应用"],
-  applyChoose: ["Which app should use this record?", "把这条记录配置到哪个应用？"],
-  appDesc_claude_code: ["~/.claude/settings.json", "写入 Claude Code 的 env 块"],
-  appDesc_codex: ["~/.codex/config.toml", "写入 Codex 的 provider 配置"],
-  appDesc_qwen: ["~/.qwen/settings.json", "模型进 Qwen 的 /model 选择器"],
-  applyConfirm: [
-    "Write this record into {0}'s config file? The current file is backed up first.",
-    "写入 {0} 的配置文件？当前文件会先自动备份。",
+  passJoinTitle: [
+    "Found an existing vault on the remote. Enter the master passphrase to join it.",
+    "发现已有保险库，输入主密码以接入。",
   ],
-  appliedToast: ["Applied to {0}.", "已配置到 {0}。"],
-  applySlotsTitle: ["Map models to slots", "把模型映射到槽位"],
-  applySlotsHint: [
-    "Each slot is written to its own config key. Leave one empty to keep the app default.",
-    "每个槽位写入对应的配置键；留空（跳过）的槽位走应用默认。",
+  passSetTitle: ["Set a new master passphrase.", "设置新的主密码。"],
+  initWarnJoin: [
+    "All devices must use the same master passphrase.",
+    "所有设备必须使用同一主密码。",
   ],
-  applySlotSkip: ["(leave unset)", "（跳过——不配置）"],
-  gitMissingTitle: ["Git is required", "需要安装 Git"],
-  gitMissingBody: [
-    "MyApiKey stores history and syncs through git. Install it, then come back and retry.",
-    "MyApiKey 的历史与同步基于 git。请先安装 git，装好后回到这里重试。",
-  ],
-  gitOpenDownload: ["Open the download page", "打开下载页面"],
-  gitCopyWinget: ["Copy the winget command", "复制 winget 命令"],
-  gitWingetCopied: ["Copied: winget install Git.Git", "已复制：winget install Git.Git"],
-  gitRetry: ["Installed, retry", "我已安装，重试"],
+  passJoinBtn: ["Join the vault", "接入保险库"],
+  unpushedPending: ["Unpushed changes — run sync", "有未推送的修改——请同步"],
+  lastSyncChip: ["Last sync: {0}", "上次同步：{0}"],
+  lastSyncNever: ["never", "从未"],
+  relJustNow: ["just now", "刚刚"],
+  relMinutesAgo: ["{0} min ago", "{0} 分钟前"],
+  relHoursAgo: ["{0} h ago", "{0} 小时前"],
+  relDaysAgo: ["{0} d ago", "{0} 天前"],
   reauthorizing: ["Opening GitHub authorization…", "正在打开 GitHub 授权…"],
-  reAuthorized: ["GitHub authorization updated. Sync is ready.", "GitHub 授权已更新，可以同步了。"],
+  reAuthorized: ["GitHub authorization updated.", "GitHub 授权已更新。"],
   daysUnit: ["days", "天"],
   rememberFor: ["Remember passphrase for", "记住密码时长"],
   daysNeverHint: ["0 = never remember", "填 0 为永不记住密码"],
@@ -428,8 +434,14 @@ const STRINGS: Record<string, [string, string]> = {
   updateSection: ["Update", "更新"],
   currentVersion: ["Version {0}", "当前版本 {0}"],
   checkUpdate: ["Check for updates", "检查更新"],
+  unbindGithub: ["Unbind GitHub", "解绑 GitHub"],
+  unbindGithubConfirm: [
+    "Unbind the remote repo and clear the GitHub token on this machine? The remote repo and vault data are untouched.",
+    "解绑远端仓库并清除本机记住的 GitHub 授权？远端仓库与保险库数据不受影响。",
+  ],
+  unboundGithub: ["GitHub unbound.", "已解绑 GitHub。"],
   checkingUpdate: ["Checking…", "正在检查…"],
-  upToDate: ["You are on the latest version.", "已是最新版本。"],
+  upToDate: ["Up to date.", "已是最新版本。"],
   notChecked: ["not checked", "未校验"],
   // 校验状态（后端 CheckStatus.label 为英文，前端按键映射成双语）
   checkValid: ["valid", "有效"],
@@ -473,7 +485,7 @@ function langToggle(rerender: () => void): HTMLButtonElement {
       document.createTextNode(prefs.lang === "zh" ? "中" : "EN"),
     );
     const tip = t(prefs.lang === "zh" ? "switchToEn" : "switchToZh");
-    btn.title = tip;
+    btn.dataset.tip = tip;
     btn.setAttribute("aria-label", tip);
   };
   sync();
@@ -492,9 +504,40 @@ function langToggle(rerender: () => void): HTMLButtonElement {
  * 标签，改存储会破坏既有 vault 数据。自定义标签原样显示。
  */
 function protoLabel(p: string): string {
-  if (p === "openai") return "OpenAI";
-  if (p === "anthropic") return "Anthropic";
+  if (p === "openai") return "OpenAI (Responses)";
+  if (p === "openai-chat") return "OpenAI Chat";
+  if (p === "anthropic") return "Anthropic (Messages)";
+  if (p === "anthropic-complete") return "Anthropic Complete";
   return p;
+}
+
+/**
+ * 协议族短名（2026-10-31 卡片徽章）：只显示 OpenAI / Anthropic /
+ * 自定义名，具体 API 形态靠 hover title（protoLabel）呈现——徽章上
+ * 长文案是视觉噪音，且 openai-chat 等旧形态本就没有专属配色。
+ */
+function protoShort(p: string): string {
+  if (p.startsWith("openai")) return "OpenAI";
+  if (p.startsWith("anthropic")) return "Anthropic";
+  if (p.startsWith("custom:")) return p.slice("custom:".length);
+  return p;
+}
+
+/** 协议族 → 徽章配色类（同族同色：openai 绿 / anthropic 黄 / custom 中性）。 */
+function protoBadgeClass(p: string): string {
+  if (p.startsWith("openai")) return "badge-openai";
+  if (p.startsWith("anthropic")) return "badge-anthropic";
+  return "badge-custom";
+}
+
+/**
+ * 模型名 → 胶囊配色下标（0-5）：名字哈希取模，同一模型永远同色，
+ * 不同模型自然分散到色板（2026-10-31 模型胶囊彩色化）。
+ */
+function modelColorIndex(name: string): number {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return h % 6;
 }
 
 /** 取当前语言文案；`{0}`/`{1}` 占位符按参数顺序替换。 */
@@ -589,11 +632,6 @@ async function boot(): Promise<void> {
     toast(t("autoLocked"));
   });
   const st = await invoke<GuiState>("gui_state");
-  // git 预检：缺失直接进安装引导页（历史与同步都依赖它）
-  if (!st.git_ok) {
-    renderGitMissing();
-    return;
-  }
   if (!st.initialized) renderInit();
   else if (st.unlocked) renderMain();
   else if (st.has_remembered) {
@@ -663,142 +701,7 @@ function confirmBox(message: string, confirmText: string): Promise<boolean> {
   });
 }
 
-/** M5 配置到应用（D21）的目标应用表：[后端标识, 展示名]。 */
-const APP_TARGETS: ReadonlyArray<readonly [string, string]> = [
-  ["claude-code", "Claude Code"],
-  ["codex", "Codex"],
-  ["qwen", "Qwen Code"],
-];
 
-/** apply_to_app 的返回视图（后端 ApplyView）。 */
-interface ApplyView {
-  app: string;
-  file: string;
-  backup: string | null;
-  written: string[];
-  effect: string;
-}
-
-/** 单个模型槽位（后端 RecipeSlotView）：槽位名 / 目标键名 / 含义说明。 */
-interface RecipeSlotView {
-  slot: string;
-  path: string;
-  desc: string;
-}
-
-/** 槽位映射对话框（D22 槽位型应用，配置到应用第二步）：每个槽位一个
- * 下拉（选项 = 记录的模型列表，尾项"跳过"= 该槽不写、走应用默认）。
- * 返回 槽位名 → 模型名 映射（跳过的槽不出现在结果里）；取消返回
- * null。调用方保证 models 非空——记录没有模型时无需本对话框。 */
-function slotMappingDialog(
-  slots: RecipeSlotView[],
-  models: string[],
-): Promise<Record<string, string> | null> {
-  return new Promise((resolve) => {
-    const overlay = el("div", "overlay confirm-overlay");
-    const dialog = el("div", "dialog slot-dialog");
-    dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
-    dialog.append(
-      el("p", "dialog-msg", t("applySlotsTitle")),
-      el("p", "dialog-sub", t("applySlotsHint")),
-    );
-    const picks: Array<{ slot: string; sel: HTMLSelectElement }> = [];
-    for (const s of slots) {
-      const row = el("div", "slot-row");
-      const lab = el("label", "slot-label");
-      lab.append(el("span", "slot-path", s.path));
-      if (s.desc) lab.append(el("span", "slot-desc", s.desc));
-      const sel = document.createElement("select");
-      sel.className = "slot-select";
-      for (const m of models) {
-        const o = document.createElement("option");
-        o.value = m;
-        o.textContent = m;
-        sel.append(o);
-      }
-      const skip = document.createElement("option");
-      skip.value = "";
-      skip.textContent = t("applySlotSkip");
-      sel.append(skip);
-      row.append(lab, sel);
-      dialog.append(row);
-      picks.push({ slot: s.slot, sel });
-    }
-    const actions = el("div", "dialog-actions");
-    const cancel = el("button", "btn", t("cancel"));
-    const ok = el("button", "btn btn-primary", t("applyToApp"));
-    const close = (val: Record<string, string> | null) => {
-      overlay.remove();
-      resolve(val);
-    };
-    cancel.addEventListener("click", () => close(null));
-    ok.addEventListener("click", () => {
-      const out: Record<string, string> = {};
-      for (const { slot, sel } of picks) {
-        if (sel.value) out[slot] = sel.value;
-      }
-      close(out);
-    });
-    actions.append(cancel, ok);
-    dialog.append(actions);
-    overlay.append(dialog);
-    document.body.appendChild(overlay);
-    ok.focus();
-  });
-}
-
-/** 选目标应用（D21 配置到应用第一步）：居中对话框，纵向三个应用选项
- * （带应用名说明），取消沉底右对齐；返回后端标识，取消/Escape/点遮罩
- * 返回 null。 */
-function chooseAppDialog(): Promise<string | null> {
-  return new Promise((resolve) => {
-    const overlay = el("div", "overlay confirm-overlay");
-    const dialog = el("div", "dialog app-dialog");
-    dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
-    const head = el("p", "dialog-msg", t("applyChoose"));
-    const list = el("div", "app-options");
-    const buttons: HTMLButtonElement[] = [];
-    for (const [id, label] of APP_TARGETS) {
-      const b = el("button", "app-option");
-      b.type = "button";
-      const nm = el("span", "app-option-name", label);
-      const desc = el("span", "app-option-desc", t(`appDesc_${id.replace(/-/g, "_")}`));
-      b.append(nm, desc);
-      b.addEventListener("click", () => close(id));
-      buttons.push(b);
-      list.append(b);
-    }
-    const actions = el("div", "dialog-actions");
-    const cancel = el("button", "btn", t("cancel"));
-    cancel.addEventListener("click", () => close(null));
-    actions.append(cancel);
-    const close = (val: string | null) => {
-      overlay.remove();
-      resolve(val);
-    };
-    // 点遮罩 = 取消（与 confirmBox 同样带 mousedown 守卫）
-    overlay.addEventListener("mousedown", (ev) => {
-      if (ev.target === overlay) close(null);
-    });
-    overlay.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") {
-        ev.preventDefault();
-        close(null);
-      } else if (ev.key === "Enter" && ev.target instanceof HTMLButtonElement) {
-        ev.preventDefault();
-        // Enter 在应用选项上 = 选它；在取消上 = 取消
-        const idx = buttons.indexOf(ev.target);
-        close(idx >= 0 && idx < APP_TARGETS.length ? APP_TARGETS[idx][0] : null);
-      }
-    });
-    dialog.append(head, list, actions);
-    overlay.append(dialog);
-    document.body.appendChild(overlay);
-    buttons[0].focus();
-  });
-}
 
 function closeOverlays(): void {
   // 挂起的确认框先按"取消"结算，再摘 DOM——悬挂的 Promise 不进内存坟场
@@ -825,6 +728,31 @@ function snapshotFields(): Record<string, { v: string; t?: string }> {
       };
     });
   return out;
+}
+
+/**
+ * ISO 时间戳 → 简洁相对时间（中英文随语言设置）：刚刚 / N 分钟前 /
+ * N 小时前 / N 天前，超过 30 天回退本地日期。异常输入原样返回。
+ * 完整精度由调用方以 title 悬停补足（2026-10-31 替代裸 ISO 时间戳）。
+ */
+function relativeTime(iso: string): string {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return iso;
+  const diff = Date.now() - then;
+  const min = 60_000;
+  const hour = 3_600_000;
+  const day = 86_400_000;
+  if (diff < min) return t("relJustNow");
+  if (diff < hour) return t("relMinutesAgo", Math.floor(diff / min));
+  if (diff < day) return t("relHoursAgo", Math.floor(diff / hour));
+  if (diff < 30 * day) return t("relDaysAgo", Math.floor(diff / day));
+  return fmtLocalFull(new Date(then));
+}
+
+/** Date → 本地时区的 `YYYY-MM-DD HH:mm`（悬停兜底与超期回退共用）。 */
+function fmtLocalFull(d: Date): string {
+  const p = (n: number): string => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 /** 把 {@link snapshotFields} 捕获的值回填到同名 data-field 输入框（只回填存在的字段）。 */
@@ -878,8 +806,146 @@ function syncPassToggle(row: HTMLElement): void {
   const shown = input.type === "text";
   toggle.replaceChildren(icon(shown ? "eyeOff" : "eye"));
   const label = t(shown ? "hidePass" : "showPass");
-  toggle.title = label;
+  toggle.dataset.tip = label;
   toggle.setAttribute("aria-label", label);
+}
+
+/** 自绘下拉的句柄：root 挂载用，value 读写对齐原生 select 的语义。 */
+interface DdHandle {
+  root: HTMLElement;
+  get value(): string;
+  set value(v: string);
+}
+
+/**
+ * 自绘下拉（替代原生 select，2026-10-31）：原生控件的下拉面板无法
+ * 样式化，本组件用"按钮 + 卡片浮层"呈现，明暗主题自适应。
+ * 外部点击关闭；Enter/Escape 在面板内不冒泡（抽屉里 Enter=保存）。
+ * 选项变更走 onChange；整页重建的回填直接用新值重建即可。
+ */
+function makeSelect(
+  opts: Array<{ value: string; label: string }>,
+  initial: string,
+  onChange?: (v: string) => void,
+): DdHandle {
+  let val = initial;
+  const root = el("div", "dd");
+  const btn = el("button", "dd-btn");
+  btn.type = "button";
+  const labelSpan = el("span", "dd-label", opts.find((o) => o.value === val)?.label ?? val);
+  btn.append(labelSpan, icon("chevron"));
+  const list = el("div", "dd-list");
+
+  const onDoc = (ev: MouseEvent): void => {
+    if (!root.contains(ev.target as Node)) {
+      root.classList.remove("open");
+      document.removeEventListener("mousedown", onDoc, true);
+    }
+  };
+  const close = (): void => {
+    root.classList.remove("open");
+    document.removeEventListener("mousedown", onDoc, true);
+  };
+  btn.addEventListener("click", () => {
+    if (root.classList.contains("open")) {
+      close();
+      return;
+    }
+    root.classList.add("open");
+    // 捕获阶段挂 document：面板内 mousedown 不触发外部关闭
+    document.addEventListener("mousedown", onDoc, true);
+  });
+
+  const renderItems = (): void => {
+    list.replaceChildren();
+    for (const o of opts) {
+      const item = el("button", o.value === val ? "dd-item active" : "dd-item");
+      item.type = "button";
+      item.append(el("span", "dd-check", "✓"), el("span", "", o.label));
+      // 面板内 Enter（选中）/Escape（收起）都不冒泡到抽屉的 Enter=保存
+      item.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === "Escape") ev.stopPropagation();
+      });
+      item.addEventListener("click", () => {
+        val = o.value;
+        labelSpan.textContent = o.label;
+        renderItems();
+        close();
+        onChange?.(val);
+      });
+      list.append(item);
+    }
+  };
+  renderItems();
+  root.append(btn, list);
+  return {
+    root,
+    get value(): string {
+      return val;
+    },
+    set value(v: string) {
+      val = v;
+      labelSpan.textContent = opts.find((o) => o.value === v)?.label ?? v;
+      renderItems();
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 全局自绘 tooltip（2026-10-31 反馈：原生 title 黑底白字丑）
+// ---------------------------------------------------------------------------
+
+let tipTimer: number | null = null;
+let tipTarget: Element | null = null;
+const tipEl = el("div", "tooltip hidden");
+
+/** 显示 tooltip：目标下方居中；越出视口底部翻转到上方、水平夹紧。 */
+function showTip(target: Element): void {
+  const text = target.getAttribute("data-tip") ?? "";
+  // 定时器触发时目标可能已被移除（检测全部逐条重渲染是高频场景）：
+  // detached 元素 rect 全 0，会把 tooltip 夹紧到视口左上角驻留
+  if (!text || !target.isConnected) {
+    hideTip();
+    return;
+  }
+  tipEl.textContent = text;
+  tipEl.classList.remove("hidden");
+  if (!tipEl.isConnected) document.body.append(tipEl);
+  const r = target.getBoundingClientRect();
+  const tr = tipEl.getBoundingClientRect();
+  let x = r.left + r.width / 2 - tr.width / 2;
+  x = Math.max(8, Math.min(x, window.innerWidth - tr.width - 8));
+  let y = r.bottom + 6;
+  if (y + tr.height > window.innerHeight - 8) {
+    y = Math.max(8, r.top - tr.height - 6);
+  }
+  tipEl.style.left = `${x}px`;
+  tipEl.style.top = `${y}px`;
+}
+
+// 事件委托：悬停带 [data-tip] 的元素 350ms 后显示，移开即隐藏。
+// 子元素间移动若仍在同一目标上不重置延迟。全部 hover 提示统一走
+// data-tip（不再用原生 title——系统绘制无法跟随应用主题）。
+document.documentElement.addEventListener("mouseleave", hideTip);
+document.addEventListener("mouseover", (ev) => {
+  const t = (ev.target as Element).closest?.("[data-tip]") ?? null;
+  if (t === tipTarget) return;
+  tipTarget = t;
+  if (tipTimer !== null) {
+    clearTimeout(tipTimer);
+    tipTimer = null;
+  }
+  hideTip();
+  if (t) {
+    tipTimer = window.setTimeout(() => {
+      tipTimer = null;
+      showTip(t);
+    }, 350);
+  }
+});
+
+function hideTip(): void {
+  tipEl.classList.add("hidden");
 }
 
 // ---------------------------------------------------------------------------
@@ -887,42 +953,10 @@ function syncPassToggle(row: HTMLElement): void {
 // ---------------------------------------------------------------------------
 
 /** git 缺失引导页：说明 + 下载入口 + 重试。装好前主流程不进入。 */
-function renderGitMissing(): void {
-  closeOverlays();
-  $app.replaceChildren();
-  const wrap = el("div", "center-wrap");
-  const card = el("div", "card init-card");
-  const brand = el("h1", "brand-row");
-  brand.append(icon("key"), el("span", "brand", "MyApiKey"));
-  card.append(brand, el("p", "warn", t("gitMissingTitle")), el("p", "muted", t("gitMissingBody")));
-  const openBtn = el("button", "btn btn-primary", t("gitOpenDownload"));
-  openBtn.addEventListener("click", () => {
-    const a = el("a", "link", "https://git-scm.com/download/win") as HTMLAnchorElement;
-    a.href = "https://git-scm.com/download/win";
-    a.target = "_blank";
-    a.click();
-  });
-  const copyBtn = el("button", "btn", t("gitCopyWinget"));
-  copyBtn.addEventListener("click", async () => {
-    try {
-      await invoke("copy_text", { text: "winget install Git.Git" });
-      toast(t("gitWingetCopied"));
-    } catch (e) {
-      toast(String(e), false);
-    }
-  });
-  const retryBtn = el("button", "btn", t("gitRetry"));
-  retryBtn.addEventListener("click", () => {
-    void boot();
-  });
-  const actions = el("div", "init-actions");
-  actions.style.display = "grid";
-  actions.style.gap = "8px";
-  actions.append(openBtn, copyBtn, retryBtn);
-  card.append(actions);
-  wrap.append(card);
-  $app.append(wrap);
-}
+
+
+/** 初始化页同步方式的跨重建记忆（自绘下拉不参与 data-field 快照）。 */
+let initModePref = "github";
 
 function renderInit(): void {
   // 语言切换会经 langToggle 重新走本函数：先把已填内容快照下来，重建后回填
@@ -936,41 +970,36 @@ function renderInit(): void {
   card.append(brand);
   card.append(el("p", "muted", t("initSubtitle")));
 
-  const pass = el("input", "input grow");
-  pass.type = "password";
-  pass.placeholder = t("unlockPlaceholder");
-  pass.dataset.field = "pass";
-  const pass2 = el("input", "input grow");
-  pass2.type = "password";
-  pass2.placeholder = t("confirmPass");
-  pass2.dataset.field = "pass2";
-
-  const mode = el("select", "input");
-  mode.dataset.field = "mode";
-  mode.append(
-    Object.assign(el("option"), { value: "github", textContent: t("modeGithub") }),
-    Object.assign(el("option"), { value: "remote", textContent: t("modeRemote") }),
-    Object.assign(el("option"), { value: "solo", textContent: t("modeSolo") }),
+  // 密码不在本页：先选同步方式 → 探测远端 → 按远端状态显示对应密码表单。
+  // 语言切换整页重建：mode 初值从模块级偏好恢复（自绘下拉没有
+  // data-field，snapshotFields 抓不到——审查修复 M1：原注释声称的
+  // "从快照恢复"是死路，每次重建都重置回 github）
+  const mode = makeSelect(
+    [
+      { value: "github", label: t("modeGithub") },
+      { value: "remote", label: t("modeRemote") },
+      { value: "solo", label: t("modeSolo") },
+    ],
+    initModePref,
+    (v) => {
+      initModePref = v;
+      syncRemote(v);
+    },
   );
   const remoteUrl = el("input", "input");
   remoteUrl.type = "url";
   remoteUrl.placeholder = "https://github.com/<you>/<repo>.git";
   remoteUrl.dataset.field = "remoteUrl";
   // 回填可能改变 mode 的选中项，可见性同步必须可重复调用（不能只在 change 事件里做）
-  const syncRemote = () => {
-    remoteUrl.style.display = mode.value === "remote" ? "" : "none";
-  };
-  mode.addEventListener("change", syncRemote);
-  syncRemote();
+  function syncRemote(v: string): void {
+    remoteUrl.style.display = v === "remote" ? "" : "none";
+  }
+  syncRemote(mode.value);
 
   const warn = el("p", "warn", t("initWarn"));
   const btn = el("button", "btn btn-primary", t("createVault"));
 
   async function doInit(): Promise<void> {
-    if (!pass.value || pass.value !== pass2.value) {
-      toast(t("passMismatch"), false);
-      return;
-    }
     if (mode.value === "remote") {
       if (!remoteUrl.value.trim()) {
         toast(t("remoteRequired"), false);
@@ -983,32 +1012,112 @@ function renderInit(): void {
     }
     try {
       const stage = await invoke<InitStage>("init_start", {
-        passphrase: pass.value,
         remote: mode.value === "remote" ? remoteUrl.value.trim() : null,
         githubRepo: mode.value === "github" ? "myapikey-vault" : null,
       });
       if (stage.stage === "device_code") {
         showDeviceCode(stage.user_code, stage.verification_uri);
-      } else {
-        toast(stage.joined ? t("joinedVault", stage.records) : t("vaultCreated"));
-        renderMain();
+        return;
       }
+      if (stage.stage === "probe_done") {
+        renderPassphrase(stage.has_data);
+        return;
+      }
+      toast(stage.joined ? t("joinedVault", stage.records) : t("vaultCreated"));
+      renderMain();
     } catch (e) {
       toast(String(e), false);
     }
   }
-  // withBusy 负责禁用与等待文案（Argon2 派生 + git 初始化需要一两秒）
+  // withBusy 负责禁用与等待文案（建仓 + 探测需要一两秒）
   btn.addEventListener("click", () => void withBusy(btn, t("creating"), doInit));
-  pass2.addEventListener("keydown", (ev) => {
+  remoteUrl.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") btn.click();
   });
 
-  card.append(passField(pass), passField(pass2), mode, remoteUrl, warn, btn);
+  card.append(mode.root, remoteUrl, warn, btn);
   wrap.append(card);
   $app.append(wrap);
   restoreFields(keep);
   // 回填后 mode 可能已是 remote：补一次同步，让远端地址框保持可见
-  syncRemote();
+  syncRemote(mode.value);
+}
+
+/** 初始化第二页：主密码表单。语义由远端状态决定——
+ * `hasData = true` 显示"输入主密码接入已有数据"（单框）；
+ * `false` 显示"设置新的主密码"（双框确认）。提交走 init_finish。 */
+function renderPassphrase(hasData: boolean): void {
+  // 语言切换整页重建：已输入的主密码照 renderUnlock 模式快照回填
+  // （2026-10-31 审查修复 M2：两阶段密码页漏了这对机制）
+  const keep = snapshotFields();
+  $app.replaceChildren();
+  const wrap = el("div", "center-wrap");
+  const card = el("div", "card init-card");
+
+  const brand = el("h1", "brand-row");
+  brand.append(icon("key"), el("span", "brand", "MyApiKey"), langToggle(() => renderPassphrase(hasData)));
+  card.append(brand);
+  card.append(el("p", "muted", hasData ? t("passJoinTitle") : t("passSetTitle")));
+
+  const pass = el("input", "input grow");
+  pass.type = "password";
+  pass.placeholder = t("unlockPlaceholder");
+  pass.dataset.field = "pass";
+  const rows: HTMLElement[] = [passField(pass)];
+
+  if (!hasData) {
+    const pass2 = el("input", "input grow");
+    pass2.type = "password";
+    pass2.placeholder = t("confirmPass");
+    pass2.dataset.field = "pass2";
+    rows.push(passField(pass2));
+  }
+
+  const warn = el("p", "warn", hasData ? t("initWarnJoin") : t("initWarn"));
+  const btn = el(
+    "button",
+    "btn btn-primary",
+    hasData ? t("passJoinBtn") : t("createVault"),
+  );
+
+  async function doFinish(): Promise<void> {
+    if (!hasData && (!pass.value || pass.value !== pass2value())) {
+      toast(t("passMismatch"), false);
+      return;
+    }
+    try {
+      await invoke<InitStage>("init_finish", { passphrase: pass.value });
+      toast(hasData ? t("joinedVaultPlain") : t("vaultCreated"));
+      renderMain();
+    } catch (e) {
+      toast(String(e), false);
+    }
+  }
+  function pass2value(): string {
+    const inp = card.querySelector<HTMLInputElement>('input[data-field="pass2"]');
+    return inp ? inp.value : "";
+  }
+  btn.addEventListener("click", () => void withBusy(btn, t("creating"), doFinish));
+  card.append(...rows, warn, btn);
+  wrap.append(card);
+  $app.append(wrap);
+  restoreFields(keep);
+}
+
+/**
+ * 设备授权轮询的单例句柄：页面挂载即开始后台轮询，整页重建（语言切换）
+ * 复用同一 in-flight 请求——后端 poll 会一次性消费 device code，并发
+ * 第二个轮询只会空转到码过期。settle（成功或失败）后置空，允许重试。
+ */
+let devicePoll: Promise<InitStage> | null = null;
+
+function ensureDevicePoll(): Promise<InitStage> {
+  if (!devicePoll) {
+    devicePoll = invoke<InitStage>("init_device_authorized").finally(() => {
+      devicePoll = null;
+    });
+  }
+  return devicePoll;
 }
 
 function showDeviceCode(code: string, uri: string): void {
@@ -1026,12 +1135,19 @@ function showDeviceCode(code: string, uri: string): void {
   const link = el("a", "link", uri);
   link.href = uri;
   link.target = "_blank";
+  // WebView 内点链接会离开应用——改走系统浏览器
+  link.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    void invoke("open_external", { url: uri }).catch(() => {
+      window.open(uri, "_blank");
+    });
+  });
   steps.children[0].appendChild(link);
   // 授权码行：大字框 + 行内复制按钮（2026-10-25 需求；码 15 分钟有效，
   // 非长期敏感值，复制后不做延时清除）
   const codeEl = el("div", "device-code", code);
   const copyCode = el("button", "btn btn-icon btn-inline");
-  copyCode.title = t("copyCode");
+  copyCode.dataset.tip = t("copyCode");
   copyCode.setAttribute("aria-label", t("copyCode"));
   copyCode.append(icon("copy"));
   copyCode.addEventListener("click", () =>
@@ -1049,25 +1165,61 @@ function showDeviceCode(code: string, uri: string): void {
   const note = el("p", "muted", t("deviceNote"));
   const btn = el("button", "btn btn-primary", t("iAuthorized"));
   const status = el("p", "muted", "");
-  // 轮询最长到设备码过期（分钟级）：busy 态防重复点击，状态行说明在等什么
-  btn.addEventListener("click", () =>
-    void withBusy(btn, t("waitingGithub"), async () => {
-      try {
-        const stage = await invoke<InitStage>("init_device_authorized");
-        if (stage.stage === "done") {
-          // refresh = 已初始化机器的授权刷新（token 失效自愈），vault 未动
-          toast(stage.refresh ? t("reAuthorized") : stage.joined ? t("joinedVault", stage.records) : t("vaultCreated"));
-          void renderMain();
-        }
-      } catch (e) {
-        toast(String(e), false);
-        status.textContent = t("authFailedHint");
-      }
-    }),
-  );
   card.append(steps, codeRow, note, btn, status);
   wrap.append(card);
   $app.append(wrap);
+
+  // 授权码进页即自动复制（2026-10-31 需求）：默认行为静默执行、不 toast，
+  // 复制按钮保留（重复制/自动复制失败时的手动兜底）
+  void invoke("copy_text", { text: code }).catch(() => {});
+
+  // 授权完成自动识别（2026-10-31 需求）：页面挂载即开始后台轮询，拿到
+  // 令牌自动走后续渲染；「我已完成授权」按钮保留为失败后的手动重试入口。
+  // 轮询挂在模块级单例上——语言切换等整页重建复用同一 in-flight 请求，
+  // 避免重复起轮询（后端 poll 一次性消费 device code，并发轮询必有一个
+  // 空转到码过期）
+  const apply = (stage: InitStage): void => {
+    if (stage.stage === "done") {
+      // refresh = 已初始化机器的授权刷新（token 失效自愈），vault 未动
+      toast(stage.refresh ? t("reAuthorized") : stage.joined ? t("joinedVault", stage.records) : t("vaultCreated"));
+      if (stage.refresh) {
+        // 重新授权只恢复绑定、不对账（解绑时同步记账已清，chips 会显示
+        // never）——授权成功后自动补一次同步把状态带回"已同步"；
+        // 失败不掩盖授权成功，警告后用户可手动点同步（2026-10-31）
+        void invoke("sync_now")
+          .catch((e) => toast(String(e), false))
+          .finally(() => void renderMain());
+      } else {
+        void renderMain();
+      }
+    }
+    if (stage.stage === "probe_done") {
+      // 新初始化：token 已入库且远端已探测——按 has_data 进入对应
+      // 语义的密码表单
+      renderPassphrase(stage.has_data);
+    }
+  };
+  const wait = (): void => {
+    btn.disabled = true;
+    btn.textContent = t("waitingGithub");
+    ensureDevicePoll()
+      .then((stage) => {
+        apply(stage);
+      })
+      .catch((e) => {
+        toast(String(e), false);
+        status.textContent = t("authFailedHint");
+        // 失败后按钮复活为重试入口（pending_device 仍在，可直接重发）
+        btn.disabled = false;
+        btn.textContent = t("retryAuth");
+      });
+  };
+  btn.addEventListener("click", () => {
+    // 轮询进行中点击无新动作；失败后点击 = 重试
+    if (devicePoll) return;
+    wait();
+  });
+  wait();
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,14 +1308,79 @@ async function renderMain(): Promise<void> {
   const chips = el("div", "chips");
   const syncBtn = el("button", "btn btn-small", t("syncNow"));
   syncBtn.prepend(icon("sync"));
-  syncBtn.title = t("syncNow");
+  syncBtn.dataset.tip = t("syncNow");
+  // 一键检测全部（2026-10-31）：核心层并发探测，结果按 id 合并进
+  // 当前列表后整表刷新；缓存写盘与单条检测同源（list_records 会带回）
+  // 窗口宽度跨过列数断点时重排瀑布流（防抖 200ms；applyFilter 重建列表）
+  let resizeTimer: number | null = null;
+  window.addEventListener("resize", () => {
+    if (resizeTimer !== null) clearTimeout(resizeTimer);
+    resizeTimer = window.setTimeout(() => void applyFilter(), 200);
+  });
+
+  const checkAllBtn = el("button", "btn btn-small", t("checkAll"));
+  checkAllBtn.prepend(icon("shield"));
+  checkAllBtn.dataset.tip = t("checkAll");
+  checkAllBtn.addEventListener("click", () =>
+    void (async () => {
+      if (records.length === 0) return;
+      // 过程反馈（2026-10-31 反馈"看不到正在检测"）：①全部 chip 先进入
+      // 检测中脉冲态；②后端 Channel 逐条推送，卡片逐个点亮结果；
+      // ③按钮显示进度计数；④完成弹分类统计
+      checkAllBtn.disabled = true;
+      checkAllBtn.textContent = t("checkingAll");
+      const total = records.length;
+      // 状态写入必须同时覆盖 records 与 visible：搜索激活时 visible 是
+      // search_records 返回的后端新对象，只改 records 会让卡片反馈整体
+      // 失效（2026-10-31 审查修复 M3）
+      const putCheck = (id: string, check: CheckView): void => {
+        for (const r of records) if (r.id === id) r.check = check;
+        for (const r of visible) if (r.id === id) r.check = check;
+      };
+      for (const r of records) {
+        putCheck(r.id, { status: "checking", label: "checking", http: null });
+      }
+      await applyFilter();
+      let done = 0;
+      const progress = new ProgressChannel<{ id: string; status: string; label: string; http: number | null }>();
+      progress.onmessage = (c) => {
+        done += 1;
+        checkAllBtn.textContent = `${t("checkingAll")} ${done}/${total}`;
+        putCheck(c.id, { status: c.status, label: c.label, http: c.http });
+        void applyFilter();
+      };
+      try {
+        const results = await invoke<
+          Array<{ id: string; status: string; label: string; http: number | null }>
+        >("check_all_keys", { onProgress: progress.handle });
+        const byId = new Map(results.map((c) => [c.id, c]));
+        for (const r of records) {
+          const c = byId.get(r.id);
+          if (c) putCheck(r.id, { status: c.status, label: c.label, http: c.http });
+        }
+        await refresh();
+        // 分类统计（非零项拼接，" · "分隔两语言皆可）
+        const cnt: Record<string, number> = {};
+        for (const c of results) cnt[c.label] = (cnt[c.label] ?? 0) + 1;
+        const parts = Object.entries(cnt)
+          .sort((a, b) => b[1] - a[1])
+          .map(([label, n]) => `${n} ${checkLabel(label)}`);
+        toast(t("checkDone", parts.join(" · ")));
+      } catch (e) {
+        toast(String(e), false);
+      } finally {
+        checkAllBtn.disabled = false;
+        checkAllBtn.replaceChildren(icon("shield"), document.createTextNode(t("checkAll")));
+      }
+    })(),
+  );
   const lockBtn = el("button", "btn btn-small btn-ghost", t("lock"));
   lockBtn.prepend(icon("lock"));
-  lockBtn.title = t("lock");
+  lockBtn.dataset.tip = t("lock");
   const gearBtn = el("button", "btn btn-small btn-ghost", t("settings"));
   gearBtn.prepend(icon("gear"));
-  gearBtn.title = t("settings");
-  top.append(brand, chips, syncBtn, lockBtn, gearBtn);
+  gearBtn.dataset.tip = t("settings");
+  top.append(brand, chips, checkAllBtn, syncBtn, lockBtn, gearBtn);
 
   // 搜索 + 新增（搜索框内嵌放大镜图标）
   const toolbar = el("div", "toolbar");
@@ -1224,25 +1441,56 @@ async function renderMain(): Promise<void> {
         records.length === 0 ? t("emptyAddFirst") : t("emptyTryOther"),
       );
       empty.append(icon("inbox"), title, hint);
+      list.classList.remove("cols-host");
       list.append(empty);
       return;
     }
-    for (const r of rows) list.append(recordCard(r));
+    // 贪心瀑布流（2026-10-31 反馈：grid 行对齐时，同行最高卡片决定
+    // 行高，矮卡片下方出现大片空隙）：按序放入当前最矮的列，列内
+    // 纵向间隔固定。列数与原 grid 断点一致（卡片最小 420px）。
+    // 切出 grid 布局（2026-10-31 修复：record-list 仍是 grid 时，
+    // 列容器会被压进第一条 420px 轨道，卡片窄到文字竖排）
+    list.classList.add("cols-host");
+    const cols = Math.max(
+      1,
+      Math.min(3, Math.floor((list.clientWidth + 10) / 430)),
+    );
+    const colEls: HTMLElement[] = [];
+    for (let i = 0; i < cols; i++) colEls.push(el("div", "record-col"));
+    const colWrap = el("div", "record-cols");
+    colWrap.append(...colEls);
+    list.append(colWrap);
+    for (const r of rows) {
+      const card = recordCard(r);
+      // 找当前最矮列（未挂载时 offsetHeight 为 0——colWrap 已在 list 内，
+      // list 本身在 DOM 中，逐卡插入后实时测量）
+      let target = colEls[0];
+      let min = target.offsetHeight;
+      for (const col of colEls) {
+        const h = col.offsetHeight;
+        if (h < min) {
+          min = h;
+          target = col;
+        }
+      }
+      target.append(card);
+    }
   }
 
   function recordCard(r: RecordView): HTMLElement {
     const card = el("div", "record");
     const head = el("div", "record-head");
-    head.append(
-      el("span", "record-name", r.name),
-      el("span", `badge badge-${r.protocol.startsWith("custom") ? "custom" : r.protocol}`, protoLabel(r.protocol)),
-    );
+    // 徽章只显示协议族短名（OpenAI / Anthropic / 自定义名），具体
+    // API 形态 hover title 呈现（2026-10-31 反馈：长文案是视觉噪音）
+    const badge = el("span", `badge ${protoBadgeClass(r.protocol)}`, protoShort(r.protocol));
+    badge.dataset.tip = protoLabel(r.protocol);
+    head.append(el("span", "record-name", r.name), badge);
 
     // 字段级复制（2026-10-25 需求）：base_url 与 api_key 成对使用，
     // 各自的行内提供复制按钮（1Password 的字段复制模式）。
     // key 复制后 30 秒自动清除（敏感）；URL 不清除（非敏感）。
     const copyUrlBtn = el("button", "btn btn-icon btn-inline");
-    copyUrlBtn.title = t("copyUrl");
+    copyUrlBtn.dataset.tip = t("copyUrl");
     copyUrlBtn.setAttribute("aria-label", t("copyUrl"));
     copyUrlBtn.append(icon("copy"));
     copyUrlBtn.addEventListener("click", () =>
@@ -1259,7 +1507,7 @@ async function renderMain(): Promise<void> {
     urlRow.append(el("span", "record-url", r.base_url), copyUrlBtn);
 
     const copyKeyBtn = el("button", "btn btn-icon btn-inline");
-    copyKeyBtn.title = t("copyKey");
+    copyKeyBtn.dataset.tip = t("copyKey");
     copyKeyBtn.setAttribute("aria-label", t("copyKey"));
     copyKeyBtn.append(icon("copy"));
     copyKeyBtn.addEventListener("click", () =>
@@ -1275,20 +1523,30 @@ async function renderMain(): Promise<void> {
 
     const keyRow = el("div", "record-key");
     keyRow.append(el("code", "mono", r.masked_key), copyKeyBtn);
-    // 备注独立成行（2026-10-25 优化）：不再挤在 key 行里，
-    // 作为卡片末尾的补充说明展示
-    const notesRow = r.notes ? el("div", "notes", r.notes) : null;
-    // 模型清单独立一行（muted 小字，与 notes 同级）；空列表不占位
+    // 备注独立成行（2026-10-25 优化）：引用块样式（左竖线）与模型胶囊
+    // 在视觉上明确区分（2026-10-31 反馈：两者此前同为 muted 文本行，
+    // 区分度不足）
+    const notesRow = r.notes ? el("div", "record-notes", r.notes) : null;
+    // 模型清单：彩色胶囊（按模型名哈希取色，同一模型永远同色）；
+    // 空列表不占位
     const modelsRow =
-      r.models && r.models.length > 0
-        ? el("div", "notes", `${t("modelsOpt")}: ${r.models.join(", ")}`)
-        : null;
+      r.models && r.models.length > 0 ? el("div", "record-models") : null;
+    if (modelsRow) {
+      for (const m of r.models) {
+        const chip = el("span", `model-chip mc-${modelColorIndex(m)}`);
+        chip.append(el("code", "mono", m));
+        modelsRow.append(chip);
+      }
+    }
     const foot = el("div", "record-foot");
     const checkChip = el("span", `check check-${r.check ? r.check.status : "none"}`, r.check ? checkLabel(r.check.label) : t("notChecked"));
-    const updated = el("span", "muted small", r.updated_at);
+    // 更新时间同样相对化（2026-10-31 采纳：与 last_sync chip 一致），
+    // 悬停看完整本地时间
+    const updated = el("span", "muted small", relativeTime(r.updated_at));
+    updated.title = fmtLocalFull(new Date(r.updated_at));
     const actions = el("div", "record-actions");
     const checkBtn = el("button", "btn btn-icon");
-    checkBtn.title = t("checkKey");
+    checkBtn.dataset.tip = t("checkKey");
     checkBtn.setAttribute("aria-label", t("checkKey"));
     checkBtn.append(icon("shield"));
     checkBtn.addEventListener("click", () =>
@@ -1306,12 +1564,12 @@ async function renderMain(): Promise<void> {
       }),
     );
     const editBtn = el("button", "btn btn-icon");
-    editBtn.title = t("editRecord");
+    editBtn.dataset.tip = t("editRecord");
     editBtn.setAttribute("aria-label", t("editRecord"));
     editBtn.append(icon("edit"));
     editBtn.addEventListener("click", () => openDrawer(r, refresh));
     const delBtn = el("button", "btn btn-icon danger");
-    delBtn.title = t("deleteRecord");
+    delBtn.dataset.tip = t("deleteRecord");
     delBtn.setAttribute("aria-label", t("deleteRecord"));
     delBtn.append(icon("trash"));
     delBtn.addEventListener("click", () => {
@@ -1328,37 +1586,7 @@ async function renderMain(): Promise<void> {
         });
       })();
     });
-        // M5 供给：配置到应用（D21）——选目标应用 → 确认 → 写配置文件
-    //（切换语义、自动备份、写后验证；restore 见 `mak restore <app>`）
-    const applyBtn = el("button", "btn btn-icon");
-    applyBtn.title = t("applyToApp");
-    applyBtn.setAttribute("aria-label", t("applyToApp"));
-    applyBtn.append(icon("download"));
-    applyBtn.addEventListener("click", async () => {
-      const app = await chooseAppDialog();
-      if (!app) return;
-      const label = APP_TARGETS.find(([id]) => id === app)?.[1] ?? app;
-      // 槽位映射（D22）：槽位型应用且记录有模型时先收集映射，
-      // 取消 = 放弃本次配置
-      let slots: Record<string, string> = {};
-      const slotDefs = await invoke<RecipeSlotView[]>("recipe_slots", { app });
-      if (slotDefs.length > 0 && r.models.length > 0) {
-        const picked = await slotMappingDialog(slotDefs, r.models);
-        if (picked === null) return;
-        slots = picked;
-      }
-      const ok = await confirmBox(t("applyConfirm", label), t("applyToApp"));
-      if (!ok) return;
-      void withBusy(applyBtn, t("applyToApp"), async () => {
-        try {
-          const v = await invoke<ApplyView>("apply_to_app", { id: r.id, app, slots });
-          toast(`${t("appliedToast", v.app)} ${v.effect}`);
-        } catch (e) {
-          toast(String(e), false);
-        }
-      });
-    });
-    actions.append(checkBtn, applyBtn, editBtn, delBtn);
+    actions.append(checkBtn, editBtn, delBtn);
     foot.append(checkChip, updated, actions);
     card.append(head, urlRow, keyRow);
     if (modelsRow) card.append(modelsRow);
@@ -1383,10 +1611,22 @@ async function renderMain(): Promise<void> {
     chips.replaceChildren();
     try {
       const st = await invoke<StatusView>("status");
-      const remoteChip = el("span", "chip", st.remote ? t("remoteBound") : t("standaloneMode"));
-      if (st.ahead > 0) chips.append(el("span", "chip chip-warn", t("nUnpushed", st.ahead)));
-      if (st.behind > 0) chips.append(el("span", "chip chip-warn", t("nToPull", st.behind)));
-      chips.append(remoteChip, el("span", "chip", t("nRecords", st.alive)));
+      // 同步按钮可用性从数据派生（D27）：单机没有远端可对账，
+      // 禁用而非点了再报"已是最新"的假成功
+      syncBtn.disabled = !st.remote;
+      syncBtn.dataset.tip = st.remote ? "" : t("syncStandaloneHint");
+      const remoteChip = el("span", "chip chip-remote", st.remote ? t("remoteBound") : t("standaloneMode"));
+      if (st.pending) chips.append(el("span", "chip chip-warn", t("unpushedPending")));
+      if (st.last_sync) {
+        // 简洁相对时间（2026-10-31 反馈：完整 ISO 时间戳不可读）；
+        // 悬停 title 显示完整本地时间兜底精度
+        const chip = el("span", "chip chip-last-sync", t("lastSyncChip", relativeTime(st.last_sync)));
+        chip.dataset.tip = fmtLocalFull(new Date(st.last_sync));
+        chips.append(chip);
+      } else {
+        chips.append(el("span", "chip chip-last-sync", t("lastSyncChip", t("lastSyncNever"))));
+      }
+      chips.append(remoteChip, el("span", "chip chip-count", t("nRecords", st.alive)));
     } catch {
       /* 状态获取失败不影响主界面 */
     }
@@ -1463,42 +1703,51 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
   name.value = existing?.name ?? "";
 
   const protoWrap = el("div", "field-row");
-  const proto = el("select", "input");
-  const preset = existing && !existing.protocol.startsWith("custom") ? existing.protocol : "";
-  proto.append(
-    // 选项文本用公司规范名展示，value 保持小写存储标签
-    Object.assign(el("option"), { value: "openai", textContent: "OpenAI" }),
-    Object.assign(el("option"), { value: "anthropic", textContent: "Anthropic" }),
-    Object.assign(el("option"), { value: "custom", textContent: t("protoCustomOpt") }),
+  // 协议选项文本用公司规范名展示，value 保持小写存储标签（自绘下拉）
+  const proto = makeSelect(
+    [
+      { value: "openai", label: "OpenAI Responses (recommended)" },
+      { value: "openai-chat", label: "OpenAI Chat (widely compatible)" },
+      { value: "anthropic", label: "Anthropic Messages (standard)" },
+      { value: "anthropic-complete", label: "Anthropic Complete (deprecated)" },
+      { value: "custom", label: t("protoCustomOpt") },
+    ],
+    existing && !existing.protocol.startsWith("custom") ? existing.protocol : "openai",
+    syncCustom,
   );
-  proto.value = preset || "openai";
   const protoCustom = el("input", "input");
   protoCustom.placeholder = t("protoCustomLabel");
   if (existing?.protocol.startsWith("custom:")) {
     protoCustom.value = existing.protocol.slice("custom:".length);
   }
   const isCustom = () => proto.value === "custom";
-  const syncCustom = () => (protoCustom.style.display = isCustom() ? "" : "none");
-  proto.addEventListener("change", syncCustom);
+  function syncCustom(): void {
+    protoCustom.style.display = isCustom() ? "" : "none";
+  }
   syncCustom();
-  protoWrap.append(proto, protoCustom);
+  protoWrap.append(proto.root, protoCustom);
 
   const baseUrl = el("input", "input");
   baseUrl.type = "url";
   baseUrl.placeholder = t("baseUrl");
   baseUrl.value = existing?.base_url ?? "";
 
-  // key 输入：默认掩码；新增时直接可输入，编辑时点 Reveal 取回明文
+  // key 输入：默认掩码；新增时直接可输入，编辑时点眼睛取回明文。
+  // 纯图标按钮 + hover 提示（2026-10-31 反馈：眼睛符号已含义明确，
+  // "查看/隐藏"文字冗余）
   const keyWrap = el("div", "field-row");
   const key = el("input", "input grow");
   key.type = "password";
   key.placeholder = t("apiKey");
   key.autocomplete = "off";
-  const reveal = el("button", "btn btn-small", t("reveal"));
-  reveal.prepend(icon("eye"));
+  const reveal = el("button", "btn btn-icon");
+  reveal.type = "button";
   let revealed = false;
   const syncRevealLabel = () => {
-    reveal.replaceChildren(icon(revealed ? "eyeOff" : "eye"), document.createTextNode(t(revealed ? "hide" : "reveal")));
+    reveal.replaceChildren(icon(revealed ? "eyeOff" : "eye"));
+    const label = t(revealed ? "hidePass" : "showPass");
+    reveal.dataset.tip = label;
+    reveal.setAttribute("aria-label", label);
   };
   reveal.addEventListener("click", async () => {
     if (existing && !revealed) {
@@ -1530,7 +1779,7 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
   // 取第一个。chosen 是唯一事实源，chip 与保存值都从它渲染。
   let chosen: string[] = [...(existing?.models ?? [])];
   const modelsWrap = el("div", "models-editor");
-  const modelsLabel = el("span", "models-label", t("modelsOpt"));
+  const modelsLabel = el("div", "field-label", t("modelsOpt"));
   const chipBox = el("div", "chip-box");
   const modelsInput = el("input", "input grow");
   modelsInput.placeholder = t("modelsHint");
@@ -1541,6 +1790,83 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
   const modelsInputRow = el("div", "field-row models-input-row");
   modelsInputRow.append(modelsInput, addBtn, fetchBtn);
   modelsWrap.append(modelsLabel, chipBox, modelsInputRow);
+
+  // 候选挑选面板（2026-10-31 重设计）：「获取」拉到的清单不再整表塞进
+  // 已选（中转站动辄几百个模型），而是展开复选面板让用户勾选——搜索
+  // 过滤 + 全选/清空 + 按服务端顺序合并；已选过的候选自动预勾选，手工
+  // 添加的、服务端清单里没有的项合并时原样保留
+  let candidates: string[] = [];
+  const picked = new Set<string>();
+  const pickWrap = el("div", "model-pick hidden");
+  const pickSearch = el("input", "input");
+  pickSearch.placeholder = t("pickSearch");
+  pickSearch.type = "search";
+  const pickAllBtn = el("button", "btn btn-small", t("pickAll"));
+  pickAllBtn.type = "button";
+  const pickNoneBtn = el("button", "btn btn-small", t("pickNone"));
+  pickNoneBtn.type = "button";
+  const pickHead = el("div", "field-row");
+  pickHead.append(pickSearch, pickAllBtn, pickNoneBtn);
+  const pickList = el("div", "pick-list");
+  const pickAdd = el("button", "btn btn-small btn-primary", t("pickAdd", 0));
+  pickAdd.type = "button";
+  pickWrap.append(pickHead, pickList, pickAdd);
+  modelsWrap.append(pickWrap);
+  const syncPickAdd = (): void => {
+    pickAdd.textContent = t("pickAdd", picked.size);
+    pickAdd.disabled = picked.size === 0;
+  };
+  const renderPickList = (): void => {
+    const kw = pickSearch.value.trim().toLowerCase();
+    pickList.replaceChildren();
+    for (const m of candidates) {
+      if (kw && !m.toLowerCase().includes(kw)) continue;
+      const row = el("label", picked.has(m) ? "pick-item picked" : "pick-item");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = picked.has(m);
+      cb.addEventListener("change", () => {
+        if (cb.checked) picked.add(m);
+        else picked.delete(m);
+        row.classList.toggle("picked", cb.checked);
+        syncPickAdd();
+      });
+      row.append(cb, el("code", "mono", m));
+      pickList.append(row);
+    }
+    syncPickAdd();
+  };
+  pickSearch.addEventListener("input", renderPickList);
+  // Enter/Escape 不冒泡（2026-10-31 审查修复：抽屉的"INPUT 内 Enter=保存"
+  // 会提前落盘并丢掉未合并的勾选）；Enter 语义对齐 modelsInput = 添加所选
+  pickSearch.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (picked.size > 0) pickAdd.click();
+    } else if (ev.key === "Escape") {
+      ev.stopPropagation();
+    }
+  });
+  // 全选 = 勾选当前过滤可见的候选（跨过滤累积，不碰被过滤掉的勾选态）
+  pickAllBtn.addEventListener("click", () => {
+    const kw = pickSearch.value.trim().toLowerCase();
+    for (const m of candidates) {
+      if (!kw || m.toLowerCase().includes(kw)) picked.add(m);
+    }
+    renderPickList();
+  });
+  pickNoneBtn.addEventListener("click", () => {
+    picked.clear();
+    renderPickList();
+  });
+  pickAdd.addEventListener("click", () => {
+    chosen = chosen
+      .filter((m) => !candidates.includes(m))
+      .concat(candidates.filter((m) => picked.has(m)));
+    renderChips();
+    pickWrap.classList.add("hidden");
+  });
 
   /** 重渲染 chip 区（chosen → DOM）；空列表显示占位提示。 */
   const renderChips = () => {
@@ -1619,10 +1945,15 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
           toast(t("fetchModelsEmpty"), false);
           return;
         }
-        // 自动填充 = 替换整个列表（获取到的就是服务端的完整清单）
-        chosen = list;
-        renderChips();
-        toast(t("fetchModelsDone", list.length));
+        // 展开候选面板供挑选（不再整表塞进已选）；已选中的候选预勾选
+        candidates = list;
+        picked.clear();
+        for (const m of chosen) {
+          if (candidates.includes(m)) picked.add(m);
+        }
+        pickSearch.value = "";
+        pickWrap.classList.remove("hidden");
+        renderPickList();
       } catch (e) {
         toast(String(e), false);
       }
@@ -1744,7 +2075,23 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
   });
   actions.append(cancel, save);
 
-  drawer.append(name, protoWrap, baseUrl, keyWrap, modelsWrap, notes, errBox, actions);
+  // 每字段一行 muted 小标签（2026-10-31 反馈：仅 placeholder 在填值后
+  // 失去提示）；(optional) 为伴随信息标注，非补充说明
+  const field = (labelText: string, control: HTMLElement): HTMLElement => {
+    const wrap = el("div", "field");
+    wrap.append(el("div", "field-label", labelText), control);
+    return wrap;
+  };
+  drawer.append(
+    field(t("nameLabel"), name),
+    field(t("protoLabel"), protoWrap),
+    field(t("baseUrlLabel"), baseUrl),
+    field(t("apiKeyLabel"), keyWrap),
+    modelsWrap,
+    field(t("notesLabel"), notes),
+    errBox,
+    actions,
+  );
   overlay.append(drawer);
   // 点击遮罩空白处关闭。必须用 mousedown 做守卫：WebView2 对 type=password
   // 会弹浏览器级自动填充建议，选择建议时页面会收到一个合成的 click，落点
@@ -1768,7 +2115,10 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
 // 设置页
 // ---------------------------------------------------------------------------
 
-async function renderSettings(onBack: () => Promise<void>): Promise<void> {
+async function renderSettings(
+  onBack: () => Promise<void>,
+  keepEdits = true,
+): Promise<void> {
   let s: SettingsView;
   try {
     s = await invoke<SettingsView>("get_settings");
@@ -1777,8 +2127,10 @@ async function renderSettings(onBack: () => Promise<void>): Promise<void> {
     return;
   }
   // 语言/主题切换会整页重建设置页：先快照未保存的编辑（2026-10-26
-  // 审查修复：此前用户改了一半的 remote/数字会被静默回滚）
-  const keep = snapshotFields();
+  // 审查修复：此前用户改了一半的 remote/数字会被静默回滚）。
+  // 解绑等"数据刚被清掉"的重开必须传 keepEdits=false——回填会把
+  // 刚清空的地址又填回输入框，看起来像解绑没生效（2026-10-31 修复）
+  const keep = keepEdits ? snapshotFields() : {};
   $app.replaceChildren();
   const shell = el("div", "shell");
   const top = el("div", "topbar");
@@ -1794,24 +2146,53 @@ async function renderSettings(onBack: () => Promise<void>): Promise<void> {
   const remote = el("input", "input");
   remote.type = "url";
   remote.placeholder = t("remotePlaceholder");
-  remote.title = t("remoteHint"); // 细则走 hover 提示
+  remote.dataset.tip = t("remoteHint"); // 细则走 hover 提示
   remote.value = s.remote ?? "";
   remote.dataset.field = "remote";
-  // token 失效自愈入口（2026-10-26）：重新走设备授权，完成后可立即同步
-  const reauthBtn = el("button", "btn btn-small", t("reauthorizeGithub"));
-  reauthBtn.style.justifySelf = "start";
-  reauthBtn.addEventListener("click", () =>
-    void withBusy(reauthBtn, t("reauthorizing"), async () => {
-      try {
-        const stage = await invoke<InitStage>("github_reauthorize");
-        if (stage.stage === "device_code") {
-          showDeviceCode(stage.user_code, stage.verification_uri);
-        }
-      } catch (e) {
-        toast(String(e), false);
-      }
-    }),
+  // 同步区块单按钮（2026-10-31 拍板：语义从绑定状态派生，D27）——
+  // 已绑定 → 「解绑 GitHub」（清令牌 + 解绑，危险动作红字 + 确认框）；
+  // 未绑定 → 「重新授权 GitHub」（设备流授权，绑定保持空）。
+  // 两个后端命令原样复用，前端只按 s.remote 选择渲染哪个动作。
+  // 尺寸对齐「检查更新」的小按钮（btn-small，2026-10-31 反馈：大按钮
+  // 与设置页行式布局不协调）
+  const syncBtn2 = el(
+    "button",
+    s.remote ? "btn btn-small btn-danger" : "btn btn-small",
+    s.remote ? t("unbindGithub") : t("reauthorizeGithub"),
   );
+  syncBtn2.addEventListener("click", () => {
+    if (!s.remote) {
+      // 未绑定：重新授权（设备流，完成后本页不动，令牌已入库）
+      void withBusy(syncBtn2, t("reauthorizing"), async () => {
+        try {
+          const stage = await invoke<InitStage>("github_reauthorize");
+          if (stage.stage === "device_code") {
+            showDeviceCode(stage.user_code, stage.verification_uri);
+          }
+        } catch (e) {
+          toast(String(e), false);
+        }
+      });
+      return;
+    }
+    // 已绑定：解绑（清令牌 + 解绑，一次写清）——确认后执行；
+    // 数据层一次写清后重开设置页，从 get_settings 重新派生
+    // （远端框清空、按钮自动变回「重新授权」），主界面 chips 由
+    // 返回时的 renderMain 重读
+    void (async () => {
+      if (!(await confirmBox(t("unbindGithubConfirm"), t("unbindGithub")))) return;
+      await withBusy(syncBtn2, t("creating"), async () => {
+        try {
+          await invoke("forget_github_token");
+          toast(t("unboundGithub"));
+          // keepEdits=false：数据层刚清掉绑定，不能把旧地址回填回输入框
+          await renderSettings(onBack, false);
+        } catch (e) {
+          toast(String(e), false);
+        }
+      });
+    })();
+  });
 
   const h2Behavior = el("h2", "", t("behaviorSection"));
   const mkNum = (
@@ -1827,7 +2208,7 @@ async function renderSettings(onBack: () => Promise<void>): Promise<void> {
     num.min = "0";
     num.dataset.field = field;
     num.value = String(val);
-    if (hint) num.title = hint; // 细则走 hover 提示，文案本体保持简洁
+    if (hint) num.dataset.tip = hint; // 细则走 hover 提示，文案本体保持简洁
     row.append(el("label", "", label), num, el("span", "muted", suffix));
     return [num, row];
   };
@@ -1853,15 +2234,14 @@ async function renderSettings(onBack: () => Promise<void>): Promise<void> {
     onChange: (v: string) => void,
   ): HTMLElement => {
     const row = el("div", "setting-row");
-    const sel = el("select", "input num");
-    for (const [v, text] of opts) {
-      const o = el("option", undefined, text);
-      o.value = v;
-      sel.append(o);
-    }
-    sel.value = value;
-    sel.addEventListener("change", () => onChange(sel.value));
-    row.append(el("label", "", label), sel);
+    // 自绘下拉（2026-10-31 三处 select 统一）：固定宽度对齐原 .num 形态
+    const dd = makeSelect(
+      opts.map(([v, text]) => ({ value: v, label: text })),
+      value,
+      onChange,
+    );
+    dd.root.style.width = "160px";
+    row.append(el("label", "", label), dd.root);
     return row;
   };
   const themeRow = mkSelect(
@@ -1980,7 +2360,7 @@ async function renderSettings(onBack: () => Promise<void>): Promise<void> {
     .then((v) => (versionLabel.textContent = t("currentVersion", v)))
     .catch(() => {});
   updateRow.append(versionLabel, checkBtn);
-  body.append(h2Sync, remote, reauthBtn, h2Behavior, rememberRow, lockRow, autoPushRow, h2Appearance, themeRow, langRow, h2Update, updateRow, updateResult, errBox, save);
+  body.append(h2Sync, remote, syncBtn2, h2Behavior, rememberRow, lockRow, autoPushRow, h2Appearance, themeRow, langRow, h2Update, updateRow, updateResult, errBox, save);
   shell.append(top, body);
   $app.append(shell);
   // 回填必须在挂载到 document 之后：restoreFields 走 document 查询，

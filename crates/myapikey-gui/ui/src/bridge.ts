@@ -11,7 +11,10 @@ import { mockInvoke, mockListen } from "./mock";
 
 interface TauriGlobal {
   __TAURI__?: {
-    core: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    core: {
+      invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+      Channel?: new () => unknown;
+    };
     event: { listen: (name: string, cb: (e: { payload: unknown }) => void) => Promise<() => void> };
   };
 }
@@ -32,5 +35,31 @@ export async function onLocked(cb: () => void): Promise<void> {
     await tauri.event.listen("locked", cb);
   } else {
     await mockListen(cb);
+  }
+}
+
+// 批量进度通道（2026-10-31 一键检测全部的过程反馈）：
+// Tauri 窗口内包装 __TAURI__.core.Channel，后端每完成一条即推送；
+// 浏览器 mock 下是空壳（handle 传普通对象，mock 不认识该参数——
+// 由后端全量返回值兜底一次性更新）。
+
+/** 批量进度通道（Tauri 2 ipc::Channel 的前端壳，零 npm 依赖）。 */
+export class ProgressChannel<T> {
+  private raw: unknown;
+
+  /** 每条进度回调（属性式赋值；Tauri 下逐条触发，mock 下不触发）。 */
+  onmessage: ((payload: T) => void) | null = null;
+
+  constructor() {
+    const Ctor = tauri?.core.Channel;
+    this.raw = Ctor ? new Ctor() : {};
+    if (this.raw && "onmessage" in (this.raw as Record<string, unknown>)) {
+      (this.raw as { onmessage: unknown }).onmessage = (p: T) => this.onmessage?.(p);
+    }
+  }
+
+  /** 传给 invoke 的参数值（Tauri Channel 实例或 mock 占位对象）。 */
+  get handle(): unknown {
+    return this.raw;
   }
 }

@@ -1,6 +1,7 @@
 /**
  * 浏览器模式的后端 mock：仅用于无 Tauri 环境下的 UI 开发与自动化测试。
- * 数据存 localStorage，不涉及任何真实加密/同步；解锁密码为初始化时
+ * 数据存 sessionStorage（会话级，明文 key 不落浏览器持久层），
+ * 不涉及任何真实加密/同步；解锁密码为初始化时
  * 设置的那个（与真实 vault 行为一致，旧状态退回历史固定值 "mock"）。
  */
 
@@ -17,7 +18,19 @@ interface MockRecord {
   check?: { status: string; label: string; http: number | null } | null;
 }
 
+// mock 数据放 sessionStorage（会话级）：开发预览时可能录入真实 key，
+// 明文不落浏览器持久层（2026-10-31 审查修复）；mak-mock-* 调试开关
+// 仍走 localStorage（跨会话保留）
 const STORE_KEY = "myapikey-mock";
+
+function mockStoreGet(key: string): string | null {
+  return key === STORE_KEY ? sessionStorage.getItem(key) : localStorage.getItem(key);
+}
+
+function mockStoreSet(key: string, value: string): void {
+  if (key === STORE_KEY) sessionStorage.setItem(key, value);
+  else localStorage.setItem(key, value);
+}
 
 interface MockStore {
   initialized: boolean;
@@ -31,11 +44,13 @@ interface MockStore {
     auto_push: boolean;
     remember_days: number;
     auto_lock_minutes: number;
+    /** 最近一次对账时刻（对齐真实 config.last_sync_at，sync 成功时刷新）。 */
+    last_sync: string | null;
   };
 }
 
 function load(): MockStore {
-  const raw = localStorage.getItem(STORE_KEY);
+  const raw = mockStoreGet(STORE_KEY);
   if (raw) return JSON.parse(raw) as MockStore;
   return {
     initialized: false,
@@ -47,12 +62,13 @@ function load(): MockStore {
       auto_push: true,
       remember_days: 7,
       auto_lock_minutes: 10,
+      last_sync: null,
     },
   };
 }
 
 function save(s: MockStore): void {
-  localStorage.setItem(STORE_KEY, JSON.stringify(s));
+  mockStoreSet(STORE_KEY, JSON.stringify(s));
 }
 
 function mask(key: string): string {
@@ -102,79 +118,71 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
       } as T);
     case "init_start": {
       if (s.initialized) return err("already initialized on this machine");
-      const pass = String(args?.passphrase ?? "");
-      if (pass.length < 4) return err("passphrase too short");
-      // GitHub 模式返回设备码阶段，便于在浏览器里目检授权页
+      // 两阶段（对齐真实后端）：init_start 不再收主密码。
+      // solo 模式直接返回探测结果（远端无数据 → 前端显示设置密码表单）；
+      // GitHub 模式返回设备码阶段，便于在浏览器里目检授权页。
       if (args?.github_repo) {
+        localStorage.setItem("mak-mock-pending-remote", "1");
         return ok({ stage: "device_code", user_code: "AB12-CD34", verification_uri: "https://github.com/login/device" } as T);
+      }
+      localStorage.removeItem("mak-mock-pending-remote");
+      return ok({ stage: "probe_done", has_data: false, repo: "" } as T);
+    }
+    case "init_device_authorized": {
+      // mock：授权完成 → 探测。localStorage 置 mak-mock-remote-has-data
+      // 可模拟“远端已有保险库”，预览接入表单（密码须与 mak-mock-remote-pass
+      // 一致，默认 "remote"）；置 mak-mock-auth-fail 可模拟授权失败，
+      // 预览“重试”按钮路径。已初始化机器 = 授权刷新（对齐真实后端：
+      // 返回 Done{refresh:true}，绑定恢复、vault 不动）。
+      if (localStorage.getItem("mak-mock-auth-fail")) {
+        return err("authorization_pending: waiting for the user to authorize");
+      }
+      if (s.initialized) {
+        // 对齐真实后端 refresh 分支：授权刷新会把 remote 重新指向同步仓库
+        s.settings.remote = "you/myapikey-vault";
+        save(s);
+        return ok({ stage: "done", joined: false, records: s.records.length, refresh: true } as T);
+      }
+      return ok({
+        stage: "probe_done",
+        has_data: !!localStorage.getItem("mak-mock-remote-has-data"),
+        repo: "you/myapikey-vault",
+      } as T);
+    }
+    case "init_finish": {
+      // 与真实 init_finish 对齐：接入模式以密码解密远端（不匹配即拒绝），
+      // 新设模式直接以该密码加密空 vault（真实后端不做长度校验）。
+      const pass = String(args?.passphrase ?? "");
+      if (localStorage.getItem("mak-mock-remote-has-data")) {
+        const expected = localStorage.getItem("mak-mock-remote-pass") ?? "remote";
+        if (pass !== expected) {
+          return err("cannot decrypt the remote vault with the given passphrase. All devices must use the same master passphrase");
+        }
       }
       s.initialized = true;
       s.unlocked = true;
-      s.pass = pass; // 与真实 vault 一致：解锁校验初始化时设置的密码
+      s.pass = pass; // 与真实 vault 一致：解锁校验初始化/接入时用的密码
+      // GitHub 流程收尾：回写远端仓库（对齐真实后端写 config.remote_repo），
+      // 使状态页显示 GitHub 模式而非单机模式；solo 流程保持 null。
+      if (localStorage.getItem("mak-mock-pending-remote")) {
+        s.settings.remote = "you/myapikey-vault";
+        localStorage.removeItem("mak-mock-pending-remote");
+      }
       save(s);
-      return ok({ stage: "done", joined: false, records: 0 } as T);
+      return ok({ stage: "done", joined: !!localStorage.getItem("mak-mock-remote-has-data"), records: 0 } as T);
     }
-    case "init_device_authorized":
-      // mock：模拟"已初始化机器的授权刷新"完成
-      return ok({ stage: "done", joined: false, records: s.records.length, refresh: true } as T);
     case "fetch_models":
       // mock：返回三个假模型（真实行为见 core::probe::fetch_models）
       return ok(["GLM-5.2", "GLM-5.1", "GLM-5-Air"] as T);
-    case "recipe_slots":
-      // mock：槽位型应用的槽位清单（真实行为见 core::supply::Recipe::slot_ops）
-      if (String(args?.app ?? "") === "claude-code") {
-        return ok([
-          {
-            slot: "opus",
-            path: "env.ANTHROPIC_DEFAULT_OPUS_MODEL",
-            desc: "Model used when Claude Code requests the Opus tier (main conversation).",
-          },
-          {
-            slot: "sonnet",
-            path: "env.ANTHROPIC_DEFAULT_SONNET_MODEL",
-            desc: "Model used when Claude Code requests the Sonnet tier (main conversation).",
-          },
-          {
-            slot: "haiku",
-            path: "env.ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            desc: "Model used for background tasks (summaries, titles, haiku-tier calls).",
-          },
-          {
-            slot: "fable",
-            path: "env.ANTHROPIC_DEFAULT_FABLE_MODEL",
-            desc: "Model used when Claude Code requests the Fable tier.",
-          },
-        ] as T);
-      }
-      if (String(args?.app ?? "") === "codex") {
-        return ok([
-          {
-            slot: "main",
-            path: "model",
-            desc: "Default model for Codex requests (written to the top-level `model` key).",
-          },
-        ] as T);
-      }
-      return ok([] as T);
-    case "apply_to_app": {
-      // mock：模拟 D21 写配置文件（真实行为见 core::supply）
-      const labels: Record<string, string> = {
-        "claude-code": "Claude Code",
-        codex: "Codex",
-        qwen: "Qwen Code",
-      };
-      const app = String(args?.app ?? "claude-code");
-      const label = labels[app] ?? app;
-      return ok({
-        app: label,
-        file: `C:\\Users\\you\\.${app === "claude-code" ? "claude" : app}\\settings.json`,
-        backup: "settings.json.mak-bak-1",
-        written: ["env.ANTHROPIC_AUTH_TOKEN"],
-        effect: `Restart ${label} to take effect.`,
-      } as T);
-    }
     case "github_reauthorize":
       return ok({ stage: "device_code", user_code: "AB12-CD34", verification_uri: "https://github.com/login/device" } as T);
+    case "forget_github_token":
+      // 对齐真实后端：清令牌 + 解绑（一次写清）；返回是否清到了令牌
+      if (s.settings.remote) {
+        s.settings.remote = null;
+        save(s);
+      }
+      return ok(true as T);
     case "unlock": {
       const expected = s.pass ?? "mock"; // 旧 mock 状态未存密码时退回历史固定值
       if (String(args?.passphrase) !== expected) return err("wrong master passphrase, or the vault data is corrupted");
@@ -254,20 +262,48 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
       return ok(undefined as T);
     case "check_key":
       return ok({ status: "unverifiable", label: "unverifiable", http: null } as T);
+    case "check_all_keys": {
+      // mock：全部记录返回"无法验证"（无真实网络）；带 id 供前端合并。
+      // 加 900ms 延迟模拟真实探测耗时，让"检测中"脉冲态可感知
+      return new Promise((resolve) =>
+        setTimeout(
+          () =>
+            resolve(
+              ok(
+                s.records.map((r) => ({
+                  id: r.id,
+                  status: "unverifiable",
+                  label: "unverifiable",
+                  http: null,
+                })) as T,
+              ),
+            ),
+          900,
+        ),
+      );
+    }
     case "sync_now":
+      // 对齐真实后端：单机模式没有远端，明确报错而非静默“已是最新”；
+      // 成功 = 对账完成，刷新记账时间（对齐 mark_synced 语义）
+      if (!s.settings.remote) {
+        return err("standalone mode: no remote is bound to sync with. Bind one on the settings page");
+      }
+      s.settings.last_sync = new Date().toISOString();
+      save(s);
       return ok({ pulled: false, merged: false, pushed: false, push_error: null, alive: s.records.length } as T);
     case "status":
       return ok({
         remote: s.settings.remote,
-        ahead: 0,
-        behind: 0,
-        last_sync: null,
+        pending: localStorage.getItem("mak-mock-pending") === "1",
+        last_sync: s.settings.last_sync,
         alive: s.records.length,
       } as T);
     case "get_settings":
       return ok(s.settings as T);
     case "set_settings":
-      s.settings = { ...(args?.settings as MockStore["settings"]) };
+      // 逐字段合并：前端 SettingsView 不含 mock 自有的 last_sync——
+      // 整体替换会让保存设置后"上次同步"清零（2026-10-31 审查采纳）
+      s.settings = { ...s.settings, ...(args?.settings as Partial<MockStore["settings"]>) };
       save(s);
       return ok(undefined as T);
     case "search_records": {
@@ -300,9 +336,20 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
 
 // ---------------------------------------------------------------------------
 // core::search 的 TS 复刻（仅供浏览器 mock，与 Rust 版规则保持一致：
-// 子串优先、子序列 3 字符起、URL 剥 scheme 按 / 分词、协议不参与、
-// 名称 30 / 域名段 10 / 备注 8 / 路径段 4）
+// 子串优先、子序列 3 字符起、URL 剥 scheme 按 / 分词、协议参与匹配
+// （2026-10-31 加入，权重 3 最低）、名称 30 / 域名段 10 / 备注 8 / 路径段 4）
 // ---------------------------------------------------------------------------
+
+
+/** 对齐 core Protocol::search_terms：协议的搜索匹配词（小写）。 */
+function protoSearchTerms(protocol: string): string {
+  if (protocol === "openai") return "openai responses";
+  if (protocol === "openai-chat") return "openai openai-chat chat";
+  if (protocol === "anthropic") return "anthropic messages";
+  if (protocol === "anthropic-complete") return "anthropic anthropic-complete complete";
+  const name = protocol.startsWith("custom:") ? protocol.slice("custom:".length) : protocol;
+  return `custom ${name.toLowerCase()}`;
+}
 
 function mockFuzzyScore(target: string, q: string): number | null {
   const idx = target.indexOf(q);
@@ -323,13 +370,18 @@ function mockWordBoundary(target: string, i: number): boolean {
   return i === 0 || /[-_./: ]/.test(target[i - 1] ?? "");
 }
 
-function mockSearchScore(r: { name: string; base_url: string; notes?: string | null }, q: string): number | null {
+function mockSearchScore(
+  r: { name: string; base_url: string; notes?: string | null; protocol: string },
+  q: string,
+): number | null {
   if (!q) return 0;
   const segs = r.base_url.toLowerCase().replace(/^https?:\/\//, "").split("/").filter(Boolean);
   const fields: Array<[string, number]> = [
     [r.name.toLowerCase(), 30],
     [r.notes?.toLowerCase() ?? "", 8],
     ...segs.map((sg, i): [string, number] => [sg, i === 0 ? 10 : 4]),
+    // 协议字段（2026-10-31 加入）：标签 + 完整形态词，权重 3 最低
+    [protoSearchTerms(r.protocol), 3],
   ];
   let best: number | null = null;
   for (const [text, weight] of fields) {

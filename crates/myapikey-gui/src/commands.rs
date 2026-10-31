@@ -138,6 +138,20 @@ pub async fn check_key(
         .map_err(err_str)
 }
 
+/// 一键校验全部记录（核心层并发探测，总耗时约最慢一条；放线程池）。
+/// `on_progress`：逐条完成的进度通道，前端据此逐条点亮检测结果。
+#[tauri::command]
+pub async fn check_all_keys(
+    on_progress: tauri::ipc::Channel<crate::CheckResultView>,
+    state: State<'_, SharedState>,
+) -> Result<Vec<crate::CheckResultView>, String> {
+    let shared = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || crate::check_all_keys(&shared, &on_progress))
+        .await
+        .map_err(join_err)?
+        .map_err(err_str)
+}
+
 /// 同步（git fetch/merge/push 网络操作，放线程池）。
 #[tauri::command]
 pub async fn sync_now(state: State<'_, SharedState>) -> Result<crate::SyncView, String> {
@@ -181,36 +195,71 @@ pub async fn set_settings(
         .map_err(err_str)
 }
 
-/// 初始化第一步（可能触发设备授权网络请求 / git ls-remote / 全套
-/// init 的加密与提交，放线程池）。
+/// 初始化第一步（可能触发设备授权网络请求 / 远端探测，放线程池）。
+/// D25 交互对齐：不再收主密码——密码表单在探测完成后按远端状态显示。
 #[tauri::command]
 pub async fn init_start(
-    passphrase: String,
     remote: Option<String>,
     github_repo: Option<String>,
     state: State<'_, SharedState>,
 ) -> Result<crate::InitStage, String> {
     let shared = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        crate::init_start(
-            &shared,
-            &passphrase,
-            remote.as_deref(),
-            github_repo.as_deref(),
-        )
+        crate::init_start(&shared, remote.as_deref(), github_repo.as_deref())
     })
     .await
     .map_err(join_err)?
     .map_err(err_str)
 }
 
+/// 忘记 GitHub 授权：清除本机凭据库里的 access/refresh 令牌。
+/// 远端仓库与 vault 不受影响；重新授权走 init 或 remote set 流程。
+///
+/// # Errors
+/// 凭据库操作失败。
+#[tauri::command]
+pub async fn forget_github_token(state: State<'_, SharedState>) -> Result<bool, String> {
+    let shared = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || crate::forget_github(&shared))
+        .await
+        .map_err(join_err)?
+        .map_err(err_str)
+}
+
 /// 设备授权完成后收尾（阻塞轮询 + 网络 + git，放线程池）。
 #[tauri::command]
 pub async fn init_device_authorized(
-    state: State<'_, SharedState>,
+    state: tauri::State<'_, crate::SharedState>,
 ) -> Result<crate::InitStage, String> {
     let shared = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || crate::init_device_authorized(&shared))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// 用系统默认浏览器打开链接（WebView 内导航会离开应用，外链一律
+/// 交系统浏览器）。
+///
+/// # Errors
+/// 系统打开浏览器失败。
+#[tauri::command]
+pub async fn open_external(url: String) -> Result<(), String> {
+    crate::open_external(&url).map_err(|e| e.to_string())
+}
+
+/// 初始化收尾：主密码表单提交（前端按 ProbeDone.has_data 显示接入/
+/// 新设表单后调用）。
+///
+/// # Errors
+/// 无进行中的初始化 / 主密码不匹配远端数据 / 保存失败。
+#[tauri::command]
+pub async fn init_finish(
+    passphrase: String,
+    state: State<'_, SharedState>,
+) -> Result<crate::InitStage, String> {
+    let shared = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || crate::init_finish(&shared, &passphrase))
         .await
         .map_err(join_err)?
         .map_err(err_str)
