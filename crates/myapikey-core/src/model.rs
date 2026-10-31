@@ -21,10 +21,20 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Protocol {
-    /// OpenAI 风格协议（`Authorization: Bearer`，`{base}/chat/completions`）。
+    /// OpenAI **Responses** API（`{base}/v1/responses`）——官方推荐的
+    /// 新接口，无后缀默认值代指最新协议。
     OpenAi,
-    /// Anthropic 风格协议（`x-api-key` + `anthropic-version`，`{base}/v1/messages`）。
+    /// OpenAI **Chat Completions**（`{base}/v1/chat/completions`）——
+    /// 兼容生态最广的旧接口，显式带 `-chat` 后缀声明。
+    #[serde(rename = "openai-chat")]
+    OpenAiChat,
+    /// Anthropic **Messages**（`x-api-key` + `anthropic-version`，
+    /// `{base}/v1/messages`）——主流标准接口。
     Anthropic,
+    /// Anthropic **Text Completions**（`{base}/v1/complete`）——旧版，
+    /// 已淘汰，显式带 `-complete` 后缀声明。
+    #[serde(rename = "anthropic-complete")]
+    AnthropicComplete,
     /// 用户自定义标签，仅用于展示。
     /// 结构体变体（而非 `Custom(String)`）是因为 serde 的内部标签
     /// 不支持包装裸字符串的新类型变体。
@@ -35,9 +45,12 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    /// 解析用户输入的协议标签：`openai` / `anthropic`（含缩写 `o` / `a` / `1` / `2`）
+    /// 解析用户输入的协议标签：内置标签大小写不敏感匹配（含缩写），
     /// 之外的任意文本都视为自定义协议；已带 `custom:` 前缀的会被剥掉，
     /// 避免 `custom:custom:x` 双重前缀。CLI 与 GUI 共用本实现。
+    ///
+    /// 别名约定：无后缀 = 最新协议（`openai` → Responses、`anthropic` →
+    /// Messages）；带后缀 = 旧协议（`openai-chat`、`anthropic-complete`）。
     pub fn from_label(label: &str) -> Self {
         let trimmed = label.trim();
         // 内置标签大小写不敏感匹配；自定义标签保留用户输入的原始大小写
@@ -45,7 +58,9 @@ impl Protocol {
         // custom:azure，用户命名信息丢失且无提示）
         match trimmed.to_ascii_lowercase().as_str() {
             "1" | "o" | "openai" => Protocol::OpenAi,
-            "2" | "a" | "anthropic" => Protocol::Anthropic,
+            "2" | "oc" | "openai-chat" | "chat" => Protocol::OpenAiChat,
+            "3" | "a" | "anthropic" => Protocol::Anthropic,
+            "4" | "ac" | "anthropic-complete" | "complete" => Protocol::AnthropicComplete,
             _ => Protocol::Custom {
                 name: trimmed
                     .strip_prefix("custom:")
@@ -66,8 +81,30 @@ impl Protocol {
     pub fn display_label(&self) -> String {
         match self {
             Protocol::OpenAi => "OpenAI".to_string(),
+            Protocol::OpenAiChat => "OpenAI Chat".to_string(),
             Protocol::Anthropic => "Anthropic".to_string(),
+            Protocol::AnthropicComplete => "Anthropic Complete".to_string(),
             Protocol::Custom { name } => format!("custom:{name}"),
+        }
+    }
+
+    /// 搜索匹配词（小写、空格分隔，供 `core::search` 的协议字段使用）：
+    /// 存储标签 + 完整形态词——搜 "openai"、"responses"、"chat"、
+    /// "anthropic"、"messages"、"complete"、自定义名都能命中。
+    ///
+    /// 2026-10-31 用户需求：协议加入搜索（推翻 2026-10-25 "协议不参与"
+    /// 决议——当时记录少且兼容服务商全员同协议，按协议搜噪音大；现在
+    /// 用户预期按协议类型找记录，如搜 OpenAI 找到走 openai 协议的千问）。
+    pub fn search_terms(&self) -> String {
+        match self {
+            Protocol::OpenAi => "openai responses".to_string(),
+            Protocol::OpenAiChat => "openai openai-chat chat".to_string(),
+            Protocol::Anthropic => "anthropic messages".to_string(),
+            Protocol::AnthropicComplete => "anthropic anthropic-complete complete".to_string(),
+            // 自定义名小写化（2026-10-31 审查修复）：2026-10-26 决议
+            // 保留用户原始大小写，但搜索匹配词约定全小写——查询词会
+            // lower，匹配文本不 lower 则带大写的自定义名永远搜不中
+            Protocol::Custom { name } => format!("custom {}", name.to_lowercase()),
         }
     }
 }
@@ -76,7 +113,9 @@ impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Protocol::OpenAi => write!(f, "openai"),
+            Protocol::OpenAiChat => write!(f, "openai-chat"),
             Protocol::Anthropic => write!(f, "anthropic"),
+            Protocol::AnthropicComplete => write!(f, "anthropic-complete"),
             // 展示时明确标注来源是用户自定义，避免与内置标签混淆
             Protocol::Custom { name } => write!(f, "custom:{name}"),
         }
@@ -87,7 +126,7 @@ impl std::fmt::Display for Protocol {
 ///
 /// `api_key` 是敏感字段。安全约束见 crate 顶部文档：
 /// 只能进内存、vault 密文与用户显式要求的输出。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// 记录的唯一标识（UUID v7，时间有序，跨设备生成也不会冲突）。
     /// 一旦创建永不改变，删除后重建会得到新的 id。
@@ -104,6 +143,14 @@ pub struct Record {
 
     /// API key 明文。仅存在于内存与解密后的 vault 中。
     pub api_key: String,
+
+    /// 这份凭证可用的模型名列表（2026-10-27 增补；**可空**，2026-10-28
+    /// 决议移除 unknown 占位——空列表 = 应用走自己的默认模型）。一对多：
+    /// 一份 key 通常解锁服务商的多个模型（如 GLM 的 GLM-5.2/5.1/5/Turbo）。
+    /// **只存名字，不存参数**——generationConfig/采样参数等属应用侧调优，
+    /// 不进 mak。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 
     /// 附加请求头（可选），例如 Anthropic 的 `anthropic-workspace-id`、
     /// OpenAI 的 `OpenAI-Project`。键排序存储（BTreeMap）保证序列化稳定，
@@ -143,6 +190,7 @@ impl Record {
             protocol,
             base_url,
             api_key,
+            models: Vec::new(),
             extra_headers: BTreeMap::new(),
             notes: None,
             created_at: now,
@@ -241,9 +289,49 @@ impl VaultData {
 
 #[cfg(test)]
 mod tests {
-    //! 模型层测试：掩码不泄密、查找语义、墓碑时间刷新。
+    //! 模型层测试：掩码不泄密、查找语义、墓碑时间刷新、协议扩充。
 
     use super::*;
+
+    /// 协议扩充（D26）：新变体的标签解析、Display roundtrip、serde
+    /// 兼容（旧值 openai/anthropic 语义不变）。
+    #[test]
+    fn protocol_expanded_labels_roundtrip() {
+        // from_label 别名
+        assert_eq!(Protocol::from_label("openai"), Protocol::OpenAi);
+        assert_eq!(Protocol::from_label("openai-chat"), Protocol::OpenAiChat);
+        assert_eq!(Protocol::from_label("chat"), Protocol::OpenAiChat);
+        assert_eq!(Protocol::from_label("anthropic"), Protocol::Anthropic);
+        assert_eq!(
+            Protocol::from_label("anthropic-complete"),
+            Protocol::AnthropicComplete
+        );
+        assert_eq!(
+            Protocol::from_label("complete"),
+            Protocol::AnthropicComplete
+        );
+
+        // Display 小写标签 roundtrip
+        for p in [
+            Protocol::OpenAi,
+            Protocol::OpenAiChat,
+            Protocol::Anthropic,
+            Protocol::AnthropicComplete,
+        ] {
+            let label = p.to_string();
+            assert_eq!(Protocol::from_label(&label), p, "{label} 应可 roundtrip");
+        }
+
+        // serde：存储标签兼容（旧 vault 的 openai/anthropic 不受扩充影响）
+        assert_eq!(
+            serde_json::to_value(Protocol::OpenAiChat).unwrap(),
+            serde_json::json!({ "type": "openai-chat" })
+        );
+        assert_eq!(
+            serde_json::from_value::<Protocol>(serde_json::json!({ "type": "openai" })).unwrap(),
+            Protocol::OpenAi
+        );
+    }
 
     fn sample() -> Record {
         Record::new(

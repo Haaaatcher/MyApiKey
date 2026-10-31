@@ -27,14 +27,11 @@ pub enum Error {
     #[error("vault version {0} is newer than the supported version {SUPPORTED_VAULT_VERSION}; please upgrade MyApiKey")]
     UnsupportedVersion(u16),
 
-    /// git 命令执行失败（退出码非零）。携带命令与 stderr 摘要，
-    /// 供用户手动进入仓库目录救急。
-    #[error("git operation failed: {0}")]
-    Git(String),
-
-    /// 系统中找不到可用的 git 可执行文件。
-    #[error("{}", git_missing_hint())]
-    GitUnavailable,
+    /// 远端已有更新版本（CAS 冲突：上传时携带的旧 sha 与远端当前
+    /// 不一致）。同步流程捕获后走"下载 + LWW 合并 + 重传"，到达用户
+    /// 面前时通常已被消化；不消化即提示跑 `mak sync`。
+    #[error("the remote vault has changed since the last sync")]
+    RemoteConflict,
 
     /// 底层 IO 错误的直接透传。
     #[error("I/O error: {0}")]
@@ -65,23 +62,6 @@ pub enum Error {
 
 /// 本程序支持读写的最高 vault 格式版本（见 [`crate::vault`] 的格式说明）。
 pub const SUPPORTED_VAULT_VERSION: u16 = 1;
-
-/// git 缺失时的引导文案（按当前平台给出安装命令）。
-///
-/// git 是硬依赖（vault 的本地历史与同步都基于它，见 ADR D8），
-/// 与其只报错不如直接告诉用户装法，一步到位。
-fn git_missing_hint() -> String {
-    let install = if cfg!(target_os = "windows") {
-        "winget install Git.Git   (or download from https://git-scm.com)"
-    } else if cfg!(target_os = "macos") {
-        "brew install git         (or download from https://git-scm.com)"
-    } else {
-        "sudo apt install git     (or your distro's package manager)"
-    };
-    format!(
-        "git is required (local history + sync are git-based) but was not found on PATH.\n  Install it with: {install}\n  Then re-run this command."
-    )
-}
 
 /// 全库统一的 `Result` 别名。
 pub type Result<T> = std::result::Result<T, Error>;

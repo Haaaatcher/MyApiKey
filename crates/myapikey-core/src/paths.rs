@@ -101,7 +101,9 @@ impl AppDirs {
     /// config.toml / 缓存 / 锁文件不算初始化标志——它们可能在 init 之前就被
     /// 读取配置的路径触碰出来。
     pub fn is_initialized(&self) -> bool {
-        self.repo_dir.join(".git").is_dir() && self.vault_path.is_file()
+        // D25：本地不再有 git 仓库，vault 文件本身就是"已初始化"的
+        // 全部状态（repo/.git 旧版遗留会在首次同步时清理）
+        self.vault_path.is_file()
     }
 }
 

@@ -1,37 +1,39 @@
-//! 同步引擎：fetch → 解密合并 → commit → push。
+//! 同步引擎（D25）：GitHub Contents API 直连，单文件 CAS 同步。
 //!
-//! 三个基本场景（详见 docs/design.md §5.2）：
+//! 取代 git 协议（M4）。远端状态 = 一个 blob sha；本地状态 = vault
+//! 密文 + config 的 `last_sync_sha`（与远端一致的最后时点）与
+//! `push_pending`（本地有未推送修改）。三个基本场景：
 //!
-//! 1. **仅远端有新数据**（本地干净落后）：`git merge --ff-only origin/main`
-//!    快进，工作区 vault 即为远端版本，无需产生新提交；
-//! 2. **双方都有新数据**（分歧）：必然在二进制 vault 上冲突——
-//!    这在预期之内。取出 origin/main 上的密文与本机数据，
-//!    在**数据层**按 LWW+墓碑合并（见 [`crate::merge`]），
-//!    重新加密写入并完成一个合并提交。git 只负责传输与历史，
-//!    冲突语义完全由我们自己掌握；
-//! 3. **仅本地有新数据**：直接 push。
+//! 1. **仅远端有新数据**（本地干净）：下载远端密文替换本地；
+//! 2. **双方都有新数据**（远端 sha ≠ last_sync_sha 且本地 dirty）：
+//!    取远端密文与本地数据在**数据层**按 LWW+墓碑合并
+//!    （[`crate::merge`]），上传合并结果；上传遇 409（同步期间远端
+//!    又变了）→ 重拉重合并（有限轮次）；
+//! 3. **仅本地有新数据**：直接上传。
 //!
-//! push 一律 best-effort：失败收集到 `push_error` 提示用户，
-//! 不阻塞本地保存（ADR：保存即静默同步，失败仅提示）。
+//! 上传 best-effort：保存路径上的失败收进 `push_error` 不阻塞本地保存。
+//! 每次 PUT 在远端产生一个 git commit（message 透传），GitHub 网页
+//! 历史照旧可见。
 //!
-//! git 认证完全交给用户环境（SSH key / credential manager），
-//! 本模块不接触任何 git 凭据。
+//! 本地无 git 仓库：`<config_dir>/repo/.git`（旧版遗留）在首次同步时
+//! 清理（历史在远端仓库，本地纯冗余）。
 
+use crate::config::AppConfig;
 use crate::error::{Error, Result};
 use crate::merge::merge_vaults;
 use crate::model::VaultData;
 use crate::paths::AppDirs;
-use crate::store::Store;
+use crate::remote::{GitHubStore, RemoteHead, SyncStore};
 use crate::vault;
 
-/// 一次同步/保存的结果摘要，供 CLI 展示。
+/// 一次同步/保存的结果摘要，供 CLI/GUI 展示。
 #[derive(Debug, Clone, Default)]
 pub struct SyncOutcome {
     /// 配置的 origin 远端地址（`None` = 纯单机模式）。
     pub remote: Option<String>,
-    /// 是否从远端并入了新数据（快进或合并）。
+    /// 是否从远端并入了新数据（下载或合并）。
     pub pulled: bool,
-    /// 是否发生了双方分歧的数据层合并（区别于纯快进）。
+    /// 是否发生了双方分歧的数据层合并（区别于纯下载）。
     pub merged: bool,
     /// 是否成功推送到远端。
     pub pushed: bool,
@@ -41,168 +43,355 @@ pub struct SyncOutcome {
     pub alive_records: usize,
 }
 
-/// 保存数据到本机并提交；`auto_push` 为真且配置了远端时顺手推送（best-effort）。
+/// 从 config 的 remote 地址与 token 组装 GitHub 同步通道。
 ///
-/// 这是所有修改类命令（add/edit/delete/passwd/import）的统一出口：
-/// 加密 → 写 `vault.mkv` → commit →（可选）push。
+/// 返回 `None` = 未绑定远端（纯单机）。
 ///
 /// # Errors
-/// 加密/写盘/commit 失败即返回错误（本地都不成功必须报错）；
-/// 仅 push 失败被收进 `push_error` 不算错误。
-pub fn save(
-    store: &Store,
+/// remote 地址不是 GitHub 形态。
+pub fn open_remote(url: &str, token: &str) -> Result<Box<dyn SyncStore>> {
+    Ok(Box::new(GitHubStore {
+        token: token.to_string(),
+        repo: crate::remote::parse_github_repo(url)?,
+    }))
+}
+
+/// 原子写 vault（tmp + rename）：直写中途崩溃会留半截密文即数据全失；
+/// tmp 写完再 rename，任意时刻崩溃旧文件都完好（rename 原子替换目标——
+/// Windows 上是 MoveFileExW(REPLACE_EXISTING)，无需也不能先删旧文件，
+/// 2026-10-31 审查修复：此前的 remove+rename 在两步之间留下"旧文件已
+/// 删、新文件未就位"的非原子窗口，崩溃/掉电即整库丢失）。父目录不存
+/// 在则先建（全新机器接入远端数据时 `repo/` 尚未创建——缺这一步会在
+/// os error 3 上炸掉）。
+pub fn atomic_write_vault(dirs: &AppDirs, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = dirs.vault_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = dirs.vault_path.with_extension("mkv.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, &dirs.vault_path)?;
+    Ok(())
+}
+
+/// 同步记账（数据层唯一写入口）：任何"本地与远端达成一致"的时刻——
+/// 上传成功、下载替换、接入完成——都必须经本函数写 config 的同步
+/// 状态三件套（`last_sync_sha` / `push_pending=false` / `last_sync_at`）
+/// 并落盘。禁止调用方各自手写字段：状态字段一旦散落多处手写，必有
+/// 遗漏（GUI 接入后显示 never 的根因，2026-10-31 修复）。
+pub fn mark_synced(dirs: &AppDirs, cfg: &mut AppConfig, sha: String) {
+    cfg.last_sync_sha = Some(sha);
+    cfg.push_pending = false;
+    cfg.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
+    // best-effort 落盘（2026-10-31 审查可选采纳，注释固化语义）：此刻
+    // 数据本体已保存成功，记账写盘失败（磁盘满等）只影响下次 sync 的
+    // 差异判断——最坏多推一次幂等副本，报错反而会让"同步成功"误报
+    // 为失败。由调用方决定是否感知：本函数刻意不返回 Result。
+    let _ = cfg.save(dirs);
+}
+
+/// 解绑远端（数据层唯一写入口，与 [`mark_synced`] 对称的另一半）：
+/// `remote_repo = None` 并把同步记账三件套一并归零后落盘。任何解绑
+/// 语义的出口——CLI `remote unset`、GUI 忘记授权——都必须经本函数，
+/// 禁止各自手写字段（解绑漏清 `last_sync_*` 会出现"单机模式却有上次
+/// 同步时间"的矛盾显示，2026-10-31 修复）。
+///
+/// 只动 config 与记账；vault 文件与远端仓库由调用方决定去留，本函数
+/// 不碰。
+pub fn unbind_remote(dirs: &AppDirs, cfg: &mut AppConfig) {
+    cfg.remote_repo = None;
+    cfg.last_sync_sha = None;
+    cfg.push_pending = false;
+    cfg.last_sync_at = None;
+    let _ = cfg.save(dirs);
+}
+
+/// 上传一个版本并记账（config 状态三件套）。CAS 冲突原样上抛给调用方。
+fn push_one(
+    remote: &dyn SyncStore,
+    dirs: &AppDirs,
+    cfg: &mut AppConfig,
+    bytes: &[u8],
+    expect: Option<String>,
+    alive: usize,
+) -> Result<String> {
+    // expect = 调用方声明的远端状态（CAS 基准），由调用方按场景给出
+    let message = format!(
+        "sync: {}, {} records",
+        chrono::Utc::now().to_rfc3339(),
+        alive
+    );
+    let sha = remote.put_blob(&message, bytes, expect.as_deref())?;
+    mark_synced(dirs, cfg, sha.clone());
+    Ok(sha)
+}
+
+/// 已初始化语境下的公开上传+记账组合（init 自身就是同步点，绕过
+/// [`save_local`] 的置位语义）：PUT → `mark_synced` 记账三件套。
+/// CLI/GUI 的 init 收尾统一走本入口——记账唯一写入口约定（见
+/// [`mark_synced`]）同样适用于这条路径，调用方不得手写字段
+/// （2026-10-31 审查：CLI push_initialized 曾手写三件套）。
+///
+/// # Errors
+/// CAS 冲突 / 网络失败原样上抛（记账不会发生）。
+pub fn push_and_mark(
+    remote: &dyn SyncStore,
+    dirs: &AppDirs,
+    cfg: &mut AppConfig,
+    bytes: &[u8],
+    expect: Option<String>,
+    alive: usize,
+) -> Result<String> {
+    push_one(remote, dirs, cfg, bytes, expect, alive)
+}
+
+/// 保存数据到本机并（按配置）best-effort 推送。
+///
+/// 这是所有修改类命令（add/edit/delete/passwd）的统一出口：
+/// 加密 → 原子写 `vault.mkv` → 置 `push_pending` →（可选）上传。
+///
+/// # Errors
+/// 加密/写盘失败即返回错误（本地都不成功必须报错）；
+/// 仅上传失败被收进 `push_error` 不算错误。
+/// 阶段 1（保存）：加密 → 原子写 vault → 置"有未推送修改"。
+///
+/// 独立于推送（阶段 2）——保存成功但同步失败是完全可用的状态
+/// （push_pending 标记待推，sync 补推），两者的感知与重试解耦。
+///
+/// 返回密文（供调用方阶段 2 上传复用，避免重复加密）。
+///
+/// # Errors
+/// 加密/写盘失败。
+pub fn save_local(
     dirs: &AppDirs,
     passphrase: &str,
     data: &VaultData,
-    auto_push: bool,
-) -> Result<SyncOutcome> {
-    let mut out = SyncOutcome::default();
+    cfg: &mut AppConfig,
+) -> Result<Vec<u8>> {
     let bytes = vault::encrypt(data, passphrase)?;
-    // 原子写（tmp + rename，与 config.rs 同法）：直写中途崩溃/断电会留下
-    // 半截 vault，加密文件损坏即数据全失——tmp 未 rename 完成前旧文件
-    // 完好（2026-10-26 采纳审查建议；git 历史是第二道兜底，这里是第一道）
-    let tmp = dirs.vault_path.with_extension("mkv.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    if dirs.vault_path.exists() {
-        std::fs::remove_file(&dirs.vault_path)?;
-    }
-    std::fs::rename(&tmp, &dirs.vault_path)?;
-    store.commit_vault(count_alive(data))?;
+    // 先持久化"有未推送修改"再写 vault：config 写盘失败（磁盘满等）
+    // 只会让下次 sync 多推一次相同内容（幂等无害）；反过来（vault 已写
+    // 而 pending 丢失）会静默丢同步。vault 写失败则报错返回，多置位的
+    // pending 同样幂等无害。
+    cfg.push_pending = true;
+    cfg.save(dirs)?;
+    atomic_write_vault(dirs, &bytes)?;
+    Ok(bytes)
+}
+
+pub fn save(
+    dirs: &AppDirs,
+    passphrase: &str,
+    data: &VaultData,
+    remote: Option<&dyn SyncStore>,
+    auto_push: bool,
+    cfg: &mut AppConfig,
+) -> Result<SyncOutcome> {
+    let mut out = SyncOutcome {
+        remote: Some(cfg_remote_label(cfg)),
+        ..Default::default()
+    };
+    let bytes = save_local(dirs, passphrase, data, cfg)?;
     out.alive_records = count_alive(data);
 
-    if auto_push && store.remote_url()?.is_some() {
-        match store.push() {
-            Ok(()) => out.pushed = true,
+    if let (true, Some(r)) = (auto_push, remote) {
+        match push_one(
+            r,
+            dirs,
+            cfg,
+            &bytes,
+            cfg.last_sync_sha.clone(),
+            out.alive_records,
+        ) {
+            Ok(_new_sha) => out.pushed = true,
+            Err(Error::RemoteConflict) => {
+                out.push_error = Some(
+                    "the remote vault has new changes; run `mak sync` to merge and push".into(),
+                );
+            }
             Err(e) => out.push_error = Some(e.to_string()),
         }
     }
     Ok(out)
 }
 
-/// 执行一次完整同步（`mak sync` 的核心）。
+/// config 里的远端地址（status/摘要展示用）。
+fn cfg_remote_label(cfg: &AppConfig) -> String {
+    cfg.remote_repo.clone().unwrap_or_default()
+}
+
+/// 执行一次完整同步（`mak sync` / GUI 同步按钮的核心）。
 ///
-/// 入参 `tombstone_days` 来自本机配置（[`crate::config::AppConfig`]）。
+/// 入参 `tombstone_days` 来自本机配置。
 ///
 /// # Errors
 /// - [`Error::NotInitialized`]：本机没有 vault 文件；
 /// - [`Error::Decrypt`]：本机密码错误；
-/// - [`Error::Usage`]：远端 vault 用了不同主密码（明确提示，两台设备必须同一密码）；
-/// - git / IO 错误。
+/// - [`Error::Usage`]：远端 vault 用了不同主密码（两台设备必须同一密码）；
+/// - 网络/认证错误。
 pub fn sync(
-    store: &Store,
     dirs: &AppDirs,
     passphrase: &str,
+    remote: &dyn SyncStore,
     tombstone_days: u32,
+    cfg: &mut AppConfig,
 ) -> Result<SyncOutcome> {
+    migrate_legacy_git(dirs, cfg);
+
     if !dirs.vault_path.is_file() {
         return Err(Error::NotInitialized);
     }
-
-    // 1) 读入并解密本机数据（同时验证密码）
     let local_bytes = std::fs::read(&dirs.vault_path)?;
-    let local_data = vault::decrypt(&local_bytes, passphrase)?;
+    let mut local_data = vault::decrypt(&local_bytes, passphrase)?;
 
     let mut out = SyncOutcome {
         alive_records: count_alive(&local_data),
-        remote: store.remote_url()?,
+        remote: Some(cfg_remote_label(cfg)),
         ..Default::default()
     };
 
-    // 2) 纯单机模式：没有远端，无事可做
-    if out.remote.is_none() {
-        return Ok(out);
-    }
+    // 远端当前状态（None = 空仓库）
+    let mut head: Option<RemoteHead> = remote.fetch_head()?;
+    let mut attempts = 0usize;
 
-    // 3) 拉取远端引用
-    store
-        .fetch()
-        .map_err(|e| auth_hint(e, store.auth().is_some()))?;
-
-    if store.remote_branch_exists() {
-        let behind = store.behind_count();
-        let ahead = store.ahead_count();
-
-        if behind > 0 {
-            if ahead == 0 {
-                // 场景 1：干净落后 → 快进
-                store.merge_ff_only()?;
-                let remote_bytes = std::fs::read(&dirs.vault_path)?;
-                // 远端内容若解不开，说明远端换了密码（或本机密码输错）
+    loop {
+        let local_dirty = cfg.push_pending || cfg.last_sync_sha.is_none();
+        match (local_dirty, &head) {
+            // 本地干净 + 远端未变：无事（幂等——上次 PUT 成功但记账未及
+            // 写盘时，远端内容 == 本地内容，下次按 behind 重下也无害）。
+            // 已达成一致同样经唯一记账入口：刷新 last_sync_at（"上次同步"
+            // 反映最近一次对账时刻），sha/pending 幂等不变
+            (false, Some(h)) if Some(h.sha.as_str()) == cfg.last_sync_sha.as_deref() => {
+                mark_synced(dirs, cfg, h.sha.clone());
+            }
+            // 本地干净 + 远端新：下载替换
+            (false, Some(h)) => {
                 let pulled_data =
-                    vault::decrypt(&remote_bytes, passphrase).map_err(remote_password_error)?;
+                    vault::decrypt(&h.bytes, passphrase).map_err(remote_password_error)?;
+                atomic_write_vault(dirs, &h.bytes)?;
+                mark_synced(dirs, cfg, h.sha.clone());
                 out.pulled = true;
                 out.alive_records = count_alive(&pulled_data);
-            } else {
-                // 场景 2：双方分歧 → 数据层合并
-                let _conflicted = store.start_merge()?;
-                let remote_bytes = store.remote_vault_bytes()?;
+            }
+            // 本地干净 + 远端无文件（仓库被删重建）：以本地为准创建
+            (false, None) => {
+                let bytes = std::fs::read(&dirs.vault_path)?;
+                push_one(remote, dirs, cfg, &bytes, None, out.alive_records)?;
+                out.pushed = true;
+            }
+            // 本地 dirty + 远端无文件：直接创建
+            (true, None) => {
+                let bytes = vault::encrypt(&local_data, passphrase)?;
+                push_one(remote, dirs, cfg, &bytes, None, count_alive(&local_data))?;
+                out.pushed = true;
+            }
+            // 本地 dirty + 远端未变：直接上传
+            (true, Some(h)) if Some(h.sha.as_str()) == cfg.last_sync_sha.as_deref() => {
+                let bytes = vault::encrypt(&local_data, passphrase)?;
+                push_one(
+                    remote,
+                    dirs,
+                    cfg,
+                    &bytes,
+                    Some(h.sha.clone()),
+                    count_alive(&local_data),
+                )?;
+                out.pushed = true;
+            }
+            // 双方都有新数据（或首次迁移建基线）：数据层 LWW 合并
+            (true, Some(h)) => {
                 let remote_data =
-                    vault::decrypt(&remote_bytes, passphrase).map_err(remote_password_error)?;
-
+                    vault::decrypt(&h.bytes, passphrase).map_err(remote_password_error)?;
                 let merged = merge_vaults(
                     &local_data,
                     &remote_data,
                     chrono::Utc::now(),
                     tombstone_days,
                 );
-                let enc = vault::encrypt(&merged, passphrase)?;
-                std::fs::write(&dirs.vault_path, &enc)?;
-                store.commit_vault(count_alive(&merged))?;
-
-                out.pulled = true;
-                out.merged = true;
-                out.alive_records = count_alive(&merged);
-            }
-
-            // 场景 3（或合并后）：本地有未推送提交 → 推送
-            if store.ahead_count() > 0 {
-                match store.push() {
-                    Ok(()) => out.pushed = true,
+                let bytes = vault::encrypt(&merged, passphrase)?;
+                atomic_write_vault(dirs, &bytes)?;
+                local_data = merged;
+                let merged_alive = count_alive(&local_data);
+                match push_one(remote, dirs, cfg, &bytes, Some(h.sha.clone()), merged_alive) {
+                    Ok(_new_sha) => {
+                        out.pulled = true;
+                        out.merged = true;
+                        out.alive_records = merged_alive;
+                        out.pushed = true;
+                    }
+                    // 同步期间远端又变了（另一台设备抢先上传）：重拉重合并
+                    Err(Error::RemoteConflict) => {
+                        attempts += 1;
+                        if attempts >= 3 {
+                            out.push_error = Some(
+                                "the remote kept changing during sync; try again in a moment"
+                                    .into(),
+                            );
+                            break;
+                        }
+                        head = remote.fetch_head()?;
+                        continue;
+                    }
                     Err(e) => {
-                        out.push_error = Some(auth_hint(e, store.auth().is_some()).to_string())
+                        out.push_error = Some(e.to_string());
+                        break;
                     }
                 }
             }
-        } else if store.ahead_count() > 0 {
-            // 场景 3：仅本地有新数据 → 直接推送
-            match store.push() {
-                Ok(()) => out.pushed = true,
-                Err(e) => out.push_error = Some(auth_hint(e, store.auth().is_some()).to_string()),
-            }
         }
-    } else {
-        // 远端仓库还是空的（没有 main 分支）：场景 3 的边界——本地必然
-        // 领先（vault 已提交），直接推送建分支。不补这个分支的话，
-        // "绑定空仓库后靠 sync 推送"永远推不上去且不报任何错误。
-        match store.push() {
-            Ok(()) => out.pushed = true,
-            Err(e) => out.push_error = Some(auth_hint(e, store.auth().is_some()).to_string()),
-        }
+        break;
     }
 
     Ok(out)
 }
 
-/// git 远端操作失败且本次带认证时，在错误后附加自愈指引。
+/// 旧版（git 同步时代）遗留的一次性迁移：远端绑定在 git config 里而
+/// 新架构存应用 config——删除 `.git` 前先把 remote 地址抢救出来，
+/// 否则老用户升级后同步会静默失效（表现为"没绑远端"）。
 ///
-/// GitHub 对私有仓库在凭据失效时统一报 "Repository not found"（避免泄露
-/// 仓库存在性），用户无法从字面看出是 token 过期。此处提示重新授权命令。
-/// 只有错误文本里出现这两类关键词才附加，避免误导无关错误。
-fn auth_hint(e: Error, has_auth: bool) -> Error {
-    const HINT: &str = ", your saved GitHub authorization may have expired. \
-                        Run `mak init --github` to re-authorize";
-    if !has_auth {
-        return e;
+/// 迁移读取用一次性 git 子进程调用（本模块唯一的 spawn——仅服务
+/// 存量迁移，新装机器 `.git` 不存在自然跳过；未来版本可移除）。
+fn migrate_legacy_git(dirs: &AppDirs, cfg: &mut AppConfig) {
+    let git_dir = dirs.repo_dir.join(".git");
+    if !git_dir.is_dir() {
+        return;
     }
-    let msg = e.to_string();
-    if msg.contains("Repository not found") || msg.contains("Authentication failed") {
-        Error::Usage(format!("{msg}{HINT}"))
-    } else {
-        e
+    // config 已有绑定（可能用户在新版里改过）：以新值为准，直接清理
+    if cfg.remote_repo.is_none() {
+        let url = std::process::Command::new("git")
+            .args([
+                "-C",
+                &dirs.repo_dir.to_string_lossy(),
+                "remote",
+                "get-url",
+                "origin",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|u| !u.is_empty());
+        if let Some(Ok(repo)) = url.as_deref().map(crate::remote::parse_github_repo) {
+            cfg.remote_repo = Some(repo);
+            let _ = cfg.save(dirs);
+        }
     }
+    let _ = std::fs::remove_dir_all(&git_dir);
 }
 
-/// 远端 vault 解密失败时的错误转换：给出“两台设备必须同密码”的明确指引。
+/// 判断错误文本是否属于"认证/授权失败"（HTTP 401/403 的结构化
+/// 文本，见 remote.rs）。供 CLI/GUI 的"token 静默续期重试"共用。
+/// 判定是否认证类错误（触发刷新令牌静默重试一次）：401 之外，
+/// 令牌被 SSO/权限撤销时 GitHub 也可能回 403——`auth_or_limit` 已把
+/// 限流单独转成不含 "HTTP 403" 的文案，不会误入本判定
+/// （2026-10-31 审查可选采纳）。
+pub fn is_auth_error(msg: &str) -> bool {
+    msg.contains("GitHub authorization failed")
+        || msg.contains("HTTP 401")
+        || msg.contains("HTTP 403")
+        || msg.contains("Bad credentials")
+}
+
+/// 远端 vault 解密失败时的错误转换：给出"两台设备必须同密码"的明确指引。
 fn remote_password_error(e: Error) -> Error {
     match e {
         Error::Decrypt => Error::Usage(
@@ -220,314 +409,324 @@ fn count_alive(d: &VaultData) -> usize {
     d.records.iter().filter(|r| !r.is_deleted()).count()
 }
 
-/// `mak status` 需要的仓库状态摘要。
+/// `mak status` / GUI 状态页需要的同步摘要（纯本地，不联网）。
 #[derive(Debug, Clone)]
 pub struct StatusInfo {
     /// origin 远端地址（None = 单机）。
     pub remote: Option<String>,
-    /// 本地领先远端的提交数（未推送的变更）。
-    pub ahead: usize,
-    /// 本地落后远端的提交数（可 pull 的更新）。
-    pub behind: usize,
+    /// 本地有未推送的修改（保存过但尚未成功上传）。
+    pub pending: bool,
+    /// 最近一次成功同步时间（RFC 3339）。
+    pub last_sync_at: Option<String>,
 }
 
-/// 收集仓库状态摘要（只读操作，不需要密码）。
+/// 收集同步状态摘要（只读，不需要密码，不联网——远端是否有新数据
+/// 由 `sync` 联网判断）。
 ///
 /// # Errors
-/// git 调用异常（仓库损坏级别）。
-pub fn status_summary(store: &Store) -> Result<StatusInfo> {
+/// config 读取失败。
+pub fn status_summary(_dirs: &AppDirs, cfg: &AppConfig) -> Result<StatusInfo> {
     Ok(StatusInfo {
-        remote: store.remote_url()?,
-        ahead: store.ahead_count(),
-        behind: store.behind_count(),
+        remote: cfg.remote_repo.clone(),
+        pending: cfg.push_pending,
+        last_sync_at: cfg.last_sync_at.clone(),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    //! 双设备同步的端到端集成测试：真实 git + 真实加密（不碰网络）。
-    //!
-    //! 拓扑：device_a --push/pull--> bare.git <--clone-- device_b
-    //! bare 仓库即“远端”，用本地路径模拟 GitHub，git 本地传输无需任何凭据。
-
     use super::*;
     use crate::model::{Protocol, Record};
+    use crate::remote::mem::MemStore;
+    use std::rc::Rc;
 
-    const PASS: &str = "test-passphrase-1";
-
-    /// 一台“设备”：独立目录 + Store + AppDirs。
-    struct Device {
-        store: Store,
-        dirs: AppDirs,
-    }
-
-    fn device(tag: &str) -> Device {
-        let base =
-            std::env::temp_dir().join(format!("mak-sync-{tag}-{}", uuid::Uuid::now_v7().simple()));
-        let repo_dir = base.join("repo");
-        let vault_path = repo_dir.join(crate::store::VAULT_FILE);
-        let config_path = base.join("config.toml");
-        let check_cache_path = base.join("check_cache.json");
-        let lock_path = base.join("vault.lock");
-        std::fs::create_dir_all(&repo_dir).expect("创建仓库目录失败");
+    fn dirs_at(tag: &str) -> (AppDirs, AppConfig) {
+        let root = std::env::temp_dir().join(format!("mak-sync-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root.join("repo")).unwrap();
         let dirs = AppDirs {
-            config_dir: base,
-            repo_dir: repo_dir.clone(),
-            vault_path,
-            config_path,
-            check_cache_path,
-            lock_path,
-            from_env: false,
+            config_dir: root.clone(),
+            repo_dir: root.join("repo"),
+            vault_path: root.join("repo/vault.mkv"),
+            config_path: root.join("config.toml"),
+            check_cache_path: root.join("check_cache.json"),
+            lock_path: root.join("vault.lock"),
+            from_env: true,
         };
-        let store = Store::new(&repo_dir);
-        store.ensure_init().expect("git init 失败");
-        // 测试仓库显式注入本地身份，保证与宿主机全局配置无关（hermetic）
-        store.git_t(&["config", "user.email", "t@t"]);
-        store.git_t(&["config", "user.name", "T"]);
-        Device { store, dirs }
+        (dirs, AppConfig::default())
     }
 
-    /// 测试辅助：暴露私有的 git 调用（仅测试内使用）。
-    impl Store {
-        fn git_t(&self, args: &[&str]) {
-            use std::process::Command;
-            let st = Command::new("git")
-                .arg("-C")
-                .arg(&self.repo_dir)
-                .args(args)
-                .status()
-                .expect("git 执行失败");
-            assert!(st.success(), "git {:?} 必须成功", args);
-        }
-        fn git_out(&self, args: &[&str]) -> String {
-            use std::process::Command;
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(&self.repo_dir)
-                .args(args)
-                .output()
-                .expect("git 执行失败");
-            assert!(out.status.success(), "git {:?} 必须成功", args);
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
-    }
-
-    /// 组网：a 初始化并推送，建 bare 仓库作为远端，b 克隆接入。
-    fn two_devices(tag: &str) -> (Device, Device) {
-        let a = device(tag);
-        // 初始 vault：一条记录
-        let mut data = VaultData::empty();
-        data.records.push(Record::new(
-            "base".into(),
+    fn vault_with(name: &str, updated_min_ago: i64) -> VaultData {
+        let mut d = VaultData::default();
+        let mut r = Record::new(
+            name.to_string(),
             Protocol::OpenAi,
-            "https://a".into(),
-            "sk-a".into(),
-        ));
-        save(&a.store, &a.dirs, PASS, &data, false).expect("初始保存失败");
+            "https://x.example".into(),
+            format!("key-{name}"),
+        );
+        r.updated_at = chrono::Utc::now() - chrono::Duration::minutes(updated_min_ago);
+        d.records.push(r);
+        d
+    }
 
-        // bare 远端
-        let bare =
-            std::env::temp_dir().join(format!("mak-bare-{tag}-{}", uuid::Uuid::now_v7().simple()));
-        a.store.git_t(&[
-            "clone",
-            "--bare",
-            a.dirs.repo_dir.to_str().expect("路径非法"),
-            bare.to_str().expect("路径非法"),
-        ]);
-        a.store
-            .git_t(&["remote", "add", "origin", bare.to_str().expect("路径非法")]);
-        a.store.git_t(&["push", "-u", "origin", "main"]);
+    fn digest(d: &VaultData) -> String {
+        d.records
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 
-        // b 克隆接入
-        let b_base = std::env::temp_dir().join(format!(
-            "mak-sync-b-{tag}-{}",
-            uuid::Uuid::now_v7().simple()
-        ));
-        let b_repo = b_base.join("repo");
-        let b_vault = b_repo.join(crate::store::VAULT_FILE);
-        let b_config = b_base.join("config.toml");
-        let b_cache = b_base.join("check_cache.json");
-        let b_lock = b_base.join("vault.lock");
-        std::fs::create_dir_all(&b_base).expect("创建目录失败");
+    fn load(dirs: &AppDirs, pw: &str) -> VaultData {
+        vault::decrypt(&std::fs::read(&dirs.vault_path).unwrap(), pw).unwrap()
+    }
+
+    /// 场景 1：本地干净、远端新 → 下载替换（pulled，不 merged）。
+    #[test]
+    fn behind_downloads_remote() {
+        let (dirs, mut cfg) = dirs_at("behind");
+        let mem = Rc::new(MemStore::default());
+        let remote_vault = vault_with("from-remote", 10);
+        let bytes = vault::encrypt(&remote_vault, "pw").unwrap();
+        mem.0.borrow_mut().sha = "sha-r1".into();
+        mem.0.borrow_mut().bytes = bytes.clone();
+
+        let local = vault_with("local-old", 30);
+        let lb = vault::encrypt(&local, "pw").unwrap();
+        std::fs::write(&dirs.vault_path, &lb).unwrap();
+        cfg.last_sync_sha = Some("sha-stale".into());
+
+        let out = sync(&dirs, "pw", mem.as_ref(), 30, &mut cfg).unwrap();
+        assert!(out.pulled && !out.merged && !out.pushed);
+        assert_eq!(digest(&load(&dirs, "pw")), "from-remote");
+        assert_eq!(cfg.last_sync_sha.as_deref(), Some("sha-r1"));
+        assert!(!cfg.push_pending);
+    }
+
+    /// 场景 2：双方都有新数据 → LWW 合并 + 上传。
+    #[test]
+    fn diverged_merges_lww_and_pushes() {
+        let (dirs, mut cfg) = dirs_at("diverge");
+        let mem = Rc::new(MemStore::default());
+        let remote_vault = vault_with("remote-new", 10);
+        let bytes = vault::encrypt(&remote_vault, "pw").unwrap();
+        mem.0.borrow_mut().sha = "sha-r2".into();
+        mem.0.borrow_mut().bytes = bytes;
+        let local = vault_with("local-new", 5);
+        let lb = vault::encrypt(&local, "pw").unwrap();
+        std::fs::write(&dirs.vault_path, &lb).unwrap();
+        cfg.last_sync_sha = Some("sha-r1".into());
+        cfg.push_pending = true;
+
+        let out = sync(&dirs, "pw", mem.as_ref(), 30, &mut cfg).unwrap();
+        assert!(out.merged && out.pushed);
+        let merged = load(&dirs, "pw");
+        assert!(merged.records.iter().any(|r| r.name == "remote-new"));
+        assert!(merged.records.iter().any(|r| r.name == "local-new"));
+        assert!(!cfg.push_pending);
+        assert_eq!(mem.0.borrow().history.len(), 1);
+    }
+
+    /// 场景 3：仅本地新 → 直接上传。
+    #[test]
+    fn local_only_pushes() {
+        let (dirs, mut cfg) = dirs_at("push-only");
+        let mem = Rc::new(MemStore::default());
+        let base = vault_with("base", 60);
+        let bb = vault::encrypt(&base, "pw").unwrap();
+        mem.0.borrow_mut().sha = "sha-base".into();
+        mem.0.borrow_mut().bytes = bb.clone();
+        std::fs::write(&dirs.vault_path, &bb).unwrap();
+        cfg.last_sync_sha = Some("sha-base".into());
+        cfg.push_pending = true;
+
+        let out = sync(&dirs, "pw", mem.as_ref(), 30, &mut cfg).unwrap();
+        assert!(out.pushed && !out.pulled && !out.merged);
+        assert!(!cfg.push_pending);
+    }
+
+    /// 已是最新也刷新记账时间：本地干净 + 远端未变 → 无数据动作，
+    /// 但 last_sync_at 走 mark_synced 刷新（"上次同步"= 最近一次对账
+    /// 时刻），sha 与 pending 幂等不变。CLI/GUI 尾部的手写记账已删，
+    /// 本用例锁死该场景仍会更新时间（2026-10-31 回归）。
+    #[test]
+    fn up_to_date_refreshes_last_sync_at() {
+        let (dirs, mut cfg) = dirs_at("uptodate");
+        let mem = Rc::new(MemStore::default());
+        let bytes = vault::encrypt(&vault_with("a", 5), "pw").unwrap();
+        mem.0.borrow_mut().sha = "sha-base".into();
+        mem.0.borrow_mut().bytes = bytes.clone();
+        std::fs::write(&dirs.vault_path, &bytes).unwrap();
+        cfg.last_sync_sha = Some("sha-base".into());
+        cfg.last_sync_at = Some("2026-01-01T00:00:00+00:00".into());
+        cfg.push_pending = false;
+
+        let out = sync(&dirs, "pw", mem.as_ref(), 30, &mut cfg).unwrap();
+
+        assert!(!out.pulled && !out.pushed && !out.merged, "无事发生");
+        assert_eq!(cfg.last_sync_sha.as_deref(), Some("sha-base"), "sha 不变");
+        assert!(!cfg.push_pending);
+        let at = cfg.last_sync_at.as_deref().unwrap();
+        assert_ne!(at, "2026-01-01T00:00:00+00:00", "对账时刻已刷新");
+        // 落盘验证
+        let re = AppConfig::load(&dirs).unwrap();
+        assert_eq!(re.last_sync_at.as_deref(), Some(at));
+    }
+
+    /// 同步期间远端又变了（409 竞态）→ 重拉重合并，最终收敛。
+    #[test]
+    fn conflict_retries_and_converges() {
+        let (dirs, mut cfg) = dirs_at("conflict");
+        let mem = Rc::new(MemStore::default());
+        let remote_vault = vault_with("remote-new", 10);
+        let bytes = vault::encrypt(&remote_vault, "pw").unwrap();
+        mem.0.borrow_mut().sha = "sha-r2".into();
+        mem.0.borrow_mut().bytes = bytes;
+        let local = vault_with("local-new", 5);
+        let lb = vault::encrypt(&local, "pw").unwrap();
+        std::fs::write(&dirs.vault_path, &lb).unwrap();
+        cfg.last_sync_sha = Some("sha-r1".into());
+        cfg.push_pending = true;
+        mem.0.borrow_mut().conflict_next = true;
+
+        let out = sync(&dirs, "pw", mem.as_ref(), 30, &mut cfg).unwrap();
+        assert!(out.merged && out.pushed, "push_error={:?}", out.push_error);
+        let merged = load(&dirs, "pw");
+        assert!(merged.records.iter().any(|r| r.name == "remote-new"));
+        assert!(merged.records.iter().any(|r| r.name == "local-new"));
+    }
+
+    /// 旧版迁移：repo/.git 存在且 config 无 remote → 抢救 git remote
+    /// 地址到 config.remote_repo 后清理 .git；config 已有绑定则以新值为
+    /// 准（不覆盖）。迁移后 is_initialized 仍为真（vault 在）。
+    #[test]
+    fn legacy_git_remote_migrated_then_cleaned() {
         use std::process::Command;
+
+        let (dirs, mut cfg) = dirs_at("migrate");
+        // 造一个带 origin 的旧版仓库（git 可执行在 CI/开发机均存在；
+        // 本测试是迁移路径的唯一覆盖，依赖 git 是可接受的）
         let st = Command::new("git")
-            .arg("clone")
-            .arg(bare.to_str().expect("路径非法"))
-            .arg(b_repo.to_str().expect("路径非法"))
-            .status()
-            .expect("clone 执行失败");
-        assert!(st.success(), "clone 必须成功");
-        let b_dirs = AppDirs {
-            config_dir: b_base,
-            repo_dir: b_repo.clone(),
-            vault_path: b_vault,
-            config_path: b_config,
-            check_cache_path: b_cache,
-            lock_path: b_lock,
-            from_env: false,
-        };
-        let b = Device {
-            store: Store::new(&b_repo),
-            dirs: b_dirs,
-        };
-        b.store.git_t(&["config", "user.email", "t@t"]);
-        b.store.git_t(&["config", "user.name", "T"]);
-        (a, b)
+            .args(["init", "-b", "main", &dirs.repo_dir.to_string_lossy()])
+            .output()
+            .expect("git init");
+        assert!(st.status.success());
+        let st = Command::new("git")
+            .args([
+                "-C",
+                &dirs.repo_dir.to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/someone/vault.git",
+            ])
+            .output()
+            .expect("git remote add");
+        assert!(st.status.success());
+
+        migrate_legacy_git(&dirs, &mut cfg);
+
+        assert_eq!(
+            cfg.remote_repo.as_deref(),
+            Some("someone/vault"),
+            "remote 地址应被抢救并归一化"
+        );
+        assert!(!dirs.repo_dir.join(".git").exists(), ".git 应被清理");
+
+        // config 已有绑定时不覆盖
+        let _ = Command::new("git")
+            .args(["init", &dirs.repo_dir.to_string_lossy()])
+            .output();
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                &dirs.repo_dir.to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/other/vault.git",
+            ])
+            .output();
+        cfg.remote_repo = Some("someone/vault".into());
+        migrate_legacy_git(&dirs, &mut cfg);
+        assert_eq!(
+            cfg.remote_repo.as_deref(),
+            Some("someone/vault"),
+            "已有绑定不被覆盖"
+        );
+        assert!(!dirs.repo_dir.join(".git").exists());
     }
 
-    fn load(dev: &Device) -> VaultData {
-        let bytes = std::fs::read(&dev.dirs.vault_path).expect("读 vault 失败");
-        vault::decrypt(&bytes, PASS).expect("解密失败")
-    }
-
-    fn rec_named(name: &str) -> Record {
-        Record::new(
-            name.into(),
-            Protocol::Anthropic,
-            "https://x".into(),
-            "sk-x".into(),
-        )
-    }
-
+    /// mark_synced 三件套原子记账：sha / pending=false / at 非空同落
+    /// config——手写记账漏字段（绑定即同步却显示 never）的回归锁。
     #[test]
-    fn fresh_init_device_with_remote_set_converges() {
-        // 场景：设备 b 没走 clone 接入，而是先独立 init（独立根提交），
-        // 之后才 remote set + sync —— 必须靠 --allow-unrelated-histories 收敛
-        let a = device("unrel-a");
-        let mut ad = VaultData::empty();
-        ad.records.push(rec_named("shared"));
-        save(&a.store, &a.dirs, PASS, &ad, false).expect("a 保存失败");
+    fn mark_synced_writes_all_three_fields() {
+        let (dirs, mut cfg) = dirs_at("mark");
+        cfg.push_pending = true;
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        mark_synced(&dirs, &mut cfg, "sha-x".into());
+        assert_eq!(cfg.last_sync_sha.as_deref(), Some("sha-x"));
+        assert!(!cfg.push_pending);
+        assert!(cfg.last_sync_at.is_some());
+        // 落盘验证：重新加载仍能看到
+        let re = AppConfig::load(&dirs).unwrap();
+        assert_eq!(re.last_sync_sha.as_deref(), Some("sha-x"));
+    }
 
-        let bare =
-            std::env::temp_dir().join(format!("mak-bare-unrel-{}", uuid::Uuid::now_v7().simple()));
-        a.store.git_t(&[
-            "clone",
-            "--bare",
-            a.dirs.repo_dir.to_str().expect("路径非法"),
-            bare.to_str().expect("路径非法"),
-        ]);
-        a.store
-            .git_t(&["remote", "add", "origin", bare.to_str().expect("路径非法")]);
-        a.store.git_t(&["push", "-u", "origin", "main"]);
+    /// 解绑与记账对称：`unbind_remote` 清 `remote_repo` + 记账三件套，
+    /// 落盘后重新加载仍是干净的单机状态——否则解绑后状态页出现
+    /// "单机模式却有上次同步时间"的矛盾显示（2026-10-31 回归）。
+    #[test]
+    fn unbind_remote_clears_repo_and_sync_state() {
+        let (dirs, mut cfg) = dirs_at("unbind");
+        cfg.remote_repo = Some("you/myapikey-vault".into());
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        mark_synced(&dirs, &mut cfg, "sha-x".into());
+        assert!(cfg.last_sync_at.is_some(), "前置：先有同步记账");
 
-        // b：完全独立的仓库（不同根提交），只做 set_remote
-        let b = device("unrel-b");
-        save(&b.store, &b.dirs, PASS, &VaultData::empty(), false).expect("b 保存失败");
-        b.store
-            .set_remote(bare.to_str().expect("路径非法"))
-            .expect("设置远端失败");
-        // 直接 push 必然被拒（non-fast-forward），这正是用户会遇到的路径
-        assert!(b.store.push().is_err(), "独立历史的 push 必须失败");
+        unbind_remote(&dirs, &mut cfg);
 
-        let s = sync(&b.store, &b.dirs, PASS, 30).expect("b sync 失败");
-        assert!(s.merged, "不相关历史必须走数据层合并");
-        let data_b = load(&b);
-        let names: Vec<&str> = data_b.alive_records().map(|r| r.name.as_str()).collect();
-        assert!(
-            names.contains(&"shared"),
-            "b 必须拿到 a 的记录，实际: {names:?}"
+        assert!(cfg.remote_repo.is_none());
+        assert!(cfg.last_sync_sha.is_none());
+        assert!(cfg.last_sync_at.is_none());
+        assert!(!cfg.push_pending);
+        // 落盘验证：重新加载也干净
+        let re = AppConfig::load(&dirs).unwrap();
+        assert!(re.remote_repo.is_none());
+        assert!(re.last_sync_at.is_none());
+        assert!(re.last_sync_sha.is_none());
+    }
+
+    /// 原子写在父目录（repo/）不存在时自动建目录——全新机器接入远端
+    /// 数据时 `repo/` 尚未创建（2026-10-30 os error 3 回归：init 接入
+    /// 分支裸写未建目录）。
+    #[test]
+    fn atomic_write_creates_missing_parent_dir() {
+        let (dirs, mut _cfg) = dirs_at("atomic-parent");
+        // 模拟"目录刚被整体删除"的全新机器
+        std::fs::remove_dir_all(&dirs.repo_dir).unwrap();
+
+        atomic_write_vault(&dirs, b"content").unwrap();
+
+        assert_eq!(
+            std::fs::read(&dirs.vault_path).unwrap(),
+            b"content",
+            "vault 应已落盘（含父目录自动创建）"
         );
     }
 
+    /// 空仓库 + 本地有数据 → 创建远端文件。
     #[test]
-    fn offline_edits_on_both_sides_merge_and_converge() {
-        let (a, b) = two_devices("diverge");
+    fn empty_remote_creates_file() {
+        let (dirs, mut cfg) = dirs_at("empty-remote");
+        let mem = Rc::new(MemStore::default());
+        let local = vault_with("solo", 1);
+        let lb = vault::encrypt(&local, "pw").unwrap();
+        std::fs::write(&dirs.vault_path, &lb).unwrap();
+        cfg.push_pending = true;
 
-        // b 离线加一条 Y 并推送
-        let mut bd = load(&b);
-        bd.records.push(rec_named("Y"));
-        save(&b.store, &b.dirs, PASS, &bd, true).expect("b 保存失败");
-
-        // a 离线加一条 X；push 会因远端已前进而失败（best-effort，仅记录错误）
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut ad = load(&a);
-        ad.records.push(rec_named("X"));
-        let out = save(&a.store, &a.dirs, PASS, &ad, true).expect("a 保存失败");
-        assert!(
-            out.push_error.is_some(),
-            "a 此时的 push 应失败（non-fast-forward）"
-        );
-
-        // a 执行 sync：发现分歧 → 数据层合并 → 推送
-        let s = sync(&a.store, &a.dirs, PASS, 30).expect("a sync 失败");
-        assert!(s.merged, "双方分歧必须走数据层合并");
-        assert!(s.pushed, "合并后应推送成功");
-
-        // b 再 sync：快进拉取，两边数据完全一致
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let sb = sync(&b.store, &b.dirs, PASS, 30).expect("b sync 失败");
-        assert!(sb.pulled && !sb.merged, "b 应走快进路径");
-
-        let data_a = load(&a);
-        let names_a: Vec<&str> = data_a.alive_records().map(|r| r.name.as_str()).collect();
-        let data_b = load(&b);
-        let names_b: Vec<&str> = data_b.alive_records().map(|r| r.name.as_str()).collect();
-        assert_eq!(names_a, names_b, "同步后两边记录必须一致");
-        for expect in ["base", "X", "Y"] {
-            assert!(
-                names_a.contains(&expect),
-                "记录 {expect} 必须存在: {names_a:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn deletion_tombstone_propagates_to_other_device() {
-        let (a, b) = two_devices("tombstone");
-
-        // a 删除 base 记录并同步
-        let mut ad = load(&a);
-        let idx = ad.find("base").expect("找到 base");
-        ad.records[idx].mark_deleted();
-        save(&a.store, &a.dirs, PASS, &ad, true).expect("a 删除保存失败");
-
-        // b 同步：拿到墓碑，base 消失
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        sync(&b.store, &b.dirs, PASS, 30).expect("b sync 失败");
-        let data_b = load(&b);
-        let names_b: Vec<&str> = data_b.alive_records().map(|r| r.name.as_str()).collect();
-        assert!(
-            !names_b.contains(&"base"),
-            "删除必须传播到 b，实际: {names_b:?}"
-        );
-    }
-
-    #[test]
-    fn sync_without_remote_is_noop_success() {
-        let a = device("solo");
-        let mut ad = VaultData::empty();
-        ad.records.push(rec_named("only"));
-        save(&a.store, &a.dirs, PASS, &ad, false).expect("保存失败");
-
-        let s = sync(&a.store, &a.dirs, PASS, 30).expect("单机 sync 失败");
-        assert!(!s.pulled && !s.pushed && s.remote.is_none());
-        assert_eq!(s.alive_records, 1);
-    }
-
-    #[test]
-    fn status_summary_counts() {
-        let (a, _b) = two_devices("status");
-        let info = status_summary(&a.store).expect("状态查询失败");
-        assert!(info.remote.is_some());
-        assert_eq!(info.behind, 0, "刚推送完不应落后");
-        assert_eq!(info.ahead, 0, "刚推送完不应领先");
-
-        // a 本地再保存一条（不推送）→ ahead = 1
-        let mut ad = load(&a);
-        ad.records.push(rec_named("new"));
-        save(&a.store, &a.dirs, PASS, &ad, false).expect("保存失败");
-        let info = status_summary(&a.store).expect("状态查询失败");
-        assert_eq!(info.ahead, 1);
-    }
-
-    #[test]
-    fn git_history_visible() {
-        // 验证“本地即 git 仓库”：历史可查，提交信息为机器格式
-        let (a, _b) = two_devices("history");
-        let log = a.store.git_out(&["log", "--oneline"]);
-        assert!(
-            log.contains("sync:"),
-            "提交信息必须是 sync: 机器格式，实际: {log}"
-        );
+        let out = sync(&dirs, "pw", mem.as_ref(), 30, &mut cfg).unwrap();
+        assert!(out.pushed);
+        assert!(mem.0.borrow().sha.starts_with("sha-"));
     }
 }

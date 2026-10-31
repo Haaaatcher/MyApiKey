@@ -67,6 +67,13 @@ pub enum Command {
             help = "API key. Hidden input if omitted, recommended"
         )]
         api_key: Option<String>,
+        /// 模型名（可重复；交互时也支持逗号分隔）。
+        #[arg(
+            long = "model",
+            short = 'm',
+            help = "Model name (repeatable, or comma-separated when prompted)"
+        )]
+        models: Vec<String>,
         /// 备注。
         #[arg(long, help = "Notes, optional")]
         notes: Option<String>,
@@ -204,8 +211,9 @@ pub fn run() -> myapikey_core::Result<()> {
             protocol,
             base_url,
             api_key,
+            models,
             notes,
-        } => commands::add(name, protocol, base_url, api_key, notes),
+        } => commands::add(name, protocol, base_url, api_key, models, notes),
         Command::Version => commands::version(),
         Command::Update => commands::update(),
         Command::List => commands::list(None),

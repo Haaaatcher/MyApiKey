@@ -10,6 +10,7 @@ interface MockRecord {
   protocol: string;
   base_url: string;
   api_key: string;
+  models: string[];
   notes: string | null;
   updated_at: string;
   /** 可选的校验结果（手工注入 localStorage 可预览校验 chip 的双语展示）。 */
@@ -116,6 +117,62 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
     case "init_device_authorized":
       // mock：模拟"已初始化机器的授权刷新"完成
       return ok({ stage: "done", joined: false, records: s.records.length, refresh: true } as T);
+    case "fetch_models":
+      // mock：返回三个假模型（真实行为见 core::probe::fetch_models）
+      return ok(["GLM-5.2", "GLM-5.1", "GLM-5-Air"] as T);
+    case "recipe_slots":
+      // mock：槽位型应用的槽位清单（真实行为见 core::supply::Recipe::slot_ops）
+      if (String(args?.app ?? "") === "claude-code") {
+        return ok([
+          {
+            slot: "opus",
+            path: "env.ANTHROPIC_DEFAULT_OPUS_MODEL",
+            desc: "Model used when Claude Code requests the Opus tier (main conversation).",
+          },
+          {
+            slot: "sonnet",
+            path: "env.ANTHROPIC_DEFAULT_SONNET_MODEL",
+            desc: "Model used when Claude Code requests the Sonnet tier (main conversation).",
+          },
+          {
+            slot: "haiku",
+            path: "env.ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            desc: "Model used for background tasks (summaries, titles, haiku-tier calls).",
+          },
+          {
+            slot: "fable",
+            path: "env.ANTHROPIC_DEFAULT_FABLE_MODEL",
+            desc: "Model used when Claude Code requests the Fable tier.",
+          },
+        ] as T);
+      }
+      if (String(args?.app ?? "") === "codex") {
+        return ok([
+          {
+            slot: "main",
+            path: "model",
+            desc: "Default model for Codex requests (written to the top-level `model` key).",
+          },
+        ] as T);
+      }
+      return ok([] as T);
+    case "apply_to_app": {
+      // mock：模拟 D21 写配置文件（真实行为见 core::supply）
+      const labels: Record<string, string> = {
+        "claude-code": "Claude Code",
+        codex: "Codex",
+        qwen: "Qwen Code",
+      };
+      const app = String(args?.app ?? "claude-code");
+      const label = labels[app] ?? app;
+      return ok({
+        app: label,
+        file: `C:\\Users\\you\\.${app === "claude-code" ? "claude" : app}\\settings.json`,
+        backup: "settings.json.mak-bak-1",
+        written: ["env.ANTHROPIC_AUTH_TOKEN"],
+        effect: `Restart ${label} to take effect.`,
+      } as T);
+    }
     case "github_reauthorize":
       return ok({ stage: "device_code", user_code: "AB12-CD34", verification_uri: "https://github.com/login/device" } as T);
     case "unlock": {
@@ -144,6 +201,7 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
           protocol: r.protocol,
           base_url: r.base_url,
           masked_key: mask(r.api_key),
+          models: r.models ?? [],
           notes: r.notes,
           updated_at: r.updated_at,
           check: r.check ?? null,
@@ -153,7 +211,8 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
     case "save_record": {
       if (!s.unlocked) return err("locked — unlock first");
       const input = args?.input as {
-        name: string; protocol: string; base_url: string; api_key: string; notes?: string | null;
+        name: string; protocol: string; base_url: string; api_key: string;
+        models?: string[] | null; notes?: string | null;
       };
       if (!input.name.trim()) return err("name must not be empty");
       const editing = args?.editing_id as string | null;
@@ -162,11 +221,16 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
         if (!r) return err(`record not found: ${editing}`);
         // 空 key = 保持原 key（与真实后端一致：掩码占位未动时只改其他字段）
         const keep = { ...input, api_key: input.api_key || r.api_key };
-        Object.assign(r, keep, { notes: input.notes || null, updated_at: new Date().toISOString() });
+        Object.assign(r, keep, {
+          models: input.models ?? r.models ?? [],
+          notes: input.notes || null,
+          updated_at: new Date().toISOString(),
+        });
       } else {
         s.records.push({
           id: crypto.randomUUID(),
           ...input,
+          models: input.models ?? [],
           notes: input.notes || null,
           updated_at: new Date().toISOString(),
         });

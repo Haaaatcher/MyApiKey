@@ -6,7 +6,7 @@
 use crate::cli::RemoteAction;
 use crate::prompt::{self, confirm, new_passphrase, prompt_line};
 use crate::table;
-use myapikey_core::model::{Record, VaultData};
+use myapikey_core::model::{Protocol, Record, VaultData};
 use myapikey_core::paths::AppDirs;
 use myapikey_core::probe;
 use myapikey_core::store::Store;
@@ -56,7 +56,26 @@ fn load_vault(c: &Ctx, passphrase: &str) -> Result<VaultData> {
 
 /// 保存 + 提交 +（按配置）自动推送，并打印同步摘要。
 fn save_and_report(c: &Ctx, passphrase: &str, data: &VaultData) -> Result<()> {
-    let out = sync::save(&c.store, &c.dirs, passphrase, data, c.config.auto_push)?;
+    // 自动推送走网络，同样给等待指示（未绑远端/关闭推送时瞬间通过）
+    let run = |c: &Ctx| -> Result<SyncOutcome> {
+        let _spin = prompt::wait_spinner("Saving & syncing…");
+        let out = sync::save(&c.store, &c.dirs, passphrase, data, c.config.auto_push);
+        drop(_spin);
+        out
+    };
+    // 认证失败 → 刷新令牌静默续期后重试一次（与 sync 同策略）
+    let out = match run(c) {
+        Err(e)
+            if sync::is_auth_error(&e.to_string())
+                && myapikey_core::github::try_refresh_and_store(
+                    myapikey_core::github::CLIENT_ID,
+                ) =>
+        {
+            println!("⟳ GitHub authorization refreshed; retrying…");
+            run(c)?
+        }
+        other => other?,
+    };
     report_push(&out);
     Ok(())
 }
@@ -235,9 +254,10 @@ fn github_setup(repo_name: &str) -> Result<(String, String)> {
             }
             println!("Waiting for authorization… this continues automatically.");
             let t = github::poll_device_token(&dc, &client_id)?;
-            github::keychain_set_token(&t)?;
+            // refresh token 在 poll 内部已入 keychain（有才写）；这里只存 access
+            github::keychain_set_token(&t.access_token)?;
             println!("✓ Authorized. Token saved to the credential store.\n  Clear it with `mak forget --github`.");
-            t
+            t.access_token
         }
     };
 
@@ -297,12 +317,14 @@ fn resolve_add_fields(
     Ok((name, protocol, base_url))
 }
 
-/// `add`：交互式添加记录。命令行给了的字段不再询问。
+/// `add`：交互式添加记录（缺省的参数会逐项询问）。
+/// 扫描导入功能已按 D20（2026-10-27）移除——M5 收敛为纯供给。
 pub fn add(
     name: Option<String>,
     protocol: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
+    models: Vec<String>,
     notes: Option<String>,
 ) -> Result<()> {
     let c = ctx()?;
@@ -311,20 +333,47 @@ pub fn add(
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
     let mut data = load_vault(&c, &passphrase)?;
 
-    let (name, protocol, base_url) = resolve_add_fields(name, protocol, base_url)?;
+    let (name_tmp, protocol_tmp, base_url_tmp) = resolve_add_fields(name, protocol, base_url)?;
 
     let api_key = match api_key {
         Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-        _ => {
-            let k = prompt::prompt_hidden("API key");
-            if k.is_empty() {
-                return Err(Error::Usage("API key must not be empty".into()));
+        _ => loop {
+            // 可空变体 + 显式重问：必填但拒绝静默死循环（空 Enter 只会
+            // 得到一行提示而不是原地重渲染，2026-10-27 修）
+            let k = prompt::prompt_hidden_optional("API key");
+            if !k.is_empty() {
+                break k;
             }
-            k
-        }
+            println!("API key must not be empty; try again.");
+        },
     };
 
-    let mut record = Record::new(name, protocol, base_url, api_key);
+    // 模型列表：命令行给了就直接用；否则先自动拉取（list-models 端点，
+    // 与 key 校验同一个请求；失败不阻塞回落手输——D5 容错风格）。
+    // 手输为空 → 占位 ["unknown"]（models 非空不变量，2026-10-27）
+    let models = if models.is_empty() {
+        let fetched = fetch_models_interactive(&name_tmp, &protocol_tmp, &base_url_tmp, &api_key);
+        if fetched.is_empty() {
+            Vec::new()
+        } else {
+            fetched
+        }
+    } else {
+        models
+            .into_iter()
+            // 逗号分隔与重复 --model 两种写法都接受（cli-guide 承诺），
+            // 中英逗号都拆
+            .flat_map(|m| {
+                m.split([',', '，'])
+                    .map(|s| s.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|m| !m.is_empty())
+            .collect()
+    };
+
+    let mut record = Record::new(name_tmp, protocol_tmp, base_url_tmp, api_key);
+    record.models = models;
     if let Some(n) = notes {
         record.notes = if n.is_empty() { None } else { Some(n) };
     } else {
@@ -382,28 +431,30 @@ pub fn list(query: Option<&str>) -> Result<()> {
 
     // 列宽（显示宽度）：中文按 2 列计算，保证中英混排对齐
     println!(
-        "{} {} {} {} {} {}",
+        "{} {} {} {} {} {} {}",
         table::pad_to("#", 4),
         table::pad_to("Name", 18),
         table::pad_to("Protocol", 12),
         table::pad_to("Base URL", 34),
         table::pad_to("Key", 20),
+        table::pad_to("Models", 20),
         table::pad_to("Check", 10),
     );
-    println!("{}", "-".repeat(104));
+    println!("{}", "-".repeat(125));
     for (i, r) in rows.iter().enumerate() {
         let check = cache.get(&r.id).map(|e| e.status.label()).unwrap_or("-");
         println!(
-            "{} {} {} {} {} {}",
+            "{} {} {} {} {} {} {}",
             table::pad_to(&(i + 1).to_string(), 4),
             table::pad_to(&table::truncate_width(&r.name, 18), 18),
             table::pad_to(&table::truncate_width(&r.protocol.display_label(), 12), 12),
             table::pad_to(&table::truncate_width(&r.base_url, 34), 34),
             table::pad_to(&r.masked_key(), 20),
+            table::pad_to(&table::truncate_width(&r.models.join(","), 20), 20),
             table::pad_to(check, 10),
         );
     }
-    println!("{}", "-".repeat(104));
+    println!("{}", "-".repeat(125));
     // 序号定位（#index）只对 `mak list` 的顺序有效；search 按相关度排序，
     // 行首序号是显示行号——提示用户用名称或 id 定位，避免对错记录操作
     let locator_hint = if query.is_empty() {
@@ -453,6 +504,9 @@ pub fn show(target: &str, copy: bool) -> Result<()> {
     println!("Name       : {}", r.name);
     println!("Protocol   : {}", r.protocol.display_label());
     println!("Base URL   : {}", r.base_url);
+    if !r.models.is_empty() {
+        println!("Models     : {}", r.models.join(", "));
+    }
     // 安全红线（AGENTS.md）：完整 key 永远不出现在终端输出中——
     // 终端会留在滚动缓冲/录屏/截图里；明文只进剪贴板（--copy）或显式导出文件
     println!("API Key    : {}", r.masked_key());
@@ -500,38 +554,64 @@ pub fn edit(target: &str) -> Result<()> {
     let mut data = load_vault(&c, &passphrase)?;
     let idx = resolve_target(&data, target)?;
     let record = &mut data.records[idx];
+    let original = record.clone();
 
     println!(
-        "Editing \"{}\". Press Enter to keep each current value.",
+        "Editing \"{}\" — each field is prefilled; edit in place, Enter submits.",
         record.name
     );
-    // 各字段带当前值作默认（回车即保留）；key 是敏感值不显示默认，
-    // 空输入 = 保留；备注输入 “-” 表示清空
-    record.name = prompt::prompt_default("Name", &record.name);
-    // edit 的 URL 输入：回车 = 保留原值（原值当初已过校验）；新值非法原地重问
+    // 名称：预填充编辑（必填——清空提交会原地重问；非 TTY 下 EOF 直接
+    // 报错退出，避免空值重问死循环）
     loop {
-        let raw = prompt::prompt_line(&format!("Base URL [{}]: ", record.base_url));
-        if raw.is_empty() {
+        let v = if prompt::is_interactive() {
+            prompt::prompt_default("Name", &record.name)
+        } else {
+            prompt::prompt_line_opt("Name (must not be empty): ")
+                .ok_or_else(|| Error::Usage("input ended before a name was given".into()))?
+        };
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            record.name = v;
+            break;
+        }
+        println!("Name must not be empty.");
+    }
+    // Base URL：预填充编辑；清空提交 = 保留现值（原值当初已过校验），
+    // 新值非法原地重问
+    loop {
+        let v = prompt::prompt_default("Base URL", &record.base_url);
+        let v = v.trim().to_string();
+        if v.is_empty() {
             break; // 保留原值
         }
-        if myapikey_core::store::is_valid_http_url(&raw) {
-            record.base_url = raw;
+        if myapikey_core::store::is_valid_http_url(&v) {
+            record.base_url = v;
             break;
         }
         println!("Must start with http:// or https:// followed by a host; try again.");
     }
-    let key = prompt::prompt_hidden("API key (Enter keeps current)");
+    // key：可空隐藏输入——回车 = 保留现值（prompt_hidden 的默认拒绝空
+    // 输入会让"回车保留"永远无法提交，2026-10-27 用户实测反馈）
+    let key = prompt::prompt_hidden_optional("API key (Enter keeps current)");
     if !key.is_empty() {
         record.api_key = key;
     }
+    // Models：预填充编辑（逗号分隔）；清空提交 = 空列表（应用走默认）
+    let models_cur = record.models.join(", ");
+    let mv = prompt::prompt_default("Models", &models_cur);
+    record.models = parse_model_list(&mv);
+    // Notes：预填充，直接编辑；清空提交 = None
     let notes_cur = record.notes.clone().unwrap_or_default();
-    let notes = prompt::prompt_default("Notes, - clears", &notes_cur);
-    record.notes = match notes.as_str() {
-        "-" | "" => None,
-        n => Some(n.to_string()),
-    };
-    record.protocol = prompt::select_protocol(Some(&record.protocol))?;
+    let notes = prompt::prompt_default("Notes", &notes_cur);
+    let notes = notes.trim().to_string();
+    record.notes = if notes.is_empty() { None } else { Some(notes) };
 
+    // 无任何字段变化 → 跳过加密/提交/推送/探测（空跑的 commit 会污染
+    // 同步历史，2026-10-28 优化）
+    if *record == original {
+        println!("No changes.");
+        return Ok(());
+    }
     record.updated_at = chrono::Utc::now();
     let id = record.id;
     save_and_report(&c, &passphrase, &data)?;
@@ -539,7 +619,6 @@ pub fn edit(target: &str) -> Result<()> {
     run_probe(&c, &data, &id);
     Ok(())
 }
-
 /// `delete`：墓碑删除，需确认。
 pub fn delete(target: &str) -> Result<()> {
     let c = ctx()?;
@@ -613,7 +692,10 @@ fn run_probe(c: &Ctx, data: &VaultData, id: &uuid::Uuid) {
     let Some(r) = data.records.iter().find(|r| r.id == *id) else {
         return;
     };
+    // 探测最长 10s 超时（D5），给等待指示
+    let _spin = prompt::wait_spinner("Checking key against the endpoint…");
     let (status, http) = probe::probe(r);
+    drop(_spin);
     println!(
         "Key check: {} {}",
         status.label(),
@@ -637,7 +719,28 @@ pub fn sync() -> Result<()> {
     let _guard = lock::acquire(&c.dirs)?;
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
 
-    let out = sync::sync(&c.store, &c.dirs, &passphrase, c.config.tombstone_days)?;
+    // 网络等待指示器（2026-10-27 用户反馈）：fetch/push 可能数秒乃至
+    // 更久（坏网络下低速超时 15s），转轮让等待可感知
+    // 认证失败（token 过期/被回收）→ 用刷新令牌静默续期后重试一次；
+    // 刷新失败维持原错误（auth_hint 指向重新授权）
+    let run = |c: &Ctx| -> Result<SyncOutcome> {
+        let _spin = prompt::wait_spinner("Syncing with remote (fetch + push)…");
+        let out = sync::sync(&c.store, &c.dirs, &passphrase, c.config.tombstone_days);
+        drop(_spin);
+        out
+    };
+    let out = match run(&c) {
+        Err(e)
+            if sync::is_auth_error(&e.to_string())
+                && myapikey_core::github::try_refresh_and_store(
+                    myapikey_core::github::CLIENT_ID,
+                ) =>
+        {
+            println!("⟳ GitHub authorization refreshed; retrying sync…");
+            run(&c)?
+        }
+        other => other?,
+    };
 
     match (&out.remote, out.pulled, out.pushed) {
         (None, _, _) => println!(
@@ -920,7 +1023,11 @@ pub fn version() -> Result<()> {
 /// `update`：联网查最新 Release 并提示升级命令。
 /// 网络失败/无 Release 都不报错——检查只是增强，不该让命令失败。
 pub fn update() -> Result<()> {
-    match myapikey_core::github::latest_release_tag() {
+    // GitHub API 网络请求，给等待指示（失败不阻塞，见下）
+    let _spin = prompt::wait_spinner("Checking for updates…");
+    let release = myapikey_core::github::latest_release_tag();
+    drop(_spin);
+    match release {
         Ok(Some(tag)) => {
             let latest = tag.trim_start_matches('v');
             let current = env!("CARGO_PKG_VERSION");
@@ -955,10 +1062,63 @@ fn is_newer(candidate: &str, current: &str) -> bool {
         .is_some_and(|(a, b)| a > b)
 }
 
+// ---------------------------------------------------------------------------
+// M5 生态集成：apply / restore（供给 = 写配置文件，D21）。
+// 环境变量供给（mak env）已按 D21 移除——不做用不上的能力。
+// ---------------------------------------------------------------------------
+
+/// 逗号分隔的模型名解析：逐项 trim、去空（中英逗号都接受）。
+fn parse_model_list(raw: &str) -> Vec<String> {
+    raw.split([',', '，'])
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect()
+}
+
+/// 交互式的模型列表获取：先调 list-models 端点自动拉取（与 key 校验同
+/// 一个请求），成功则展示并让回车收下 / 手输覆盖；失败（网络 / 非 200 /
+/// Custom 协议）静默回落手输提问。**拉取失败绝不阻塞添加**（D5）。
+fn fetch_models_interactive(
+    name: &str,
+    protocol: &Protocol,
+    base_url: &str,
+    api_key: &str,
+) -> Vec<String> {
+    // probe 吃 Record——拼一个临态记录（只为借它的请求构造）
+    let tmp = Record::new(
+        name.to_string(),
+        protocol.clone(),
+        base_url.to_string(),
+        api_key.to_string(),
+    );
+    // 网络拉取，同样给等待指示
+    let _spin = prompt::wait_spinner("Fetching model list from the endpoint…");
+    let fetched = probe::fetch_models(&tmp);
+    drop(_spin);
+    if let Some(fetched) = fetched {
+        // 展示：≤8 个全列；更多只列前 8 + 总数（中转端可能返回上百个）
+        let preview = if fetched.len() <= 8 {
+            fetched.join(", ")
+        } else {
+            format!(
+                "{}, … and {} more",
+                fetched[..8].join(", "),
+                fetched.len() - 8
+            )
+        };
+        println!("Fetched {} models: {preview}", fetched.len());
+        // 选择器：小清单多选勾选，大清单模糊搜索逐个添加
+        return prompt::pick_models(&fetched);
+    }
+    // 回落：常规手输（Enter 跳过）
+    let raw = prompt_line("Models (comma-separated, Enter to skip): ");
+    parse_model_list(&raw)
+}
+
 #[cfg(test)]
 mod tests {
     //! 版本比较回归（D16）：提示新版本的前提是比较不误报。
-    use super::is_newer;
+    use super::{is_newer, parse_model_list};
 
     #[test]
     fn semver_compare() {
@@ -972,5 +1132,17 @@ mod tests {
         assert!(!is_newer("0.0.9", "0.1.0"));
         // 非数字段按 0：不误报
         assert!(!is_newer("x.y", "0.0.0"));
+    }
+
+    /// 模型列表解析：中英逗号、空白容错、空项剔除。
+    #[test]
+    fn model_list_parsing() {
+        assert_eq!(
+            parse_model_list("GLM-5.2, GLM-5-Air"),
+            vec!["GLM-5.2", "GLM-5-Air"]
+        );
+        assert_eq!(parse_model_list("a，b"), vec!["a", "b"]);
+        assert!(parse_model_list(" , ,").is_empty());
+        assert!(parse_model_list("").is_empty());
     }
 }

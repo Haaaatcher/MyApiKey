@@ -33,7 +33,7 @@ cargo fmt                      # 格式化（提交前运行）
   - **禁止**：用圆括号或破折号**夹带补充说明**——"它是什么/为什么"的解释要并入短句，或缩进两空格独立成提示行（GUI 用 hover 提示）
   - **允许且推荐**：用括号**呈现选项与伴随信息**——输入提示的 Enter 语义 `(Enter keeps current)`、示例 `(e.g. OpenAI primary)`、伴随状态 `(HTTP 401)`、默认值/约束标注 `(private)`、`(optional)` 等，这类括号让主信息与伴随信息层次分明，起更好的提示作用
   - 界限：括号内是**同一信息的组成部分**（选项、状态、示例、约束）→ 可用；括号内是**岔开的解释**（原因、后果、指引）→ 改短句或独立行
-- **注释尽可能详细**（主人的明确要求，优先于"少注释"的社区习惯）：
+- **注释尽可能详细**（我的明确要求，优先于"少注释"的社区习惯）：
   - 所有公开项（pub 函数/类型/常量）必须有 `///` 文档注释，写清用途、参数、返回值，并按惯例补 `# Errors`、`# Panics`、`# Safety` 章节
   - 每个模块/文件以 `//!` 开头说明该模块的职责与边界
   - 加密、KDF 参数、同步合并、墓碑这类关键逻辑，行内注释解释"为什么这么做"与安全约束，不止是"做了什么"
@@ -47,7 +47,7 @@ cargo fmt                      # 格式化（提交前运行）
 - ALWAYS 给新的 core 行为配测试（vault 加解密、同步合并这类逻辑必须有 roundtrip/边界用例）
 - ALWAYS 保证日志、错误信息、panic 消息里不出现 api_key 与主密码（含部分明文）
 - NEVER 做协议自动推断、key 前缀识别、base_url 归一化——协议只是用户手填的标签
-- NEVER 在任何终端输出中显示明文 key（包括 `show` 命令）——完整 key 只进剪贴板（`--copy`）或双重确认的导出文件（2026-10-24 主人明确要求）
+- NEVER 在任何终端输出中显示明文 key（包括 `show` 命令）——完整 key 只进剪贴板（`--copy`）或双重确认的导出文件（2026-10-24 我明确要求）
 - NEVER 把明文凭证写入任何会被同步或提交的文件；明文导出必须走显式确认流程
 - NEVER 让 `myapikey-core` 依赖 CLI / GUI 或任何 UI 相关 crate
 - NEVER 绕过删除墓碑机制物理删除记录
@@ -69,16 +69,16 @@ cargo fmt                      # 格式化（提交前运行）
 4. **交付（涉及 GUI）**：
    - 先 `taskkill //IM myapikey-gui.exe //F`——旧进程占用 exe，不杀会导致构建 os error 5
    - 在 `crates/myapikey-gui` 下执行 `node ui/node_modules/@tauri-apps/cli/tauri.js build`（crate 根有 `tauri.conf.json`，npm scripts 在 ui/ 下）
-   - 产物以链接交付主人：`target/release/myapikey-gui.exe`（免安装）与 `target/release/bundle/nsis/*-setup.exe`（安装包）；提醒主人**托盘退出后重开**——点 × 只是隐藏到托盘，直接双击 exe 会由单实例唤起旧进程，跑的还是旧代码
+   - 产物以链接交付给我：`target/release/myapikey-gui.exe`（免安装）与 `target/release/bundle/nsis/*-setup.exe`（安装包）；提醒我**托盘退出后重开**——点 × 只是隐藏到托盘，直接双击 exe 会由单实例唤起旧进程，跑的还是旧代码
 5. **交付（涉及 CLI）**：
-   - `cargo build --release -p myapikey-cli` 后 `cargo install --path crates/myapikey-cli --force`，即时更新主人的 `mak`
+   - `cargo build --release -p myapikey-cli` 后 `cargo install --path crates/myapikey-cli --force`，即时更新我的 `mak`
    - 交互类改动用管道喂输入冒烟（顺带覆盖非 TTY 降级路径）
-6. **测试数据纪律**：一律用 `MYAPIKEY_HOME` 指向临时目录隔离，**绝不碰主人的真实 `%APPDATA%\myapikey`**；需要清主人本地状态时先整目录备份（`myapikey.bak-<日期>`）再动，删完报告清单
-7. **文档同步**：行为/架构变更记入 `docs/design.md`（ADR 表或对应章节），规则变更同步本文件；全程不做 `git commit` / `git push`（等主人批准）
+6. **测试数据纪律**：一律用 `MYAPIKEY_HOME` 指向临时目录隔离，**绝不碰我的真实 `%APPDATA%\myapikey`**；需要清我的本地状态时先整目录备份（`myapikey.bak-<日期>`）再动，删完报告清单
+7. **文档同步**：行为/架构变更记入 `docs/design.md`（ADR 表或对应章节），规则变更同步本文件；全程不做 `git commit` / `git push`（等我批准）
 
 ### 发布流程（tag / GitHub Release）
 
-发布属红线动作，除主人明确批准外不得进行；且以里程碑功能完整为前提。
+发布属红线动作，除我明确批准外不得进行；且以里程碑功能完整为前提。
 
 1. **版本号**：workspace `Cargo.toml` 与 `crates/myapikey-gui/tauri.conf.json` 的 `version` 同步 bump
 2. **签名构建（GUI）**：注入 `TAURI_SIGNING_PRIVATE_KEY`（私钥路径）与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（取值见 `%USERPROFILE%\.tauri\myapikey-updater-README.txt`）再构建，产出安装包 + `.sig` 签名
@@ -90,7 +90,7 @@ cargo fmt                      # 格式化（提交前运行）
 
 ## 需要先征得同意（⚠️）
 
-- **git 提交与推送**：任何 `git commit` / `git push` 前必须获得仓库主人的明确允许
+- **git 提交与推送**：任何 `git commit` / `git push` 前必须获得我的明确允许
 - **发布**：打版本标签 / 创建 GitHub Release 属于发布，除明确允许外，**必须等里程碑功能完整后才能进行**（首个发布 = M3 完成后，2026-10-24 决议）
 - 修改 `docs/design.md` 中已定的决策（ADR 表）
 - 引入新的第三方依赖
@@ -100,3 +100,4 @@ cargo fmt                      # 格式化（提交前运行）
 
 - 面向用户的文档用 GitHub 风格：居中徽章头、alerts、折叠块、复选框路线图
 - 不虚构未实现的功能，状态如实标注（如"M1 后可用"）
+- 文档以第一人称书写（2026-10-26 决议）：指代我本人用「我」，不用「主人」等第三人称

@@ -5,9 +5,11 @@
 //!
 //! - 子串精确命中优先于子序列模糊命中；
 //! - 参与 matching 的字段：名称（权重 30）、备注（权重 8）、URL 分词后的
-//!   各段——域名段权重 10、路径段权重 4；
-//! - **协议不参与**：协议是兼容性标签，DeepSeek 等都用 openai 协议，按它
-//!   搜会把所有兼容服务商都命中，违背"搜服务商"的直觉；
+//!   各段——域名段权重 10、路径段权重 4、协议（权重 3，见下）；
+//! - **协议参与匹配（2026-10-31 用户需求，推翻 2026-10-25 "协议不参与"
+//!   决议）**：匹配词见 [`Protocol::search_terms`]（标签 + 完整形态词），
+//!   权重 3 刻意最低——兼容服务商按协议全员命中时仍排在名称/URL 命中
+//!   之后，不淹没"搜服务商"的结果；
 //! - **URL 先剥 `https?://` 再按 `/` 分词**：协议前缀人人都有（h/t/p/s），
 //!   不剥的话短查询会用子序列命中一切；分段同时阻断跨段的伪命中
 //!   （h 在主机名、i 在路径拼成 "hi"）；
@@ -80,6 +82,10 @@ fn best_score(r: &Record, q: &str) -> Option<i64> {
     for (i, seg) in segs.iter().enumerate() {
         fields.push(((*seg).to_string(), if i == 0 { 10 } else { 4 }));
     }
+    // 协议字段（2026-10-31 加入，见模块注释决议变更）：标签 + 完整形态
+    // 词整段匹配（不分词——"openai-chat" 作为整体可搜，拆开会让 "chat"
+    // 这种通用词的子序列到处命中）
+    fields.push((r.protocol.search_terms(), 3));
 
     fields
         .iter()
@@ -124,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn substring_wins_and_protocol_is_excluded() {
+    fn substring_wins_and_protocol_participates() {
         let records = [
             rec("Alpha", "https://api.openai.com/v1", "", "openai"),
             rec(
@@ -134,20 +140,45 @@ mod tests {
                 "openai",
             ),
         ];
-        // "openai" 只命中 URL/名称，不因协议全员命中
         let hits = search(records.iter(), "openai");
         assert_eq!(hits.len(), 2, "两条 URL 都含 openai");
         // Alpha 域名命中（权重 10）应排在 DeepSeek 路径段命中（权重 4）之前
         assert_eq!(hits[0].name, "Alpha");
 
-        // 排除协议：查询词只出现在协议里时不应命中
-        let only_proto = [rec(
-            "Gemini",
-            "https://generativelanguage.googleapis.com",
+        // 协议参与（2026-10-31 用户需求，推翻 2026-10-25 排除决议）：
+        // 查询词只出现在协议里也命中——搜 OpenAI 找到走 openai 协议的千问
+        let qianwen = [rec(
+            "千问AI平台",
+            "https://maas.qianwenaiapi.com/compatible-mode/v1",
             "",
             "openai",
         )];
-        assert!(search(only_proto.iter(), "openai").is_empty());
+        let hits = search(qianwen.iter(), "OpenAI");
+        assert_eq!(hits.len(), 1, "协议 openai 应命中（大小写不敏感）");
+        // 完整形态词同样可搜
+        assert_eq!(search(qianwen.iter(), "responses").len(), 1);
+        // 权重 3 最低：名称/URL 命中排在纯协议命中之前
+        let mixed = [
+            rec("千问", "https://maas.qianwenaiapi.com", "", "openai"),
+            rec("OpenAI 官方", "https://api.example.com", "", "anthropic"),
+        ];
+        let hits = search(mixed.iter(), "openai");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].name, "OpenAI 官方", "名称命中应排协议命中之前");
+        // anthropic 协议搜 messages / chat（openai-chat）也命中
+        let forms = [
+            rec("A", "https://a.example.com", "", "anthropic"),
+            rec("B", "https://b.example.com", "", "openai-chat"),
+        ];
+        assert_eq!(search(forms.iter(), "messages").len(), 1);
+        assert_eq!(search(forms.iter(), "chat").len(), 1);
+        // 自定义协议搜自定义名；名字带大写（2026-10-26 决议保留原始
+        // 大小写）也能搜到——search_terms 统一小写（2026-10-31 审查修复）
+        let custom = [
+            rec("C", "https://c.example.com", "", "custom:azure"),
+            rec("D", "https://d.example.com", "", "custom:Azure"),
+        ];
+        assert_eq!(search(custom.iter(), "azure").len(), 2);
     }
 
     #[test]

@@ -162,6 +162,7 @@ fn main() {
             commands::init_start,
             commands::init_device_authorized,
             commands::github_reauthorize,
+            commands::fetch_models,
             commands::app_version,
             commands::check_update,
             commands::apply_update,

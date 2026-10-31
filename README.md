@@ -33,6 +33,7 @@
 - 🏷️ **协议即标签** —— OpenAI / Anthropic / 自定义，由用户手填，兼容任意三方平台与网关，不做自动推断
 - 🖥️ **双形态** —— CLI（`myapikey` / `mak`，三平台）+ 窗口应用（Tauri 2，首发 Windows）：宽屏多列卡片列表 / 编辑草稿防丢 / 全字段行内校验 / 设置 / 同步，空闲自动锁，复制到剪贴板的 key 30 秒后自动清空，托盘常驻 + 单实例
 - 🔎 **模糊搜索** —— 两端同源评分（fzf 风格）：子串精确优先、URL 按斜线分词、备注可搜，协议不参与；CLI `mak search`，GUI 逐键即时过滤
+- 🔌 **生态集成（M5）** —— `mak apply` / GUI「配置到应用」：把记录一键写进 Claude Code / Codex / Qwen Code 的配置文件（各家私有 schema 由 mak 消化；写入自动备份，`mak restore` 可还原）
 - ⬆️ **应用内更新** —— GUI 设置页检查更新，下载 + Ed25519 验签 + 静默安装一条龙；破坏性版本自动拦截引导手动升级；CLI `mak update` 检查并给出升级命令
 
 ## 🚀 使用（CLI 已可用）
@@ -106,7 +107,8 @@ cargo fmt           # 格式化
 - [x] M3 打磨与发布（导入导出、自动锁、剪贴板清除、三平台 CI 产物 + Windows NSIS 安装包、Linux 无头安装 `--no-default-features`）
 - [x] 追加：体验打磨（应用内更新 D16、两端模糊搜索、CLI dialoguer 交互菜单、三批代码审查修复，2026-10-26）
 - [ ] M4 内置 git：以嵌入式库替换系统 git 依赖，应用零外部依赖
-- [ ] M5 生态集成：一键导入主流 Agent 应用的配置 · 一键把记录写入环境变量
+- [x] M5 生态集成·供给 = 写配置文件（D21，2026-10-27）：`mak apply` / GUI 配置到应用 + 备份还原；导入与环境变量供给已移除（不做用不上的能力）
+- [ ] M5 第二批：Cherry Studio / CodeBuddy / Goose / OpenCode 源接入
 
 决策记录与完整设计见 [docs/design.md](docs/design.md)。
 

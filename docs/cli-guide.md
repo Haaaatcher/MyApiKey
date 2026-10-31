@@ -134,6 +134,36 @@ mak version              # 只看当前版本，不联网
 mak update               # 检查新版本，有则给出升级命令
 ```
 
+**把一条记录配置进智能体应用**（M5 供给，D21：写入应用自己的配置文件，各家私有 schema 由 mak 消化）：
+
+```bash
+mak apply                           # 全交互：选记录 → 选应用 → 勾选模型 → 写入
+mak apply "GLM"                     # 已知记录名：跳过记录菜单
+mak apply "GLM" --to codex          # 再跳过应用菜单（脚本场景）
+mak apply "GLM" --to qwen --model GLM-5.2   # 本次覆盖模型列表（--model 可重复）
+mak restore qwen                    # 还原该应用最近一次写入前的配置备份
+```
+
+  交互式流程（D23 字段模型，填表式，统一 `? … ›` / `✔ 字段 · 值`
+  主题）：选目标应用 → 选记录（菜单带协议与掩码 key，最近更新在前）
+  → 按配方字段声明逐项填表——key 确认采用记录值（不回显，`--model`
+  不影响），Base URL 预填记录值可原地编辑，模型槽位（Claude Code 四槽
+  opus/sonnet/haiku/fable、Codex 单槽）从记录模型清单单选（`(skip)` =
+  该槽走应用默认），无来源的配方询问项逐项填写——每项上方为 dim 说明
+  行（目标键名含义），**置空回车 = 跳过该字段**→ 写入。
+  写入前自动滚动备份（`.mak-bak-1/2/3`，保留 3 份），只动
+  mak 命名空间的键、其余字段原样保留；写后重读验证。Claude Code /
+  Codex 需重启生效，Qwen 热重载（首次使用需选一次 auth type）。目标
+  应用内 key 以该应用自己的方式存储（明文与否由应用决定）；vault 内
+  始终加密。
+
+  **模型列表**：`mak add` 时可填（逗号分隔或 `--model` 重复给出，`mak edit` 可改）。
+  Qwen 会把整列表写成 `/model` 选择器里的多个条目；Claude Code / Codex
+  按 `--model` 指定的模型写入各槽（未指定时逐槽询问）；列表为空则
+  应用用自己的默认。
+
+变量名按协议映射：openai → `OPENAI_API_KEY` + `OPENAI_BASE_URL`；anthropic → `ANTHROPIC_API_KEY`（+ `ANTHROPIC_BASE_URL`）；自定义 → `<标签>_API_KEY` 等。
+
 **修改一条记录**（逐项询问，回车保留原值，备注输 `-` 清空）：
 
 ```bash
@@ -195,6 +225,8 @@ Commands:
   add     Add a record interactively. Omitted fields are prompted
   version Show the current version
   update  Check for a newer release and print the upgrade command
+  apply  Apply a record to an agent app's config file (claude-code/codex/qwen, M5)
+  restore  Restore an app's config from the latest mak backup
   list    List all records. Keys are masked
   search  Search records (fuzzy match on name, URL, notes)
   show    Show one record. Key is always masked; use --copy to put it on the clipboard

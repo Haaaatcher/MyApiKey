@@ -143,6 +143,21 @@ fn refresh_github_auth(sh: &Shared) {
     }
 }
 
+/// 写路径认证失败时的自动续期：keychain 有刷新令牌 → 静默换新 access
+/// token（+ 轮换后的刷新令牌）→ 回写 Store 认证。返回是否续期成功
+/// （成功后调用方重试一次写操作；失败维持原错误与重授权指引）。
+fn try_refresh_and_retry_setup(sh: &Shared) -> bool {
+    let cid = myapikey_core::github::CLIENT_ID;
+    if !myapikey_core::github::try_refresh_and_store(cid) {
+        return false;
+    }
+    if let Ok(Some(token)) = myapikey_core::github::keychain_token() {
+        sh.set_auth(&token);
+        return true;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // 视图模型（发给前端的数据，key 一律掩码）
 // ---------------------------------------------------------------------------
@@ -156,6 +171,8 @@ pub struct RecordView {
     pub base_url: String,
     /// 掩码 key（如 `sk-p...0000`）。
     pub masked_key: String,
+    /// 模型列表（2026-10-27 增补，可空）。
+    pub models: Vec<String>,
     pub notes: Option<String>,
     pub updated_at: String,
     /// 最近一次校验结论（本机缓存；`None` = 从未校验）。
@@ -241,6 +258,9 @@ pub struct RecordInput {
     pub protocol: String,
     pub base_url: String,
     pub api_key: String,
+    /// 模型列表（2026-10-27 增补）：`None` = 未提交该字段（编辑时保持
+    /// 原值）；`Some(vec)` 逐项 trim、去空后整体替换。
+    pub models: Option<Vec<String>>,
     pub notes: Option<String>,
 }
 
@@ -433,6 +453,7 @@ fn to_view(r: &Record, cache: &CheckCache) -> RecordView {
         protocol: r.protocol.to_string(),
         base_url: r.base_url.clone(),
         masked_key: r.masked_key(),
+        models: r.models.clone(),
         notes: r.notes.clone(),
         updated_at: r.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
         check,
@@ -474,6 +495,12 @@ pub fn save_record(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let models = input.models.map(|ms| {
+        ms.iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect::<Vec<_>>()
+    });
 
     // 写命令串行闸门：全函数持有，防并发保存互相覆盖会话
     let _write_guard = sh.write.lock().unwrap_or_else(|p| p.into_inner());
@@ -499,9 +526,12 @@ pub fn save_record(
                 r.protocol = protocol;
                 r.base_url = base_url;
                 // 空 key = 前端 key 字段保持掩码占位未动（2026-10-25 优化：
-                // 改备注/名称等不再强制 Reveal）——保留原 key，只更新其他字段
+                // 改备注/名称等不再强制点 Reveal）——保留原 key，只更新其他字段
                 if !api_key.is_empty() {
                     r.api_key = api_key;
+                }
+                if let Some(ms) = models {
+                    r.models = ms;
                 }
                 r.notes = notes;
                 r.updated_at = chrono::Utc::now();
@@ -512,6 +542,7 @@ pub fn save_record(
                 // Record::new 不接收备注——新建时显式补上（曾在此整个丢弃
                 // notes，新建记录的备注保存后消失，2026-10-25 反馈）
                 r.notes = notes;
+                r.models = models.unwrap_or_default();
                 let id = r.id;
                 data.records.push(r);
                 id
@@ -524,7 +555,19 @@ pub fn save_record(
     let cfg = sh.config();
     {
         let _instance = myapikey_core::lock::acquire(&sh.dirs)?;
-        sync::save(&sh.store(), &sh.dirs, &passphrase, &data, cfg.auto_push)?;
+        // 认证失败 → 刷新令牌静默续期 → 重试一次（出事即回滚由内层
+        // 失败路径保证，这里只处理认证维度）
+        match sync::save(&sh.store(), &sh.dirs, &passphrase, &data, cfg.auto_push) {
+            Err(e)
+                if myapikey_core::sync::is_auth_error(&e.to_string())
+                    && try_refresh_and_retry_setup(sh) =>
+            {
+                sync::save(&sh.store(), &sh.dirs, &passphrase, &data, cfg.auto_push)?;
+            }
+            other => {
+                other?;
+            }
+        }
     }
 
     // 回写会话 + 返回视图
@@ -565,7 +608,19 @@ pub fn delete_record(sh: &Shared, id_str: &str) -> Result<()> {
     let cfg = sh.config();
     {
         let _instance = myapikey_core::lock::acquire(&sh.dirs)?;
-        sync::save(&sh.store(), &sh.dirs, &passphrase, &data, cfg.auto_push)?;
+        // 认证失败 → 刷新令牌静默续期 → 重试一次（出事即回滚由内层
+        // 失败路径保证，这里只处理认证维度）
+        match sync::save(&sh.store(), &sh.dirs, &passphrase, &data, cfg.auto_push) {
+            Err(e)
+                if myapikey_core::sync::is_auth_error(&e.to_string())
+                    && try_refresh_and_retry_setup(sh) =>
+            {
+                sync::save(&sh.store(), &sh.dirs, &passphrase, &data, cfg.auto_push)?;
+            }
+            other => {
+                other?;
+            }
+        }
     }
     let mut g = enter(&sh.inner);
     session_of(&mut g)?.data = data;
@@ -750,6 +805,26 @@ pub fn status_view(sh: &Shared) -> Result<StatusView> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// M5 生态集成：供给 = 写配置文件（D21，2026-10-27）
+// ---------------------------------------------------------------------------
+
+/// 拉取可用的模型名列表（list-models 端点，与 key 校验同一个请求；
+/// 2026-10-27 增补）。**抽屉保存前调用**：表单里的 base_url/key 直接
+/// 传参（key 跨 IPC 在本应用是既有事实——输入路径与 reveal_key 同级，
+/// 不是新增暴露面）。失败返回空 vec（前端提示手输，不阻塞保存）。
+///
+/// 不需要会话（不碰 vault）——拉的是用户正在填写的表单值。
+pub fn fetch_models_cmd(protocol: &str, base_url: &str, api_key: &str) -> Vec<String> {
+    let tmp = Record::new(
+        "fetch".into(),
+        Protocol::from_label(protocol),
+        base_url.trim().to_string(),
+        api_key.trim().to_string(),
+    );
+    myapikey_core::probe::fetch_models(&tmp).unwrap_or_default()
+}
+
 /// 读取设置视图。
 pub fn settings_view(sh: &Shared) -> Result<SettingsView> {
     let cfg = sh.config();
@@ -854,8 +929,9 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
             .clone()
             .ok_or_else(|| Error::Usage("no GitHub authorization in progress".into()))?
     };
-    let token = github::poll_device_token(&pending.dc, &pending.client_id)?;
-    github::keychain_set_token(&token)?;
+    let tokens = github::poll_device_token(&pending.dc, &pending.client_id)?;
+    // refresh token 在 poll 内部已入 keychain（有才写）；这里只存 access
+    github::keychain_set_token(&tokens.access_token)?;
     {
         let mut g = enter(&sh.inner);
         g.pending_device = None;
@@ -864,9 +940,9 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
     // 只更新认证并把 remote 重新指向同步仓库（与 CLI init --github 的
     // 刷新分支同语义，2026-10-26 补齐 GUI 侧闭环）
     if sh.dirs.is_initialized() {
-        sh.set_auth(&token);
-        let owner = github::api_login(&token)?;
-        let url = github::api_ensure_repo(&token, &owner, github::DEFAULT_REPO_NAME)?;
+        sh.set_auth(&tokens.access_token);
+        let owner = github::api_login(&tokens.access_token)?;
+        let url = github::api_ensure_repo(&tokens.access_token, &owner, github::DEFAULT_REPO_NAME)?;
         sh.store().set_remote(&url)?;
         let records = enter(&sh.inner)
             .session
@@ -879,7 +955,8 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
             refresh: true,
         });
     }
-    let (joined, records) = github_finish_with_token(sh, &pending.passphrase, &token)?;
+    let (joined, records) =
+        github_finish_with_token(sh, &pending.passphrase, &tokens.access_token)?;
     Ok(InitStage::Done {
         joined,
         records,
@@ -1061,6 +1138,7 @@ mod tests {
                 protocol: "openai".into(),
                 base_url: "https://api.example.com/v1".into(),
                 api_key: "sk-gui-test-12345678".into(),
+                models: None,
                 notes: Some("n".into()),
             },
             None,
@@ -1081,6 +1159,7 @@ mod tests {
                 protocol: "custom:gateway".into(),
                 base_url: "https://gw.example.com".into(),
                 api_key: "sk-gui-test-87654321".into(),
+                models: None,
                 notes: None,
             },
             Some(&created.id),
@@ -1098,6 +1177,7 @@ mod tests {
                 protocol: "custom:gateway".into(),
                 base_url: "https://gw.example.com".into(),
                 api_key: String::new(),
+                models: None,
                 notes: Some("just a note".into()),
             },
             Some(&created.id),
@@ -1162,6 +1242,7 @@ mod tests {
                 protocol: "openai".into(),
                 base_url: "https://ghost.example.com".into(),
                 api_key: "sk-ghost-000000000000".into(),
+                models: None,
                 notes: None,
             },
             None,
@@ -1233,6 +1314,7 @@ mod tests {
                 protocol: "anthropic".into(),
                 base_url: "https://api.anthropic.com".into(),
                 api_key: "sk-ant-t-1".into(),
+                models: None,
                 notes: None,
             },
             None,
@@ -1261,6 +1343,7 @@ mod tests {
                 protocol: "openai".into(),
                 base_url: "https://p.example.com".into(),
                 api_key: "sk-p-1111".into(),
+                models: None,
                 notes: None,
             },
             None,
@@ -1319,6 +1402,7 @@ mod tests {
                 protocol: "openai".into(),
                 base_url: "https://a.example.com".into(),
                 api_key: "sk-a-1111".into(),
+                models: None,
                 notes: None,
             },
             None,
@@ -1370,6 +1454,7 @@ mod tests {
                 protocol: "openai".into(),
                 base_url: "https://a2.example.com".into(),
                 api_key: "sk-a-2222".into(),
+                models: None,
                 notes: None,
             },
             None,

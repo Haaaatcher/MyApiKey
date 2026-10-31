@@ -233,6 +233,20 @@ pub async fn search_records(
         .map_err(|e| e.to_string())
 }
 
+/// 按表单值拉取模型名列表（list-models，2026-10-27 增补）；失败返回空。
+#[tauri::command]
+pub async fn fetch_models(
+    protocol: String,
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::fetch_models_cmd(&protocol, &base_url, &api_key)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// 重新授权 GitHub（token 失效自愈入口，设置页）。
 #[tauri::command]
 pub async fn github_reauthorize(

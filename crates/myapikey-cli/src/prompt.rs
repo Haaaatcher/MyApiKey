@@ -13,7 +13,8 @@
 //! 凭据库里的密码若解不开当前 vault（密码已在别的设备改过），
 //! 自动删除失效条目并回退到手动输入——这正是“记住，除非不对”的实现。
 
-use dialoguer::{Confirm, Input, Password, Select};
+use dialoguer::theme::ColorfulTheme;
+use dialoguer::{Confirm, FuzzySelect, Input, MultiSelect, Password, Select};
 use myapikey_core::{keychain, vault, Error, Result};
 use std::io::{BufRead, Write};
 
@@ -32,7 +33,9 @@ fn interact_or<T>(ui: impl FnOnce() -> dialoguer::Result<T>, fallback: impl FnOn
 }
 
 /// stdin 与 stderr 都是终端才走 dialoguer 组件；管道/CI 走行输入降级。
-fn is_interactive() -> bool {
+/// stdin/stderr 是否都是终端（管道/CI = false）。公开给 commands
+/// 做"交互分支 vs 脚本分支"的显式分派（如 edit 的 Name 重问防挂）。
+pub fn is_interactive() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
@@ -114,7 +117,7 @@ pub fn new_passphrase() -> Result<String> {
     println!("Set the master passphrase.");
     println!("  If you forget it, ALL data is unrecoverable.\n  Keep it in a password manager.");
     let p = if is_interactive() {
-        match Password::new()
+        match Password::with_theme(theme())
             .with_prompt("New master passphrase")
             .with_confirmation("Confirm passphrase", "Passphrases do not match, try again")
             .allow_empty_password(false)
@@ -158,15 +161,110 @@ fn new_passphrase_fallback() -> Result<String> {
 /// 非 TTY 下降级为回显行输入——脚本场景输入本来就来自管道，可接受。
 pub fn prompt_hidden(label: &str) -> String {
     interact_or(
-        || Password::new().with_prompt(label).interact(),
+        || Password::with_theme(theme()).with_prompt(label).interact(),
         || prompt_line(&format!("{label}: ")),
     )
+}
+
+/// 隐藏输入的**可空变体**：回车返回空串而非原地重问——供"Enter keeps
+/// current"语义使用（如 `mak edit` 的 key 保留现值）。dialoguer 的
+/// `Password` 默认拒绝空输入并静默重问，直接复用 [`prompt_hidden`] 会让
+/// "回车保留"永远无法提交（2026-10-27 用户实测反馈）。
+/// 非 TTY 下降级为回显行输入（回车 = 空串，语义一致）。
+pub fn prompt_hidden_optional(label: &str) -> String {
+    interact_or(
+        || {
+            Password::with_theme(theme())
+                .with_prompt(label)
+                .allow_empty_password(true)
+                .interact()
+        },
+        || prompt_line(&format!("{label}: ")),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 网络等待指示器（2026-10-27 用户反馈：网络操作卡住无感知）
+// ---------------------------------------------------------------------------
+
+/// 网络等待的转轮守卫：构建时在 stderr 起一个后台线程旋转
+/// `| / - \` + 描述文字，`Drop` 时停线程并清行。纯 std 实现（自绘
+/// ASCII 帧加回车转义，不用 ANSI/转义序列）——Windows 老控制台无需
+/// VT 支持也不花屏；不引入新依赖。
+///
+/// 仅 TTY 下生效：stderr 非终端（管道/CI）时返回 `None`、什么都不
+/// 打印——输出保持干净可解析。
+///
+/// 用法：`let _spin = wait_spinner("Syncing…");` 绑定到变量存活至
+/// 操作结束。
+pub struct WaitSpinner {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WaitSpinner {
+    /// 启动转轮。非 TTY 返回 `None`（不产生任何输出）。
+    pub fn start(message: &str) -> Option<Self> {
+        use std::io::IsTerminal;
+        if !std::io::stderr().is_terminal() {
+            return None;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = std::sync::Arc::clone(&stop);
+        let msg = message.to_string();
+        let handle = std::thread::spawn(move || {
+            const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+            let mut i = 0usize;
+            let mut stderr = std::io::stderr();
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = write!(stderr, "\r{} {}", FRAMES[i % FRAMES.len()], msg);
+                let _ = stderr.flush();
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            // 清行：按字节数放大的空白覆盖（中文宽字符宁可多擦不可残留）
+            let _ = write!(stderr, "\r{}\r", " ".repeat(msg.len() * 2 + 8));
+            let _ = stderr.flush();
+        });
+        Some(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for WaitSpinner {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// [`WaitSpinner::start`] 的便捷入口。
+pub fn wait_spinner(message: &str) -> Option<WaitSpinner> {
+    WaitSpinner::start(message)
 }
 
 /// 普通一行输入（回显），去掉首尾空白。返回 `None` = stdin 已关闭（EOF）。
 /// **重问类循环必须把 None 当"输入结束"错误退出**，当作空值重试会在
 /// 输入耗尽（管道、CI 忘传字段）时无限循环（2026-10-26 审查修复）。
+///
+/// 交互态走 dialoguer（`Input` + 允许空提交）：dialoguer 组件自己管理
+/// 终端模式，组件结束后紧接裸 `read_line` 在 Windows 终端上会收不到
+/// 提交（apply 询问项"无法输入"的根因，2026-10-29 修复）——所有交互
+/// 输入必须同走一条终端管理路径。Esc/组件异常降级为行读取。
 pub fn prompt_line_opt(label: &str) -> Option<String> {
+    if is_interactive() {
+        if let Ok(v) = Input::with_theme(theme())
+            .with_prompt(label)
+            .allow_empty(true)
+            .interact_text()
+        {
+            return Some(v);
+        }
+    }
     print!("{label}");
     let _ = std::io::stdout().flush();
     let mut buf = String::new();
@@ -186,21 +284,29 @@ pub fn prompt_line(label: &str) -> String {
 
 /// 带默认值的输入（edit 场景的"回车保留"）：交互态显示 `Label [当前值]:`，
 /// 回车直接取默认值；非 TTY 降级为同样的行输入格式。
+/// 编辑态预填充输入（WYSIWYG，2026-10-28 取代"[current] 回车保留 / -
+/// 清空"约定）：输入框直接预填当前值，用户原地编辑——所见即所提交，
+/// 删光回车 = 提交空值（可选字段由此清空；必填字段由调用方重问）。
+/// 非 TTY：空输入 = 保留现值（脚本场景的安全默认）。
 pub fn prompt_default(label: &str, current: &str) -> String {
     interact_or(
         || {
-            Input::<String>::new()
+            Input::with_theme(theme())
                 .with_prompt(label)
-                .default(current.to_string())
-                .show_default(true)
+                .with_initial_text(current)
+                // 允许空提交：空回车 = 清空（可选字段语义），而不是被
+                // 组件静默重问（"回车没反应"的根因，2026-10-28 修复）
+                .allow_empty(true)
                 .interact_text()
         },
         || {
-            let raw = prompt_line(&format!("{label} [{current}]: "));
-            if raw.is_empty() {
-                current.to_string()
-            } else {
-                raw
+            print!("{label} [{current}]: ");
+            let _ = std::io::stdout().flush();
+            let mut buf = String::new();
+            match std::io::stdin().lock().read_line(&mut buf) {
+                Ok(0) => current.to_string(), // EOF = 保留
+                Ok(_) => buf.trim().to_string(),
+                Err(_) => current.to_string(),
             }
         },
     )
@@ -246,11 +352,31 @@ pub fn prompt_http_url(label: &str) -> Result<String> {
     }
 }
 
+/// 全局交互主题：所有 dialoguer 组件共用一份 ColorfulTheme——统一的
+/// `? … ›` 进行时样式与 `✔ 字段 · 值` 完成痕迹，让逐项询问呈现连续的
+/// 填表视觉（字段名 · 填入值 一行一条）。每次新建主题等价但为一致性与
+/// 未来定制留单一入口。
+fn theme() -> &'static ColorfulTheme {
+    use std::sync::OnceLock;
+    static THEME: OnceLock<ColorfulTheme> = OnceLock::new();
+    THEME.get_or_init(ColorfulTheme::default)
+}
+
+/// 辅助说明行样式：交互态 dim（弱于字段名与值的视觉层级），非交互态
+/// 原样（管道日志可读）。用于 apply 表单里每个字段上方的含义说明。
+pub fn dim(text: &str) -> String {
+    if is_interactive() {
+        format!("\x1b[2m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
 /// 是/否确认，回车取默认值；Esc/中断视为否定（保守侧）。
 pub fn confirm(label: &str, default_yes: bool) -> bool {
     interact_or(
         || {
-            Confirm::new()
+            Confirm::with_theme(theme())
                 .with_prompt(label)
                 .default(default_yes)
                 .interact_opt()
@@ -296,7 +422,7 @@ pub fn select_protocol(
     };
     // interact_opt：Esc/中断 → None（视为保持默认）；非 TTY → Err 走行输入菜单
     let idx = if is_interactive() {
-        match Select::new()
+        match Select::with_theme(theme())
             .with_prompt("Select protocol")
             .items(items)
             .default(default_idx)
@@ -344,5 +470,297 @@ fn fallback_select(default_idx: usize) -> Result<usize> {
             "3" => return Ok(2),
             _ => println!("Enter 1, 2 or 3."),
         }
+    }
+}
+
+/// 交互式单选（通用）：菜单项由调用方给定，返回选中下标。
+/// 非 TTY 降级为编号行输入菜单（与其他原语一致，脚本可驱动）。
+///
+/// # Errors
+/// [`Error::Usage`]：降级行输入遇 EOF。
+pub fn select_from(labels: &[String], prompt: &str) -> Result<usize> {
+    select_from_with_default(labels, prompt, 0)
+}
+
+/// [`select_from`] 带默认项的变体：`default_idx` 高亮为回车默认。
+pub fn select_from_with_default(
+    labels: &[String],
+    prompt: &str,
+    default_idx: usize,
+) -> Result<usize> {
+    if is_interactive() {
+        match Select::with_theme(theme())
+            .with_prompt(prompt)
+            .items(labels)
+            .default(default_idx)
+            .interact_opt()
+        {
+            Ok(Some(i)) => return Ok(i),
+            // Esc/中断 = 取默认项
+            Ok(None) => return Ok(default_idx),
+            Err(_) => {} // 组件异常 → 行输入兜底
+        }
+    }
+    println!("{prompt}:");
+    for (i, it) in labels.iter().enumerate() {
+        let mark = if i == default_idx { "*" } else { " " };
+        println!("  {mark} {:<2} {it}", i + 1);
+    }
+    loop {
+        let raw = prompt_line_opt(&format!("Choice (Enter for {}): ", default_idx + 1))
+            .ok_or(Error::Usage("input ended before a choice was made".into()))?;
+        match raw.as_str() {
+            "" => return Ok(default_idx),
+            other => {
+                if let Ok(n) = other.parse::<usize>() {
+                    if (1..=labels.len()).contains(&n) {
+                        return Ok(n - 1);
+                    }
+                }
+                println!("Enter a number between 1 and {}.", labels.len());
+            }
+        }
+    }
+}
+
+/// 交互式选择一条记录（`mak apply` 无 target 时用）：菜单项 =
+/// `name  (protocol · 掩码 key)`，按最近更新倒序（与 `mak list` 一致，
+/// 最常用的记录排最前）。返回选中记录的 **id**——调用方用 id 在自己的
+/// 记录集合中定位，绝不返回下标：传入切片与调用方集合的索引基準不同
+/// （调用方可能含墓碑），下标跨集合使用会写错记录（2026-10-27 实锤
+/// 事故，修复方式 = 跨集合只传 id 不传下标）。
+///
+/// # Errors
+/// [`Error::Usage`]：没有记录 / 降级行输入遇 EOF。
+pub fn select_record(records: &[myapikey_core::model::Record]) -> Result<uuid::Uuid> {
+    use myapikey_core::model::Record;
+    if records.is_empty() {
+        return Err(Error::Usage(
+            "no records yet; add one first with `mak add`".into(),
+        ));
+    }
+    let mut order: Vec<usize> = (0..records.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(records[i].updated_at));
+    let items: Vec<String> = order
+        .iter()
+        .map(|&i| {
+            let r: &Record = &records[i];
+            format!(
+                "{}  ({} · {})",
+                r.name,
+                r.protocol.display_label(),
+                r.masked_key()
+            )
+        })
+        .collect();
+    let pick = |idx: usize| records[order[idx]].id;
+    if is_interactive() {
+        match Select::with_theme(theme())
+            .with_prompt("Apply which record")
+            .items(&items)
+            .default(0)
+            .interact_opt()
+        {
+            Ok(Some(i)) => return Ok(pick(i)),
+            Ok(None) => return Ok(pick(0)),
+            Err(_) => {}
+        }
+    }
+    println!("Apply which record:");
+    for (i, it) in items.iter().enumerate() {
+        println!("  {:<2} {it}", i + 1);
+    }
+    loop {
+        let raw = prompt_line_opt("Choice (Enter for 1): ")
+            .ok_or(Error::Usage("input ended before a choice was made".into()))?;
+        match raw.as_str() {
+            "" => return Ok(pick(0)),
+            other => {
+                if let Ok(n) = other.parse::<usize>() {
+                    if (1..=items.len()).contains(&n) {
+                        return Ok(pick(n - 1));
+                    }
+                }
+                println!("Enter a number between 1 and {}.", items.len());
+            }
+        }
+    }
+}
+
+/// 交互式多选（通用）：返回选中的项（按给定顺序）。
+/// `precheck_all` = 是否默认全勾；非 TTY：全勾时回车收下全部，否则
+/// 空输入返回空（安全默认）。占位 unknown 由调用方过滤后再传入。
+pub fn multiselect_from(items: &[String], prompt: &str, precheck_all: bool) -> Vec<String> {
+    if items.is_empty() {
+        return vec![];
+    }
+    let defaults: Vec<bool> = vec![precheck_all; items.len()];
+    if is_interactive() {
+        // ColorfulTheme：勾选渲染为 ✔（绿）/ ⬚，替代歧义的 [x]/[ ]
+        if let Ok(sel) = MultiSelect::with_theme(theme())
+            .with_prompt(format!("{prompt} (space toggles, Enter confirms)"))
+            .items(items)
+            .defaults(&defaults)
+            .interact()
+        {
+            return sel.into_iter().map(|i| items[i].clone()).collect();
+        }
+        return vec![]; // 组件异常：按取消处理（安全侧）
+    }
+    let hint = if precheck_all {
+        "enter numbers to keep (e.g. 1,3; Enter keeps all)"
+    } else {
+        "enter numbers to include (e.g. 1,3; empty = none)"
+    };
+    println!("{prompt} — {hint}:");
+    for (i, it) in items.iter().enumerate() {
+        println!("  {:<2} {it}", i + 1);
+    }
+    let raw = prompt_line("");
+    if raw.trim().is_empty() {
+        return if precheck_all { items.to_vec() } else { vec![] };
+    }
+    let picked: std::collections::BTreeSet<usize> = raw
+        .split([',', '，'])
+        .filter_map(|t| t.trim().parse::<usize>().ok())
+        .filter(|&n| (1..=items.len()).contains(&n))
+        .map(|n| n - 1)
+        .collect();
+    picked.into_iter().map(|i| items[i].clone()).collect()
+}
+
+/// 模型清单"小清单"阈值：不超过该数量直接多选勾选；超过则用模糊搜索
+/// 逐个添加（182 个模型的聚合网关清单，翻页多选不可用）。
+pub const MODEL_LIST_SMALL_MAX: usize = 12;
+
+/// 清单是否走模糊搜索添加。
+fn models_need_fuzzy(count: usize) -> bool {
+    count > MODEL_LIST_SMALL_MAX
+}
+
+/// 模糊搜索单选（大清单用）：输入即过滤，回车选中；Esc/无匹配视为
+/// 结束选择。返回 `None` = 用户结束。
+fn fuzzy_pick(remaining: &[String], prompt: &str) -> Option<usize> {
+    if !is_interactive() || remaining.is_empty() {
+        return None;
+    }
+    FuzzySelect::with_theme(theme())
+        .with_prompt(format!("{prompt} (type to filter, Esc to finish)"))
+        .items(remaining)
+        .interact_opt()
+        .ok()
+        .flatten()
+}
+
+/// 拉取到的模型清单 → 用户选定的模型列表（通用入口，add/edit/apply
+/// 共用）。分档：
+/// - 清单 ≤ [`MODEL_LIST_SMALL_MAX`]：多选勾选（默认全选）；
+/// - 清单更大：模糊搜索逐个添加（输入过滤 → 回车加入 → 继续/Esc 结束），
+///   避免在大清单里翻页找型号；
+/// - 两种方式都允许退出后手输逗号分隔清单覆盖（端点清单之外的私有
+///   型号也能加）。
+///
+/// 非 TTY（管道/CI）：直接返回**前 [`MODEL_LIST_SMALL_MAX`] 项**——
+/// 自动化场景没有交互，宁多勿缺，用户可后续 edit 裁剪。
+pub fn pick_models(fetched: &[String]) -> Vec<String> {
+    if fetched.is_empty() {
+        return vec![];
+    }
+    if is_interactive() {
+        if !models_need_fuzzy(fetched.len()) {
+            let picked = multiselect_from(fetched, "Models to apply", false);
+            if !picked.is_empty() {
+                return picked;
+            }
+            // 全不选 = 可能要填清单之外的型号 → 手动输入兜底
+            return manual_models_fallback();
+        } else {
+            let mut remaining: Vec<String> = fetched.to_vec();
+            let mut chosen: Vec<String> = Vec::new();
+            while let Some(i) = fuzzy_pick(
+                &remaining,
+                &format!("Pick models ({}/{} added)", chosen.len(), fetched.len()),
+            ) {
+                chosen.push(remaining.remove(i));
+                if remaining.is_empty() {
+                    break;
+                }
+            }
+            if !chosen.is_empty() {
+                let raw = prompt_line(&format!(
+                    "Selected: {}
+Enter to keep, or type more (comma-separated): ",
+                    chosen.join(", ")
+                ));
+                for m in parse_comma_list(&raw) {
+                    if !chosen.contains(&m) {
+                        chosen.push(m);
+                    }
+                }
+                return chosen;
+            }
+            // 立即结束（什么都没加）→ 手动输入兜底
+            return manual_models_fallback();
+        }
+    }
+    // 非 TTY / 交互被取消：取前 N 项（自动化场景宁多勿缺，可后续裁剪）
+    let n = fetched.len().min(MODEL_LIST_SMALL_MAX);
+    fetched[..n].to_vec()
+}
+
+/// 手动输入兜底（交互选择后一无所获时）：逗号分隔填写；空输入返回空
+/// 列表（models 可空，应用侧走默认模型）。
+fn manual_models_fallback() -> Vec<String> {
+    let raw = prompt_line("Models (comma-separated, Enter = not set): ");
+    parse_comma_list(&raw)
+}
+
+/// 逗号分隔解析（模型清单覆盖输入用）。
+fn parse_comma_list(raw: &str) -> Vec<String> {
+    raw.split([',', '，'])
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect()
+}
+
+/// 模糊搜索单选（apply 槽位映射在大清单上使用）：Esc = 取默认项。
+pub fn fuzzy_select_one(labels: &[String], prompt: &str, default_idx: usize) -> Result<usize> {
+    if is_interactive() && labels.len() > MODEL_LIST_SMALL_MAX {
+        match FuzzySelect::with_theme(theme())
+            .with_prompt(prompt)
+            .items(labels)
+            .default(default_idx)
+            .interact_opt()
+        {
+            Ok(Some(i)) => return Ok(i),
+            Ok(None) => return Ok(default_idx),
+            Err(_) => {} // 组件异常 → 行输入兜底
+        }
+    }
+    select_from_with_default(labels, prompt, default_idx)
+}
+
+#[cfg(test)]
+mod model_picker_tests {
+    use super::*;
+
+    /// 阈值分派：≤12 多选、>12 模糊。
+    #[test]
+    fn threshold_dispatch() {
+        assert!(!models_need_fuzzy(0));
+        assert!(!models_need_fuzzy(MODEL_LIST_SMALL_MAX));
+        assert!(models_need_fuzzy(MODEL_LIST_SMALL_MAX + 1));
+    }
+
+    /// 非 TTY：pick_models 返回前 N 项（宁多勿缺，可后续裁剪）。
+    #[test]
+    fn non_tty_returns_capped_head() {
+        let fetched: Vec<String> = (0..30).map(|i| format!("m-{i}")).collect();
+        let picked = pick_models(&fetched);
+        assert_eq!(picked.len(), MODEL_LIST_SMALL_MAX);
+        assert_eq!(picked[0], "m-0");
+        // 小清单原样返回
+        let small: Vec<String> = vec!["a".into(), "b".into()];
+        assert_eq!(pick_models(&small), small);
     }
 }

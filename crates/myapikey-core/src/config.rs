@@ -37,6 +37,26 @@ pub struct AppConfig {
 
     /// 最近一次成功同步的时间（RFC 3339，本机展示用，非精确账本）。
     pub last_sync_at: Option<String>,
+
+    /// 与远端内容一致的最后 blob sha（D25 同步的 CAS 凭据）。
+    ///
+    /// 成功拉取或上传后更新；`None` = 从未以 D25 语义同步过（首次
+    /// 迁移窗口：下一次 sync 会做一次保险 LWW 合并建立基线）。
+    pub last_sync_sha: Option<String>,
+
+    /// 本地有未推送的修改（status 的 ahead 语义）。
+    ///
+    /// 保存置位；上传成功清除。不用内容哈希而用显式标志：避免为
+    /// 对比引入哈希依赖，且跨重启语义明确。
+    pub push_pending: bool,
+
+    /// 绑定的 GitHub 远端仓库（`owner/name` 或完整 https URL，解析见
+    /// [`crate::remote::parse_github_repo`]）。
+    ///
+    /// D25 起取代 git remote——远端绑定从 git config 移到应用配置
+    /// （本地不再有 git 仓库）。旧版用户的该字段为空而 git remote
+    /// 存在时，由一次性迁移读取（见 sync.rs 迁移注释）。
+    pub remote_repo: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -47,6 +67,9 @@ impl Default for AppConfig {
             remember_days: 7,
             auto_lock_minutes: 10,
             last_sync_at: None,
+            last_sync_sha: None,
+            push_pending: false,
+            remote_repo: None,
         }
     }
 }
@@ -75,10 +98,9 @@ impl AppConfig {
             .map_err(|e| Error::Serde(format!("failed to serialize config.toml: {e}")))?;
         let tmp = dirs.config_path.with_extension("toml.tmp");
         std::fs::write(&tmp, raw)?;
-        // Windows 上 rename 目标存在时需要先移除；配置文件场景直接覆盖语义
-        if dirs.config_path.exists() {
-            std::fs::remove_file(&dirs.config_path)?;
-        }
+        // 直接 rename 原子覆盖（Windows MoveFileExW REPLACE_EXISTING）——
+        // 先删后改名会留下"旧已删新未到"的窗口（2026-10-31 审查修复，
+        // 与 atomic_write_vault 同模式）
         std::fs::rename(&tmp, &dirs.config_path)?;
         Ok(())
     }

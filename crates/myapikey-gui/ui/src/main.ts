@@ -26,12 +26,14 @@ interface UpdateView {
   breaking: boolean;
 }
 
+
 interface RecordView {
   id: string;
   name: string;
   protocol: string;
   base_url: string;
   masked_key: string;
+  models: string[];
   notes: string | null;
   updated_at: string;
   check: CheckView | null;
@@ -77,6 +79,7 @@ interface RecordInput {
   protocol: string;
   base_url: string;
   api_key: string;
+  models: string[] | null;
   notes: string | null;
 }
 
@@ -118,6 +121,7 @@ const ICONS: Record<string, string> = {
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
   inbox: '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
   search: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
   globe: '<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
   back: '<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>',
 };
@@ -354,6 +358,16 @@ const STRINGS: Record<string, [string, string]> = {
   baseUrl: ["Base URL", "Base URL"],
   apiKey: ["API key", "API key"],
   notesOpt: ["Notes", "备注"],
+  modelsOpt: ["Models", "模型"],
+  modelsHint: ["e.g. GLM-5.2, then press Enter or +", "如 GLM-5.2，回车或 + 添加"],
+  addModel: ["+", "+"],
+  removeModel: ["Remove model", "删除模型"],
+  modelsEmpty: ["No models yet — add one, or Fetch from the endpoint.", "暂无模型——手动添加，或点「获取」自动拉取。"],
+  fetchModels: ["Fetch", "获取"],
+  fetchingModels: ["Fetching…", "正在获取…"],
+  fetchModelsDone: ["Fetched {0} models.", "已获取 {0} 个模型。"],
+  fetchModelsEmpty: ["No models returned; type them manually.", "未获取到模型，请手动填写。"],
+  fetchModelsNeedBoth: ["Fill in the base URL and API key first.", "请先填写 Base URL 和 API key。"],
   reveal: ["Reveal", "查看"],
   hide: ["Hide", "隐藏"],
   showPass: ["Show password", "显示密码"],
@@ -368,6 +382,23 @@ const STRINGS: Record<string, [string, string]> = {
   remotePlaceholder: ["Remote repository URL", "远端仓库地址"],
   remoteHint: ["Leave empty for standalone mode", "留空为单机模式"],
   reauthorizeGithub: ["Re-authorize GitHub", "重新授权 GitHub"],
+  // M5 配置到应用（D21）
+  applyToApp: ["Apply to app", "配置到应用"],
+  applyChoose: ["Which app should use this record?", "把这条记录配置到哪个应用？"],
+  appDesc_claude_code: ["~/.claude/settings.json", "写入 Claude Code 的 env 块"],
+  appDesc_codex: ["~/.codex/config.toml", "写入 Codex 的 provider 配置"],
+  appDesc_qwen: ["~/.qwen/settings.json", "模型进 Qwen 的 /model 选择器"],
+  applyConfirm: [
+    "Write this record into {0}'s config file? The current file is backed up first.",
+    "写入 {0} 的配置文件？当前文件会先自动备份。",
+  ],
+  appliedToast: ["Applied to {0}.", "已配置到 {0}。"],
+  applySlotsTitle: ["Map models to slots", "把模型映射到槽位"],
+  applySlotsHint: [
+    "Each slot is written to its own config key. Leave one empty to keep the app default.",
+    "每个槽位写入对应的配置键；留空（跳过）的槽位走应用默认。",
+  ],
+  applySlotSkip: ["(leave unset)", "（跳过——不配置）"],
   gitMissingTitle: ["Git is required", "需要安装 Git"],
   gitMissingBody: [
     "MyApiKey stores history and syncs through git. Install it, then come back and retry.",
@@ -629,6 +660,143 @@ function confirmBox(message: string, confirmText: string): Promise<boolean> {
     overlay.append(dialog);
     document.body.appendChild(overlay);
     cancel.focus();
+  });
+}
+
+/** M5 配置到应用（D21）的目标应用表：[后端标识, 展示名]。 */
+const APP_TARGETS: ReadonlyArray<readonly [string, string]> = [
+  ["claude-code", "Claude Code"],
+  ["codex", "Codex"],
+  ["qwen", "Qwen Code"],
+];
+
+/** apply_to_app 的返回视图（后端 ApplyView）。 */
+interface ApplyView {
+  app: string;
+  file: string;
+  backup: string | null;
+  written: string[];
+  effect: string;
+}
+
+/** 单个模型槽位（后端 RecipeSlotView）：槽位名 / 目标键名 / 含义说明。 */
+interface RecipeSlotView {
+  slot: string;
+  path: string;
+  desc: string;
+}
+
+/** 槽位映射对话框（D22 槽位型应用，配置到应用第二步）：每个槽位一个
+ * 下拉（选项 = 记录的模型列表，尾项"跳过"= 该槽不写、走应用默认）。
+ * 返回 槽位名 → 模型名 映射（跳过的槽不出现在结果里）；取消返回
+ * null。调用方保证 models 非空——记录没有模型时无需本对话框。 */
+function slotMappingDialog(
+  slots: RecipeSlotView[],
+  models: string[],
+): Promise<Record<string, string> | null> {
+  return new Promise((resolve) => {
+    const overlay = el("div", "overlay confirm-overlay");
+    const dialog = el("div", "dialog slot-dialog");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    dialog.append(
+      el("p", "dialog-msg", t("applySlotsTitle")),
+      el("p", "dialog-sub", t("applySlotsHint")),
+    );
+    const picks: Array<{ slot: string; sel: HTMLSelectElement }> = [];
+    for (const s of slots) {
+      const row = el("div", "slot-row");
+      const lab = el("label", "slot-label");
+      lab.append(el("span", "slot-path", s.path));
+      if (s.desc) lab.append(el("span", "slot-desc", s.desc));
+      const sel = document.createElement("select");
+      sel.className = "slot-select";
+      for (const m of models) {
+        const o = document.createElement("option");
+        o.value = m;
+        o.textContent = m;
+        sel.append(o);
+      }
+      const skip = document.createElement("option");
+      skip.value = "";
+      skip.textContent = t("applySlotSkip");
+      sel.append(skip);
+      row.append(lab, sel);
+      dialog.append(row);
+      picks.push({ slot: s.slot, sel });
+    }
+    const actions = el("div", "dialog-actions");
+    const cancel = el("button", "btn", t("cancel"));
+    const ok = el("button", "btn btn-primary", t("applyToApp"));
+    const close = (val: Record<string, string> | null) => {
+      overlay.remove();
+      resolve(val);
+    };
+    cancel.addEventListener("click", () => close(null));
+    ok.addEventListener("click", () => {
+      const out: Record<string, string> = {};
+      for (const { slot, sel } of picks) {
+        if (sel.value) out[slot] = sel.value;
+      }
+      close(out);
+    });
+    actions.append(cancel, ok);
+    dialog.append(actions);
+    overlay.append(dialog);
+    document.body.appendChild(overlay);
+    ok.focus();
+  });
+}
+
+/** 选目标应用（D21 配置到应用第一步）：居中对话框，纵向三个应用选项
+ * （带应用名说明），取消沉底右对齐；返回后端标识，取消/Escape/点遮罩
+ * 返回 null。 */
+function chooseAppDialog(): Promise<string | null> {
+  return new Promise((resolve) => {
+    const overlay = el("div", "overlay confirm-overlay");
+    const dialog = el("div", "dialog app-dialog");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    const head = el("p", "dialog-msg", t("applyChoose"));
+    const list = el("div", "app-options");
+    const buttons: HTMLButtonElement[] = [];
+    for (const [id, label] of APP_TARGETS) {
+      const b = el("button", "app-option");
+      b.type = "button";
+      const nm = el("span", "app-option-name", label);
+      const desc = el("span", "app-option-desc", t(`appDesc_${id.replace(/-/g, "_")}`));
+      b.append(nm, desc);
+      b.addEventListener("click", () => close(id));
+      buttons.push(b);
+      list.append(b);
+    }
+    const actions = el("div", "dialog-actions");
+    const cancel = el("button", "btn", t("cancel"));
+    cancel.addEventListener("click", () => close(null));
+    actions.append(cancel);
+    const close = (val: string | null) => {
+      overlay.remove();
+      resolve(val);
+    };
+    // 点遮罩 = 取消（与 confirmBox 同样带 mousedown 守卫）
+    overlay.addEventListener("mousedown", (ev) => {
+      if (ev.target === overlay) close(null);
+    });
+    overlay.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        close(null);
+      } else if (ev.key === "Enter" && ev.target instanceof HTMLButtonElement) {
+        ev.preventDefault();
+        // Enter 在应用选项上 = 选它；在取消上 = 取消
+        const idx = buttons.indexOf(ev.target);
+        close(idx >= 0 && idx < APP_TARGETS.length ? APP_TARGETS[idx][0] : null);
+      }
+    });
+    dialog.append(head, list, actions);
+    overlay.append(dialog);
+    document.body.appendChild(overlay);
+    buttons[0].focus();
   });
 }
 
@@ -1110,6 +1278,11 @@ async function renderMain(): Promise<void> {
     // 备注独立成行（2026-10-25 优化）：不再挤在 key 行里，
     // 作为卡片末尾的补充说明展示
     const notesRow = r.notes ? el("div", "notes", r.notes) : null;
+    // 模型清单独立一行（muted 小字，与 notes 同级）；空列表不占位
+    const modelsRow =
+      r.models && r.models.length > 0
+        ? el("div", "notes", `${t("modelsOpt")}: ${r.models.join(", ")}`)
+        : null;
     const foot = el("div", "record-foot");
     const checkChip = el("span", `check check-${r.check ? r.check.status : "none"}`, r.check ? checkLabel(r.check.label) : t("notChecked"));
     const updated = el("span", "muted small", r.updated_at);
@@ -1155,9 +1328,40 @@ async function renderMain(): Promise<void> {
         });
       })();
     });
-    actions.append(checkBtn, editBtn, delBtn);
+        // M5 供给：配置到应用（D21）——选目标应用 → 确认 → 写配置文件
+    //（切换语义、自动备份、写后验证；restore 见 `mak restore <app>`）
+    const applyBtn = el("button", "btn btn-icon");
+    applyBtn.title = t("applyToApp");
+    applyBtn.setAttribute("aria-label", t("applyToApp"));
+    applyBtn.append(icon("download"));
+    applyBtn.addEventListener("click", async () => {
+      const app = await chooseAppDialog();
+      if (!app) return;
+      const label = APP_TARGETS.find(([id]) => id === app)?.[1] ?? app;
+      // 槽位映射（D22）：槽位型应用且记录有模型时先收集映射，
+      // 取消 = 放弃本次配置
+      let slots: Record<string, string> = {};
+      const slotDefs = await invoke<RecipeSlotView[]>("recipe_slots", { app });
+      if (slotDefs.length > 0 && r.models.length > 0) {
+        const picked = await slotMappingDialog(slotDefs, r.models);
+        if (picked === null) return;
+        slots = picked;
+      }
+      const ok = await confirmBox(t("applyConfirm", label), t("applyToApp"));
+      if (!ok) return;
+      void withBusy(applyBtn, t("applyToApp"), async () => {
+        try {
+          const v = await invoke<ApplyView>("apply_to_app", { id: r.id, app, slots });
+          toast(`${t("appliedToast", v.app)} ${v.effect}`);
+        } catch (e) {
+          toast(String(e), false);
+        }
+      });
+    });
+    actions.append(checkBtn, applyBtn, editBtn, delBtn);
     foot.append(checkChip, updated, actions);
     card.append(head, urlRow, keyRow);
+    if (modelsRow) card.append(modelsRow);
     if (notesRow) card.append(notesRow);
     card.append(foot);
     return card;
@@ -1237,12 +1441,14 @@ let drawerDraft: {
   baseUrl: string;
   apiKey: string;
   keyType: string;
+  models: string[];
   notes: string;
 } | null = null;
 
 function clearDrawerDraft(): void {
   drawerDraft = null;
 }
+
 
 function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): void {
   // 幂等闸门：已有抽屉打开时忽略（连点 Add/Edit 不会叠出多层抽屉）
@@ -1251,6 +1457,7 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
   const drawer = el("div", "drawer");
   drawer.append(el("h2", "", existing ? t("editTitle") : t("addTitle")));
 
+  // 导入面板已随 D20（2026-10-27）移除——抽屉回归纯表单
   const name = el("input", "input");
   name.placeholder = t("recordName");
   name.value = existing?.name ?? "";
@@ -1318,6 +1525,111 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
   notes.placeholder = t("notesOpt");
   notes.value = existing?.notes ?? "";
 
+  // 模型列表编辑器（D21 models 字段）：chip 逐项展示 + 输入框添加 +
+  // ×删除 + 「获取」自动填充。apply 时 Qwen 整列表成条目、Codex/Claude
+  // 取第一个。chosen 是唯一事实源，chip 与保存值都从它渲染。
+  let chosen: string[] = [...(existing?.models ?? [])];
+  const modelsWrap = el("div", "models-editor");
+  const modelsLabel = el("span", "models-label", t("modelsOpt"));
+  const chipBox = el("div", "chip-box");
+  const modelsInput = el("input", "input grow");
+  modelsInput.placeholder = t("modelsHint");
+  const addBtn = el("button", "btn btn-small", t("addModel"));
+  addBtn.type = "button";
+  const fetchBtn = el("button", "btn btn-small", t("fetchModels"));
+  fetchBtn.type = "button";
+  const modelsInputRow = el("div", "field-row models-input-row");
+  modelsInputRow.append(modelsInput, addBtn, fetchBtn);
+  modelsWrap.append(modelsLabel, chipBox, modelsInputRow);
+
+  /** 重渲染 chip 区（chosen → DOM）；空列表显示占位提示。 */
+  const renderChips = () => {
+    chipBox.replaceChildren();
+    if (chosen.length === 0) {
+      chipBox.append(el("span", "models-empty", t("modelsEmpty")));
+      return;
+    }
+    chosen.forEach((m, i) => {
+      const chip = el("span", "model-chip");
+      chip.append(el("code", "mono", m));
+      const del = el("button", "chip-del");
+      del.type = "button";
+      del.textContent = "×";
+      del.setAttribute("aria-label", `${t("removeModel")}: ${m}`);
+      del.addEventListener("click", () => {
+        chosen.splice(i, 1);
+        renderChips();
+      });
+      chip.append(del);
+      chipBox.append(chip);
+    });
+  };
+  /** 输入框内容解析入列（中英逗号分隔均可），清空输入框。 */
+  const addFromInput = () => {
+    for (const m of modelsInput.value.split(/[,，]/)) {
+      const v = m.trim();
+      if (v && !chosen.includes(v)) chosen.push(v);
+    }
+    modelsInput.value = "";
+    renderChips();
+  };
+  addBtn.addEventListener("click", addFromInput);
+  modelsInput.addEventListener("keydown", (ev) => {
+    // Enter/逗号 都能添加；不冒泡到抽屉的 Enter=保存（列表语义）
+    if (ev.key === "Enter" || ev.key === "," || ev.key === "，") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      addFromInput();
+    }
+  });
+
+  const fetchBtnHandler = () =>
+    void withBusy(fetchBtn, t("fetchingModels"), async () => {
+      // key 取值：编辑态掩码占位（未 Reveal）→ 用后端已存的真实 key
+      //（reveal_key 与 fetch_models 同为后端命令，明文不落前端持久层）；
+      // 其余情况用输入框现值
+      let keyVal = key.value.trim();
+      if (existing && key.dataset.placeholderMode === "masked") {
+        try {
+          keyVal = await invoke<string>("reveal_key", { id: existing.id });
+        } catch (e) {
+          toast(String(e), false);
+          return;
+        }
+      }
+      if (!baseUrl.value.trim() && !keyVal) {
+        toast(t("fetchModelsNeedBoth"), false);
+        return;
+      }
+      if (!baseUrl.value.trim()) {
+        fieldError(baseUrl, t("baseUrlRequired"));
+        return;
+      }
+      if (!keyVal) {
+        fieldError(key, t("apiKeyRequired"));
+        return;
+      }
+      try {
+        const list = await invoke<string[]>("fetch_models", {
+          protocol: isCustom() ? protoCustom.value : proto.value,
+          baseUrl: baseUrl.value.trim(),
+          apiKey: keyVal,
+        });
+        if (list.length === 0) {
+          toast(t("fetchModelsEmpty"), false);
+          return;
+        }
+        // 自动填充 = 替换整个列表（获取到的就是服务端的完整清单）
+        chosen = list;
+        renderChips();
+        toast(t("fetchModelsDone", list.length));
+      } catch (e) {
+        toast(String(e), false);
+      }
+    });
+  fetchBtn.addEventListener("click", fetchBtnHandler);
+  renderChips();
+
   const errBox = el("p", "warn hidden");
 
   // 恢复草稿（同目标：新增或同一条记录的编辑），key 的可见状态一并还原
@@ -1330,6 +1642,8 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
     key.value = drawerDraft.apiKey;
     key.type = drawerDraft.keyType as "text" | "password";
     if (existing && key.value !== existing.masked_key) delete key.dataset.placeholderMode;
+    chosen = [...drawerDraft.models];
+    renderChips();
     notes.value = drawerDraft.notes;
   }
 
@@ -1346,6 +1660,7 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
       baseUrl: baseUrl.value,
       apiKey: key.value,
       keyType: key.type,
+      models: [...chosen],
       notes: notes.value,
     };
   };
@@ -1367,6 +1682,7 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
       protocol: isCustom() ? protoCustom.value : proto.value,
       base_url: baseUrl.value,
       api_key: keyUntouched ? "" : key.value,
+      models: chosen,
       notes: notes.value || null,
     };
     try {
@@ -1416,7 +1732,7 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
 
   // 键盘语义：Escape 关闭抽屉；在任意输入框内 Enter 直接保存。
   // 保存进行中（save 处于 busy 禁用态）禁止 Escape 关闭——错误会写进
-  // 已脱离 DOM 的提示框，用户永远看不到失败原因（2026-10-26 审查修复）
+  // 已脱离 DOM 的提示框，用户永远看不到失败原因（2026-10-26 审查修复）。
   overlay.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") {
       ev.preventDefault();
@@ -1428,7 +1744,7 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
   });
   actions.append(cancel, save);
 
-  drawer.append(name, protoWrap, baseUrl, keyWrap, notes, errBox, actions);
+  drawer.append(name, protoWrap, baseUrl, keyWrap, modelsWrap, notes, errBox, actions);
   overlay.append(drawer);
   // 点击遮罩空白处关闭。必须用 mousedown 做守卫：WebView2 对 type=password
   // 会弹浏览器级自动填充建议，选择建议时页面会收到一个合成的 click，落点
