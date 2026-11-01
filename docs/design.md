@@ -58,6 +58,7 @@ MyApiKey 是一个跨平台（Windows / macOS / Linux）的 AI API 凭证记录�
 | D28 | **协议五值扩充**（2026-10-30，用户提供主流协议分类表）：`OpenAi`=Responses（默认，官方推荐新接口）/ `OpenAiChat`=Chat Completions / `Anthropic`=Messages / `AnthropicComplete`=Text Completions（legacy）/ `Custom`。命名规则：**无后缀 = 最新协议，带后缀 = 旧协议**。旧 vault 值（openai/anthropic）完全兼容；探测与模型拉取按两大家族分派（新旧 API 共享同一套 /models） | 真实平台同时存在新旧两种 API 形态，单值无法表达 |
 | D29 | **搜索协议参与**（2026-10-31 用户需求，推翻 2026-10-25 "协议不参与"决议）：`Protocol::search_terms()`（标签 + 完整形态词）以**权重 3（全字段最低）**参与匹配——兼容服务商全员同协议时仍排在名称/URL 命中之后，旧决议担心的噪音用低权重化解 | 用户预期按协议类型找记录（搜 OpenAI 找到走 openai 协议的千问） |
 | D30 | **提示词简约六则**（2026-10-31 用户定调"简约是设计风格"）：一句一事；删可推断；动词开头；错误 = 现象 + 出路；术语统一；双语各自成文。细则见 AGENTS.md「代码风格 · 提示词」 | 啰嗦的提示词让用户找不到重点 |
+| D31 | **同步单文件大小护栏**（2026-11-01）：全部上传路径经 `push_one` 唯一收口，put_blob 前检查密文 ≤ `MAX_SYNC_VAULT_BYTES`（1_000_000 字节，十进制取小值，确保先于 GitHub 硬限制触发）；超限报 "vault is too large to sync" + 清理出路；本地保存与下载不受影响 | 1MB 是 GitHub Contents API 的硬约束（D25）；超限时 GitHub 的原始 4xx 语焉不详，护栏把失效模式变成可执行的出路 |
 
 ---
 

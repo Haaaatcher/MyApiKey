@@ -12,6 +12,8 @@
 //! 3. **仅本地有新数据**：直接上传。
 //!
 //! 上传 best-effort：保存路径上的失败收进 `push_error` 不阻塞本地保存。
+//! 同步单文件上限 1MB（GitHub Contents API 硬约束，D31）：超限上传在
+//! [`push_one`] 收口处报错并给出路，本地保存与下载不受影响。
 //! 每次 PUT 在远端产生一个 git commit（message 透传），GitHub 网页
 //! 历史照旧可见。
 //!
@@ -105,6 +107,30 @@ pub fn unbind_remote(dirs: &AppDirs, cfg: &mut AppConfig) {
     let _ = cfg.save(dirs);
 }
 
+/// 同步单文件大小上限：GitHub Contents API 对单文件的 1MB 硬约束
+/// （D25）。取十进制 1_000_000 而非 2^20——GitHub 的阈值按 MB 计，用
+/// 较小值确保护栏必然先于 GitHub 的拒绝触发，用户看到的是我们的明确
+/// 出路而非一条语焉不详的原始 4xx。本地磁盘无此约束：护栏只挡同步，
+/// 不限制本地保存（vault 写盘刻意不检查）。
+pub const MAX_SYNC_VAULT_BYTES: usize = 1_000_000;
+
+/// 上传前的大小护栏：密文超过 [`MAX_SYNC_VAULT_BYTES`] 时拒绝上传。
+/// 典型失效模式是多设备长期使用后 vault 缓慢膨胀，此时用户应看到
+/// "现象 + 出路"而非 GitHub 的网络错误（错误呈现设计见 AGENTS.md）。
+///
+/// # Errors
+/// 超限时返回 [`Error::Usage`]（含实际大小与清理指引）。
+fn ensure_sync_size(bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_SYNC_VAULT_BYTES {
+        return Err(Error::Usage(format!(
+            "vault is too large to sync: {:.2} MB exceeds the 1 MB limit of the GitHub Contents API\n  \
+             delete unneeded records, then sync again",
+            bytes.len() as f64 / 1e6,
+        )));
+    }
+    Ok(())
+}
+
 /// 上传一个版本并记账（config 状态三件套）。CAS 冲突原样上抛给调用方。
 fn push_one(
     remote: &dyn SyncStore,
@@ -114,6 +140,9 @@ fn push_one(
     expect: Option<String>,
     alive: usize,
 ) -> Result<String> {
+    // 大小护栏放在上传唯一收口：save/sync/init 三条上传路径全覆盖，
+    // 密文都过这里，不存在绕过的入口
+    ensure_sync_size(bytes)?;
     // expect = 调用方声明的远端状态（CAS 基准），由调用方按场景给出
     let message = format!(
         "sync: {}, {} records",
@@ -741,5 +770,69 @@ mod tests {
         let out = sync(&dirs, "pw", mem.as_ref(), 30, &mut cfg).unwrap();
         assert!(out.pushed);
         assert!(mem.0.borrow().sha.starts_with("sha-"));
+    }
+
+    /// 大小护栏精确边界：等于上限通过，超出 1 字节即拒绝（D31）。
+    #[test]
+    fn sync_size_limit_boundary() {
+        let at = vec![0u8; MAX_SYNC_VAULT_BYTES];
+        ensure_sync_size(&at).unwrap();
+        let over = vec![0u8; MAX_SYNC_VAULT_BYTES + 1];
+        let err = ensure_sync_size(&over).unwrap_err();
+        assert!(err.to_string().contains("too large to sync"), "err={err}");
+    }
+
+    /// 超限护栏：密文 > 1MB 的同步被拒绝并给出清理出路，而非让 GitHub
+    /// 回语焉不详的 4xx；本地 vault 照常落盘（护栏只挡同步不挡本地）。
+    #[test]
+    fn oversized_vault_refuses_to_push() {
+        let (dirs, mut cfg) = dirs_at("oversize");
+        let mem = Rc::new(MemStore::default());
+        let mut d = VaultData::default();
+        // 单条记录塞 ~1MB 的 base_url 把密文推过上限（字段无长度限制）
+        d.records.push(Record::new(
+            "huge".into(),
+            Protocol::OpenAi,
+            format!("https://{}.example", "a".repeat(1_000_000)),
+            "key-huge".into(),
+        ));
+        let lb = vault::encrypt(&d, "pw").unwrap();
+        assert!(
+            lb.len() > MAX_SYNC_VAULT_BYTES,
+            "测试前置：密文应已超限，实际 {} 字节",
+            lb.len()
+        );
+        std::fs::write(&dirs.vault_path, &lb).unwrap();
+        cfg.push_pending = true;
+
+        let err = sync(&dirs, "pw", mem.as_ref(), 30, &mut cfg).unwrap_err();
+        assert!(err.to_string().contains("too large to sync"), "err={err}");
+        assert!(dirs.vault_path.is_file(), "本地 vault 不受护栏影响");
+        assert!(mem.0.borrow().sha.is_empty(), "远端不应收到任何上传");
+    }
+
+    /// 边界内侧：密文接近但不超 1MB 照常同步成功（护栏不误伤正常量级）。
+    #[test]
+    fn vault_just_under_limit_still_syncs() {
+        let (dirs, mut cfg) = dirs_at("near-limit");
+        let mem = Rc::new(MemStore::default());
+        let mut d = VaultData::default();
+        d.records.push(Record::new(
+            "big".into(),
+            Protocol::OpenAi,
+            format!("https://{}.example", "a".repeat(950_000)),
+            "key-big".into(),
+        ));
+        let lb = vault::encrypt(&d, "pw").unwrap();
+        assert!(
+            lb.len() > 500_000 && lb.len() <= MAX_SYNC_VAULT_BYTES,
+            "测试前置：密文应接近上限，实际 {} 字节",
+            lb.len()
+        );
+        std::fs::write(&dirs.vault_path, &lb).unwrap();
+        cfg.push_pending = true;
+
+        let out = sync(&dirs, "pw", mem.as_ref(), 30, &mut cfg).unwrap();
+        assert!(out.pushed, "push_error={:?}", out.push_error);
     }
 }
