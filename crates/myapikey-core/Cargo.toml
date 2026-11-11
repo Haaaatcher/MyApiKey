@@ -26,10 +26,12 @@ reqwest.workspace = true
 [features]
 default = ["secret-service"]
 # 启用 keyring 的 Linux secret-service 后端（经 D-Bus 访问 GNOME Keyring/KWallet）。
-# 桌面发行版默认开启；无头服务器（无 libdbus-1-dev）安装时用
+# vendored = 静态编译 libdbus 源码（D52）：编译不再依赖系统 libdbus-1-dev，
+# CI 的 apt 安装步骤随之删除（runner 对 *.ubuntu.com 域名 DNS 故障不再卡发版）。
+# 桌面发行版默认开启；无头服务器（无 gcc 的极简环境）安装时用
 # `cargo install --no-default-features myapikey-cli` 关闭，
 # 代价是 Linux 上不持久记住密码（每次手动输入），其余功能不受影响。
-secret-service = ["keyring/sync-secret-service"]
+secret-service = ["keyring/sync-secret-service", "keyring/vendored"]
 
 # 审查规范 lints:公共组继承 workspace;[lib] 级文档 lint 在此补齐
 # (CLI/GUI 应用 crate 不启用,见根 Cargo.toml 注释)
