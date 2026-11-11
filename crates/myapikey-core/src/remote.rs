@@ -57,7 +57,7 @@ pub trait SyncStore {
     fn put_blob(&self, message: &str, bytes: &[u8], expect_sha: Option<&str>) -> Result<String>;
 
     /// 取历史版本内容（`?ref=<commit sha>`）。历史列表能力在
-    /// GitHub 网页与 commits API，mak 当前只暴露单版本下载。
+    /// GitHub 网页与 commits API，makara 当前只暴露单版本下载。
     ///
     /// # Errors
     /// 网络/认证失败；ref 不存在（404）。
@@ -98,7 +98,7 @@ impl GitHubStore {
         &self,
         method: &str,
         url: &str,
-        body: Option<serde_json::Value>,
+        body: Option<&serde_json::Value>,
     ) -> Result<(u16, String)> {
         const MAX_ATTEMPTS: usize = 3;
         let client = reqwest::blocking::Client::builder()
@@ -115,7 +115,7 @@ impl GitHubStore {
                 std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 1)));
             }
             let mut r = client.request(method.clone(), url);
-            if let Some(b) = &body {
+            if let Some(b) = body {
                 r = r.json(b);
             }
             match r
@@ -163,8 +163,7 @@ impl GitHubStore {
         }
         let summary: String = body.chars().take(200).collect();
         Error::Usage(format!(
-            "GitHub rejected the request (HTTP {st}): {summary}
-               Common causes: expired token (re-authorize with `mak init`),              missing User-Agent (client bug), or insufficient permissions."
+            "GitHub rejected the request (HTTP {st}): {summary}\n  Common causes: expired access (re-bind needed), missing User-Agent (client bug), or insufficient permissions."
         ))
     }
 }
@@ -187,7 +186,10 @@ impl SyncStore for GitHubStore {
                 Ok(Some(RemoteHead { sha: f.sha, bytes }))
             }
             404 => Ok(None),
-            s if s == 401 || s == 403 => Err(Self::auth_or_limit(s, &body)),
+            s if s == 401 || s == 403 => {
+                crate::log::error("remote", &format!("GET vault.mkv rejected (HTTP {s})"));
+                Err(Self::auth_or_limit(s, &body))
+            }
             s => Err(Self::api_error(s, &body)),
         }
     }
@@ -200,7 +202,7 @@ impl SyncStore for GitHubStore {
         if let Some(sha) = expect_sha {
             body["sha"] = serde_json::Value::String(sha.to_string());
         }
-        let (st, resp) = self.request("PUT", &self.api_url(None), Some(body))?;
+        let (st, resp) = self.request("PUT", &self.api_url(None), Some(&body))?;
         match st {
             200 | 201 => {
                 #[derive(serde::Deserialize)]
@@ -218,7 +220,24 @@ impl SyncStore for GitHubStore {
             // 实测：陈旧 sha → 409；无 sha 而文件已存在 → 422。两者都是
             // "远端不处于调用方以为的状态"，调用方拉取合并即可
             409 | 422 => Err(Error::RemoteConflict),
-            s if s == 401 || s == 403 => Err(Self::auth_or_limit(s, &resp)),
+            s if s == 401 || s == 403 => {
+                crate::log::error("remote", &format!("PUT vault.mkv rejected (HTTP {s})"));
+                Err(Self::auth_or_limit(s, &resp))
+            }
+            // 写入 404 = 仓库/文件不可见:GitHub App 卸载或安装范围不含
+            // 该仓库时,GitHub 一律 404(而非 403)——引导检查安装状态
+            // (2026-11-04 用户卸载后同步实测);OAuth App 则可能仓库被删
+            404 => {
+                crate::log::error(
+                    "remote",
+                    "PUT vault.mkv returned 404 (repo not visible to this token;                      check GitHub App installation/scope)",
+                );
+                let summary: String = resp.chars().take(200).collect();
+                Err(Error::Usage(format!(
+                    "repository not found or not accessible by this token (HTTP 404): {summary}. \
+                     If you use a GitHub App, check that it is installed and includes this repo."
+                )))
+            }
             s => Err(Self::api_error(s, &resp)),
         }
     }
@@ -249,7 +268,7 @@ impl SyncStore for GitHubStore {
 /// # Errors
 /// 非 GitHub 形态（M4 后远端仅支持 GitHub 私有仓库）。
 pub fn parse_github_repo(url: &str) -> Result<String> {
-    let s = url.trim().trim_end_matches("/").trim_end_matches(".git");
+    let s = url.trim().trim_end_matches('/').trim_end_matches(".git");
     let tail = s
         .strip_prefix("https://github.com/")
         .or_else(|| s.strip_prefix("http://github.com/"))
@@ -283,14 +302,14 @@ pub(crate) mod mem {
     /// 可注入竞态的内存远端：`conflict_next` 置位后，下一次上传无视
     /// expect_sha 直接按冲突处理（模拟"另一台设备抢先上传"）。
     #[derive(Default)]
-    pub struct MemStore(pub RefCell<MemState>);
+    pub(crate) struct MemStore(pub RefCell<MemState>);
 
     #[derive(Default)]
-    pub struct MemState {
-        pub sha: String,
-        pub bytes: Vec<u8>,
-        pub history: Vec<(String, Vec<u8>)>,
-        pub conflict_next: bool,
+    pub(crate) struct MemState {
+        pub(crate) sha: String,
+        pub(crate) bytes: Vec<u8>,
+        pub(crate) history: Vec<(String, Vec<u8>)>,
+        pub(crate) conflict_next: bool,
     }
 
     impl SyncStore for MemStore {

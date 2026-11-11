@@ -1,4 +1,4 @@
-//! 系统凭据库（记住主密码）的读写封装，带**有效期（TTL）**。
+//! 系统凭据库（记住解锁密码）的读写封装，带**有效期（TTL）**。
 //!
 //! 后端（`keyring` crate 自动路由，见 docs/design.md §9.1）：
 //! - Windows：Credential Manager
@@ -7,18 +7,17 @@
 //!
 //! 条目约定：service = `myapikey`，account = `default`
 //! （account 预留命名空间，未来多 vault 时每个 vault 一个 account）。
-//! 存储内容是**主密码本身**而非派生密钥——这样 KDF 参数可随 vault
+//! 存储内容是**解锁密码本身**而非派生密钥——这样 KDF 参数可随 vault
 //! 版本演进，改参数不需要动凭据库。
 //!
-//! ## TTL 模型（2026-10-24 决议）
+//! ## TTL 模型（2026-11-03 D32 修订：时长统一为自动锁定）
 //!
-//! 主密码**输入一次即记住，默认 7 天有效**（`config.toml` 的 `remember_days`，
-//! 0 = 永不记住）：
+//! 记住副本是实现细节，用户只感知「解锁密码 + 自动锁定时长」：
+//! - 解锁成功 / 持续使用 → 副本有效期滚动续至 `now + auto_lock_minutes`；
+//! - 空闲到期或手动锁定 → 调用方清副本，下次要求输入解锁密码；
+//! - `auto_lock_minutes = 0` → 永不锁定，副本不过期（重启也免输）；
 //! - 密码存凭据库；到期时间存 `<config>/remember.json`（仅时间戳，非敏感）；
-//! - 每次成功输入都会重置计时（续 7 天）；
-//! - [`get_with_expiry`] 发现过期时自动清理凭据库条目并返回 `None`，
-//!   调用方提示重新输入——用户至多每周输一次；
-//! - [`delete`]（`mak forget`）= 立即锁定：下次命令问一次，输入后又开始新的 7 天。
+//! - [`get_with_expiry`] 发现过期时自动清理凭据库条目并返回 `None`。
 //!
 //! 降级策略：Linux 无头/纯 SSH 环境常没有 Secret Service，
 //! 所有读取返回 `Ok(None)` 由调用方退回手动输入；绝不因凭据库
@@ -58,20 +57,25 @@ struct Expiry {
     expires_at: String,
 }
 
-/// 带有效期地记住主密码：写凭据库 + 写到期时间。
+/// 带有效期地记住解锁密码：写凭据库 + 写到期时间。
 ///
-/// `days` 为 0 时不写任何东西（“永不记住”模式由调用方处理提示）。
+/// `minutes` 为自动锁定时长：0 = 永不锁定，副本写为不过期（远期时刻，
+/// 结构不变）；否则有效期 = `now + minutes` 分钟，由调用方随使用滚动续期。
 ///
 /// # Errors
 /// - [`Error::Keyring`]：凭据库写入失败（如无头 Linux）；
 /// - [`Error::Io`] / [`Error::Serde`]：到期文件写入失败。
-pub fn set_ttl(dirs: &AppDirs, passphrase: &str, days: u32) -> Result<()> {
-    if days == 0 {
-        return Ok(());
-    }
+pub fn set_ttl(dirs: &AppDirs, passphrase: &str, minutes: u32) -> Result<()> {
     set_raw(dirs, passphrase)?;
+    // 0 = 永不锁定：写一个实质永久的时刻，避免给 remember.json 引入
+    // 第二种形状（无过期字段）导致旧版本读取行为分叉
+    let expires_at = if minutes == 0 {
+        Utc::now() + chrono::Duration::days(36500)
+    } else {
+        Utc::now() + chrono::Duration::minutes(i64::from(minutes))
+    };
     let exp = Expiry {
-        expires_at: (Utc::now() + chrono::Duration::days(i64::from(days))).to_rfc3339(),
+        expires_at: expires_at.to_rfc3339(),
     };
     let raw = serde_json::to_string(&exp)
         .map_err(|e| Error::Serde(format!("failed to serialize expiry: {e}")))?;
@@ -79,11 +83,39 @@ pub fn set_ttl(dirs: &AppDirs, passphrase: &str, days: u32) -> Result<()> {
     Ok(())
 }
 
-/// 读取仍在有效期内的主密码；过期或不存在时清理并返回 `None`。
+/// 读取记住副本的过期时刻（只碰 remember.json，**不碰凭据库**）。
+/// 供调用方节流滚动续期——距过期尚有半程以上时无需每个 tick 重写
+/// （凭据库 + 文件各一次 IO，2026-11-05 审查可选 D）。
+///
+/// # Returns
+/// - `Ok(Some(at))`：文件存在且时间戳合法（含已过期的时刻）；
+/// - `Ok(None)`：无文件 / JSON 损坏 / 时间戳非法——调用方按"需重写"处理，
+///   与 [`get_with_expiry`] 的"损坏即视为过期"同语义。
+///
+/// # Errors
+/// - [`Error::Io`]：remember.json 读取失败（非缺失）。
+pub fn expires_at(dirs: &AppDirs) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let raw = match std::fs::read_to_string(dirs.config_dir.join(EXPIRY_FILE)) {
+        Ok(r) => r,
+        // 缺失 = 没记住,不是错误
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    Ok(serde_json::from_str::<Expiry>(&raw)
+        .ok()
+        .and_then(|exp| DateTime::parse_from_rfc3339(&exp.expires_at).ok())
+        .map(|t| t.with_timezone(&Utc)))
+}
+
+/// 读取仍在有效期内的解锁密码；过期或不存在时清理并返回 `None`。
 ///
 /// # Returns
 /// - `Ok(Some(passphrase))`：有未过期的记住密码；
 /// - `Ok(None)`：没记住 / 已过期（已顺手清理）/ 凭据库不可用。
+///
+/// # Errors
+/// 不失败：凭据库打不开/条目缺失、到期文件缺失或损坏均降级为
+/// `Ok(None)`（清理后回手动输入）。保留 `Result` 与调用方契约一致。
 ///
 /// 文件损坏（JSON 非法或时间戳解析失败）一律视为过期：清理条目并
 /// 返回 `Ok(None)` 降级到重新输入——到期文件不含凭据，不值得为它失败。
@@ -108,13 +140,14 @@ pub fn get_with_expiry(dirs: &AppDirs) -> Result<Option<String>> {
         return Ok(None);
     };
     if Utc::now() >= expires_at {
+        crate::log::info("keychain", "remembered passphrase expired; cleared");
         let _ = delete(dirs);
         return Ok(None);
     }
     Ok(Some(passphrase))
 }
 
-/// 立即清除记住状态（凭据库条目 + 到期文件）——`mak forget` 的实现。
+/// 立即清除记住状态（凭据库条目 + 到期文件）——`makara forget` 的实现。
 ///
 /// # Returns
 /// - `Ok(true)`：清掉了凭据库条目；
@@ -134,11 +167,7 @@ pub fn delete(dirs: &AppDirs) -> Result<bool> {
 /// 从凭据库读密码；后端不可用或无条目一律 `Ok(None)`（降级为手动输入）。
 fn get_raw(dirs: &AppDirs) -> Option<String> {
     let entry = keyring::Entry::new(service_of(dirs), ACCOUNT).ok()?;
-    match entry.get_password() {
-        Ok(p) => Some(p),
-        Err(keyring::Error::NoEntry) => None,
-        Err(_) => None,
-    }
+    entry.get_password().ok()
 }
 
 /// 直接写凭据库（不带 TTL）。
@@ -166,5 +195,69 @@ fn delete_raw(dirs: &AppDirs) -> Result<bool> {
         Err(e) => Err(Error::Keyring(format!(
             "failed to delete credential store entry: {e}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `expires_at` 只碰 remember.json（不碰凭据库），可用临时目录直测。
+    //! `set_ttl` 会写真实/隔离凭据库，这里不调用——过期时刻的写入路径
+    //! 由 GUI lib.rs 的集成测试（隔离 service）覆盖。
+
+    use super::*;
+
+    fn temp_dirs(tag: &str) -> AppDirs {
+        let root = std::env::temp_dir().join(format!(
+            "mak-keychain-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        AppDirs {
+            config_dir: root.clone(),
+            repo_dir: root.join("repo"),
+            vault_path: root.join("repo/vault.mkv"),
+            config_path: root.join("config.toml"),
+            check_cache_path: root.join("check_cache.json"),
+            lock_path: root.join("vault.lock"),
+            from_env: true,
+        }
+    }
+
+    #[test]
+    fn expires_at_reads_timestamp_or_none() {
+        let dirs = temp_dirs("exp");
+        // 无文件 → None
+        assert_eq!(expires_at(&dirs).unwrap(), None);
+        // 合法未来时刻 → Some
+        std::fs::write(
+            dirs.config_dir.join(EXPIRY_FILE),
+            r#"{"expires_at":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let at = expires_at(&dirs).unwrap().expect("应读到未来时刻");
+        assert!(at > Utc::now());
+        // 已过时刻 → 仍返回 Some(过期与否由调用方判断,本函数只读)
+        std::fs::write(
+            dirs.config_dir.join(EXPIRY_FILE),
+            r#"{"expires_at":"2000-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let past = expires_at(&dirs).unwrap().expect("应读到过去时刻");
+        assert!(past < Utc::now());
+        // JSON 损坏 / 时间戳非法 → None(与 get_with_expiry 的"损坏视为
+        // 过期"同语义,调用方按需重写)
+        std::fs::write(dirs.config_dir.join(EXPIRY_FILE), "{broken").unwrap();
+        assert_eq!(expires_at(&dirs).unwrap(), None);
+        std::fs::write(
+            dirs.config_dir.join(EXPIRY_FILE),
+            r#"{"expires_at":"not-a-time"}"#,
+        )
+        .unwrap();
+        assert_eq!(expires_at(&dirs).unwrap(), None);
+        let _ = std::fs::remove_dir_all(dirs.config_dir);
     }
 }

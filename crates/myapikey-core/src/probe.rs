@@ -69,14 +69,19 @@ impl CheckStatus {
 /// `http` 为 `None` 表示请求根本没得到 HTTP 响应（超时/DNS/连接失败）。
 /// 本函数**不返回 Err**：所有失败都归类为“无法验证”，调用方无需区分错误。
 pub fn probe(record: &Record) -> (CheckStatus, Option<u16>) {
-    match &record.protocol {
+    let (status, http) = match &record.protocol {
         // Responses / Chat Completions 共享同一套 /models 端点与认证头
         Protocol::OpenAi | Protocol::OpenAiChat => probe_openai(record),
         // Messages / Text Completions 共享同一套 /v1/models 端点与认证头
         Protocol::Anthropic | Protocol::AnthropicComplete => probe_anthropic(record),
         // 自定义协议没有可依赖的探测端点约定
         Protocol::Custom { .. } => (CheckStatus::Unverifiable, None),
-    }
+    };
+    crate::log::debug(
+        "probe",
+        &format!("probe {}: {} ({:?})", record.name, status.label(), http),
+    );
+    (status, http)
 }
 
 /// 共享 blocking 客户端（连接池 + TLS 会话复用，2026-10-31 审查可选
@@ -174,6 +179,10 @@ pub const PROBE_CONCURRENCY: usize = 8;
 /// `std::thread::scope` 工作线程 + 原子游标任务队列，不引入线程池
 /// 依赖；总耗时从"逐条之和"降为"约最慢一条"。
 pub fn probe_all(records: &[Record]) -> Vec<(uuid::Uuid, CheckStatus, Option<u16>)> {
+    crate::log::info(
+        "probe",
+        &format!("checking {} records concurrently", records.len()),
+    );
     probe_all_with(
         records,
         PROBE_CONCURRENCY,
@@ -213,10 +222,14 @@ pub fn probe_all_with(
                 }
                 let record = &records[idx];
                 let (status, http) = probe(record);
-                let mut done = results.lock().unwrap_or_else(|p| p.into_inner());
+                let mut done = results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 done[idx] = Some((record.id, status, http));
                 drop(done);
-                let mut cb = callback.lock().unwrap_or_else(|p| p.into_inner());
+                let mut cb = callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 cb(record.id, status, http);
             });
         }
@@ -242,6 +255,19 @@ pub fn probe_all_with(
 /// 返回列表按服务端顺序保留、去重去空；数量上限 128（防御异常服务端
 /// 返回海量条目撑爆 vault）。
 pub fn fetch_models(record: &Record) -> Option<Vec<String>> {
+    let result = fetch_models_inner(record);
+    crate::log::debug(
+        "probe",
+        &format!(
+            "fetch models {}: {} items",
+            record.name,
+            result.as_ref().map_or(0, Vec::len)
+        ),
+    );
+    result
+}
+
+fn fetch_models_inner(record: &Record) -> Option<Vec<String>> {
     let body = match &record.protocol {
         // Responses / Chat Completions 共享同一套 models 端点与认证头
         Protocol::OpenAi | Protocol::OpenAiChat => {
@@ -382,8 +408,8 @@ mod tests {
         let body = r#"{"data":[{"id":"claude-opus-5","display_name":"Opus"}],"has_more":false}"#;
         assert_eq!(parse_models_body(body), vec!["claude-opus-5"]);
         // 坏 body / 空列表 → 空
-        assert!(parse_models_body("{broken").is_empty());
-        assert!(parse_models_body(r#"{"data":[]}"#).is_empty());
+        assert_eq!(parse_models_body("{broken"), Vec::<String>::new());
+        assert_eq!(parse_models_body(r#"{"data":[]}"#), Vec::<String>::new());
     }
 
     /// 解析上限 128 条（防御异常服务端海量返回撑爆 vault）。
@@ -412,9 +438,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(s) => s,
-                    Err(_) => break,
+                let Ok(mut stream) = stream else {
+                    break;
                 };
                 std::thread::spawn(move || {
                     // 先排空请求再延迟响应：Windows 对"接收缓冲区还有
@@ -427,7 +452,7 @@ mod tests {
                         &mut stream,
                         b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
                     );
-                    let _ = std::net::TcpStream::shutdown(&mut stream, std::net::Shutdown::Both);
+                    let _ = std::net::TcpStream::shutdown(&stream, std::net::Shutdown::Both);
                 });
             }
         });

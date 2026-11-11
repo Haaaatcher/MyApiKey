@@ -105,6 +105,35 @@ const KDF_PARAM_LIMITS: KdfParams = KdfParams {
     p: 16,
 };
 
+/// 解锁密码的最小长度（字符数，2026-11-04 用户要求硬性限制）。
+/// 与强度条（软提示，见 GUI `passStrength`）职责不同：这条是硬门槛。
+pub const PASSPHRASE_MIN_CHARS: usize = 8;
+/// 解锁密码的最大长度：防御性上限（Argon2id 对任意长度都能派生，
+/// 上限只为拦截误粘贴整段文档之类的异常输入）。
+pub const PASSPHRASE_MAX_CHARS: usize = 128;
+
+/// 校验解锁密码长度（按字符数计，非字节——中文密码按用户感知计）。
+///
+/// 设置/修改密码的前端与后端都必须调用：前端校验只是体验层，
+/// 后端兜底防止绕过。旧密码是既有事实，不做此校验。
+///
+/// # Errors
+/// - [`Error::Usage`]：长度越界。
+pub fn validate_passphrase(passphrase: &str) -> Result<()> {
+    let n = passphrase.chars().count();
+    if n < PASSPHRASE_MIN_CHARS {
+        return Err(Error::Usage(format!(
+            "passphrase must be at least {PASSPHRASE_MIN_CHARS} characters"
+        )));
+    }
+    if n > PASSPHRASE_MAX_CHARS {
+        return Err(Error::Usage(format!(
+            "passphrase must be at most {PASSPHRASE_MAX_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
 /// 用主密码加密一份数据，产出完整的 vault 文件字节。
 ///
 /// 盐与 nonce 均在本函数内重新随机生成；同一输入多次加密输出不同。
@@ -158,6 +187,10 @@ pub fn encrypt(data: &VaultData, passphrase: &str) -> Result<Vec<u8>> {
 
     let mut out = header;
     out.extend_from_slice(&ciphertext);
+    crate::log::debug(
+        "vault",
+        &format!("encrypted ok ({} bytes ciphertext)", out.len()),
+    );
     Ok(out)
 }
 
@@ -169,7 +202,12 @@ pub fn encrypt(data: &VaultData, passphrase: &str) -> Result<Vec<u8>> {
 /// - [`Error::Decrypt`]：密码错误、或密文/头部任何一字节被篡改
 ///   （GCM 认证失败，故意不区分这两种情况）；
 /// - [`Error::Serde`]：解密成功但明文不是合法 JSON（说明是程序 bug 或格式断裂）。
+///
+/// # Panics
+/// 不 panic：头部长度守卫（`HEADER_LEN`）保证 KDF/nonce 切片与
+/// `try_into` 必然成立——`expect` 只表达该不可失败不变式。
 pub fn decrypt(bytes: &[u8], passphrase: &str) -> Result<VaultData> {
+    // 结果日志放在返回处（见下）——失败原因不含凭据,可安全落日志
     if bytes.len() < HEADER_LEN {
         return Err(Error::Format(format!(
             "file is {} bytes, too short for the {}-byte vault header",
@@ -178,7 +216,7 @@ pub fn decrypt(bytes: &[u8], passphrase: &str) -> Result<VaultData> {
         )));
     }
     if &bytes[0..4] != MAGIC {
-        return Err(Error::Format("bad magic, not a MyApiKey vault file".into()));
+        return Err(Error::Format("bad magic, not a Makara vault file".into()));
     }
 
     // ---- 逐字段解析头部（全部小端） ----
@@ -219,13 +257,30 @@ pub fn decrypt(bytes: &[u8], passphrase: &str) -> Result<VaultData> {
                 aad: &bytes[..HEADER_LEN],
             },
         )
-        .map_err(|_| Error::Decrypt)?;
-
-    serde_json::from_slice(&plaintext).map_err(|e| {
-        Error::Serde(format!(
-            "vault payload is not valid JSON (ciphertext intact): {e}"
-        ))
-    })
+        .map_err(|_| {
+            crate::log::error(
+                "vault",
+                &format!(
+                    "decrypt failed: wrong passphrase or corrupted ciphertext ({} bytes)",
+                    bytes.len()
+                ),
+            );
+            Error::Decrypt
+        })?;
+    match serde_json::from_slice::<VaultData>(&plaintext) {
+        Ok(data) => {
+            crate::log::debug(
+                "vault",
+                &format!("decrypted ok ({} records)", data.records.len()),
+            );
+            Ok(data)
+        }
+        Err(e) => {
+            let msg = format!("vault payload is not valid JSON (ciphertext intact): {e}");
+            crate::log::error("vault", &msg);
+            Err(Error::Serde(msg))
+        }
+    }
 }
 
 /// Argon2id 密钥派生：主密码 + 盐 → 32 字节 AES 密钥。
@@ -250,6 +305,17 @@ mod tests {
 
     use super::*;
     use crate::model::{Protocol, Record};
+
+    #[test]
+    fn validate_passphrase_length_boundaries() {
+        // 7 字符拒、8 字符过(中文按字符计)、128 过、129 拒
+        assert!(validate_passphrase("1234567").is_err());
+        assert!(validate_passphrase("12345678").is_ok());
+        assert!(validate_passphrase("解锁密码测试八个字").is_ok());
+        let max = "a".repeat(PASSPHRASE_MAX_CHARS);
+        assert!(validate_passphrase(&max).is_ok());
+        assert!(validate_passphrase(&format!("{max}x")).is_err());
+    }
 
     fn sample_vault() -> VaultData {
         let mut r = Record::new(
@@ -350,6 +416,6 @@ mod tests {
     fn empty_vault_roundtrips() {
         let bytes = encrypt(&VaultData::empty(), PASS).expect("加密失败");
         let back = decrypt(&bytes, PASS).expect("解密失败");
-        assert!(back.records.is_empty());
+        assert_eq!(back.records, Vec::new());
     }
 }

@@ -27,7 +27,8 @@ use crate::model::Record;
 /// 一条记录对查询词的得分；`None` = 任何字段都不匹配。
 fn score_field(text: &str, q: &str) -> Option<i64> {
     let idx = text.find(q)?;
-    Some(1000 - idx.min(500) as i64 + if is_word_boundary(text, idx) { 100 } else { 0 })
+    let penalty = i64::try_from(idx.min(500)).unwrap_or(500);
+    Some(1000 - penalty + if is_word_boundary(text, idx) { 100 } else { 0 })
 }
 
 /// 子序列匹配：query 每个字符按顺序出现在目标中即可；3 字符起启用。
@@ -45,6 +46,7 @@ fn score_subsequence(target: &str, q: &str) -> Option<i64> {
         // 从 ti 起找下一个 ch（字符级推进，避免字节切片切进多字节字符）
         let found = target[ti..].find(ch)? + ti;
         run = if found == ti { run + 1 } else { 1 };
+        let gap = i64::try_from((found - ti).min(5)).unwrap_or(5);
         score += 10
             + run * 4
             + if is_word_boundary(target, found) {
@@ -52,7 +54,7 @@ fn score_subsequence(target: &str, q: &str) -> Option<i64> {
             } else {
                 0
             }
-            - (found - ti).min(5) as i64;
+            - gap;
         ti = found + ch.len_utf8();
     }
     Some(score)
@@ -190,11 +192,11 @@ mod tests {
             "",
             "anthropic",
         )];
-        assert!(search(records.iter(), "hi").is_empty());
-        assert!(search(records.iter(), "http").is_empty());
+        assert_eq!(search(records.iter(), "hi"), Vec::<&Record>::new());
+        assert_eq!(search(records.iter(), "http"), Vec::<&Record>::new());
         // "hi" 也不因子序列命中 anthropic 里的 h 与 i（短查询只做子串）
         let anth = [rec("Claude", "https://api.anthropic.com", "", "anthropic")];
-        assert!(search(anth.iter(), "hi").is_empty());
+        assert_eq!(search(anth.iter(), "hi"), Vec::<&Record>::new());
         // 路径段可搜
         let with_path = [rec(
             "Beta",
@@ -211,7 +213,7 @@ mod tests {
         // （字节长度 6 曾绕过守卫，2026-10-26 审查修复的回归）
         let records = [rec("主力机", "https://api.example.com", "主账号", "openai")];
         // "主号" 是"主账号"的子序列但不是子串 → 不命中
-        assert!(search(records.iter(), "主号").is_empty());
+        assert_eq!(search(records.iter(), "主号"), Vec::<&Record>::new());
         // "主账" 是子串 → 命中
         assert_eq!(search(records.iter(), "主账").len(), 1);
     }
@@ -242,6 +244,9 @@ mod tests {
             rec("B", "https://b.example.com", "", "openai"),
         ];
         assert_eq!(search(records.iter(), "").len(), 2);
-        assert!(search(records.iter(), "zzz-no-match").is_empty());
+        assert_eq!(
+            search(records.iter(), "zzz-no-match"),
+            Vec::<&Record>::new()
+        );
     }
 }

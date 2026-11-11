@@ -102,9 +102,81 @@ pub fn merge_vaults(
     now: DateTime<Utc>,
     tombstone_days: u32,
 ) -> VaultData {
-    VaultData {
+    let merged = VaultData {
         records: merge_records(&local.records, &remote.records, now, tombstone_days),
+    };
+    let alive = merged.records.iter().filter(|r| !r.is_deleted()).count();
+    crate::log::info(
+        "merge",
+        &format!(
+            "merged: local={} remote={} -> total={} alive={}",
+            local.records.len(),
+            remote.records.len(),
+            merged.records.len(),
+            alive
+        ),
+    );
+    merged
+}
+
+/// 明文导入的合并结果（D52）：计数 + 被覆盖的本地旧版本。旧版本供
+/// 调用方写"导入前快照"（误导入的数据保底；注意快照的 `updated_at`
+/// 早于现数据，直接再导入会被 LWW 跳过——它是数据保底而非一键回滚）。
+pub struct ImportReport {
+    pub added: usize,
+    pub updated: usize,
+    pub overwritten: Vec<Record>,
+}
+
+/// 明文导入的合并（CLI `makara import` 与 GUI 导入共用，D47）：按 id
+/// 匹配，`updated_at` **严格大于**本地才覆盖（相等跳过——导入刚导出的
+/// 文件是幂等操作，零变化）；新 id 直接追加，且时间戳重置为导入时刻
+/// （导入即"此刻入库"，后续同步冲突中以落地时间参与新者胜）。
+///
+/// 返回 [`ImportReport`]——`added` 与 `updated` 皆为 0 时调用方应跳过
+/// 落盘/推送（零变化零动作，避免重加密噪音与远端空提交）。
+pub fn import_records(
+    data: &mut VaultData,
+    imported: Vec<Record>,
+    now: DateTime<Utc>,
+) -> ImportReport {
+    // id → 下标索引：O(n+m) 匹配（原 O(n²) find 在万级记录导入时退化）
+    let mut index: std::collections::HashMap<uuid::Uuid, usize> = data
+        .records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.id, i))
+        .collect();
+    let mut report = ImportReport {
+        added: 0,
+        updated: 0,
+        overwritten: Vec::new(),
+    };
+    for mut r in imported {
+        if let Some(&idx) = index.get(&r.id) {
+            if r.updated_at > data.records[idx].updated_at {
+                // 被覆盖的本地旧版本留档（调用方写导入前快照，D52）
+                report.overwritten.push(data.records[idx].clone());
+                data.records[idx] = r;
+                report.updated += 1;
+            }
+        } else {
+            r.updated_at = now;
+            index.insert(r.id, data.records.len());
+            data.records.push(r);
+            report.added += 1;
+        }
     }
+    crate::log::info(
+        "merge",
+        &format!(
+            "import records: added={} updated={} overwritten={}",
+            report.added,
+            report.updated,
+            report.overwritten.len()
+        ),
+    );
+    report
 }
 
 #[cfg(test)]
@@ -130,6 +202,74 @@ mod tests {
             .expect("测试时间非法")
             .with_timezone(&Utc);
         r
+    }
+
+    /// 导入合并（D47）：幂等（同 id 同时间戳跳过）、新者覆盖、旧者跳过、
+    /// 新 id 追加且时间戳重置为导入时刻。
+    #[test]
+    fn import_records_lww_and_counting() {
+        let now = DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
+            .expect("测试时间非法")
+            .with_timezone(&Utc);
+        let id_a = Uuid::now_v7();
+        let id_b = Uuid::now_v7();
+        let id_new = Uuid::now_v7();
+        let mut data = VaultData {
+            records: vec![
+                rec(id_a, "same", "2026-11-10T00:00:00Z"),
+                rec(id_b, "local-newer", "2026-11-10T00:00:00Z"),
+            ],
+        };
+        // 导入：id_a 同内容同时间戳（幂等跳过）；id_b 导入的更旧（跳过）；
+        // id_new 是新 id（追加）
+        let imported = vec![
+            rec(id_a, "same", "2026-11-10T00:00:00Z"),
+            rec(id_b, "stale-import", "2026-11-01T00:00:00Z"),
+            rec(id_new, "brand-new", "2020-01-01T00:00:00Z"),
+        ];
+        let (report) = import_records(&mut data, imported, now);
+        assert_eq!((report.added, report.updated), (1, 0), "仅新 id 计入 added");
+        assert_eq!(report.overwritten.len(), 0, "无覆盖");
+        assert_eq!(data.records.len(), 3);
+        let new_rec = data
+            .records
+            .iter()
+            .find(|r| r.id == id_new)
+            .expect("新记录应存在");
+        assert_eq!(new_rec.updated_at, now, "新增记录时间戳应重置为导入时刻");
+        let b = data
+            .records
+            .iter()
+            .find(|r| r.id == id_b)
+            .expect("本地记录应保留");
+        assert_eq!(b.name, "local-newer", "更旧的导入不应覆盖本地");
+    }
+
+    /// 导入覆盖：同 id 且导入的 `updated_at` 严格更新 → 覆盖并计入
+    /// updated；墓碑期内同 id 存活记录导入 → 覆盖墓碑（有意恢复）。
+    #[test]
+    fn import_records_overwrites_newer_and_tombstone() {
+        let now = Utc::now();
+        let id_a = Uuid::now_v7();
+        let mut dead = rec(id_a, "victim", "2026-11-01T00:00:00Z");
+        dead.mark_deleted();
+        let mut data = VaultData {
+            records: vec![dead],
+        };
+        // 导入同 id、updated_at 晚于墓碑刷新时刻的存活记录 → 覆盖墓碑
+        // （mark_deleted 会把 updated_at 刷成"现在"，导入时间戳取确定性的
+        // 未来值保证严格大于）
+        let imported = vec![rec(id_a, "revived", "2027-01-01T00:00:00Z")];
+        let report = import_records(&mut data, imported, now);
+        assert_eq!(
+            (report.added, report.updated),
+            (0, 1),
+            "墓碑覆盖计入 updated"
+        );
+        assert_eq!(report.overwritten.len(), 1, "被覆盖的墓碑应留档");
+        let r = &data.records[0];
+        assert!(!r.is_deleted(), "墓碑应被存活导入覆盖");
+        assert_eq!(r.name, "revived");
     }
 
     /// 在 `at` 时刻删除（同时刷新 updated_at，模拟 mark_deleted 的真实行为）。

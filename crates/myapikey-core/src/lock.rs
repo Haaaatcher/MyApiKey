@@ -37,13 +37,16 @@ pub fn acquire(dirs: &AppDirs) -> Result<InstanceLock> {
         .write(true)
         .open(&dirs.lock_path)?;
     let lock: &'static mut RwLock<File> = Box::leak(Box::new(RwLock::new(file)));
-    match lock.try_write() {
-        Ok(guard) => Ok(InstanceLock { _guard: guard }),
-        Err(_) => Err(Error::Usage(
-            "another MyApiKey instance is running and holds vault.lock; finish or close it first"
-                .into(),
-        )),
+    if let Ok(guard) = lock.try_write() {
+        return Ok(InstanceLock { _guard: guard });
     }
+    crate::log::error(
+        "lock",
+        "instance lock held by another Makara instance (vault.lock busy)",
+    );
+    Err(Error::Usage(
+        "another Makara instance is running and holds vault.lock; finish or close it first".into(),
+    ))
 }
 
 #[cfg(test)]

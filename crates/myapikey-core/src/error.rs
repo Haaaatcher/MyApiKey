@@ -4,7 +4,7 @@
 //! - 全库只暴露这一种 [`Error`]，调用方（CLI/GUI）按变体决定提示文案与退出码；
 //! - 所有错误信息面向最终用户，用**英文**表述可执行的补救动作
 //!   （语言分层规范见 AGENTS.md；本文件内的中文注释面向开发者）；
-//! - **任何变体的信息里都不得拼入 `api_key` 或主密码**——例如解密失败只说
+//! - **任何变体的信息里都不得拼入 `api_key` 或解锁密码**——例如解密失败只说
 //!   密码错误，绝不回显用户输入了什么。
 
 use thiserror::Error;
@@ -17,19 +17,19 @@ pub enum Error {
     #[error("invalid vault file: {0}")]
     Format(String),
 
-    /// 主密码验证失败（AES-GCM 认证标签不匹配）或密文损坏。
+    /// 解锁密码验证失败（AES-GCM 认证标签不匹配）或密文损坏。
     /// 注意：故意不区分“密码错”与“数据坏”，避免给攻击者提供可区分的信号。
-    #[error("wrong master passphrase, or the vault data is corrupted")]
+    #[error("wrong passphrase, or the vault data is corrupted")]
     Decrypt,
 
     /// vault 版本号高于本程序支持的最高版本（例如未来用新版程序加密过）。
     /// 携带读到的版本号。
-    #[error("vault version {0} is newer than the supported version {SUPPORTED_VAULT_VERSION}; please upgrade MyApiKey")]
+    #[error("vault version {0} is newer than the supported version {SUPPORTED_VAULT_VERSION}; please upgrade Makara")]
     UnsupportedVersion(u16),
 
     /// 远端已有更新版本（CAS 冲突：上传时携带的旧 sha 与远端当前
     /// 不一致）。同步流程捕获后走"下载 + LWW 合并 + 重传"，到达用户
-    /// 面前时通常已被消化；不消化即提示跑 `mak sync`。
+    /// 面前时通常已被消化；不消化即提示跑 `makara sync`。
     #[error("the remote vault has changed since the last sync")]
     RemoteConflict,
 
@@ -52,7 +52,7 @@ pub enum Error {
     NotFound(String),
 
     /// 本机尚未初始化（没有 vault / git 仓库），需要先运行 `init`。
-    #[error("not initialized yet, run `mak init` first")]
+    #[error("not initialized yet, run `makara init` first")]
     NotInitialized,
 
     /// 调用方使用错误（参数缺失、导入文件内容不对等）。

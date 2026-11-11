@@ -30,3 +30,36 @@ default = ["secret-service"]
 # `cargo install --no-default-features myapikey-cli` 关闭，
 # 代价是 Linux 上不持久记住密码（每次手动输入），其余功能不受影响。
 secret-service = ["keyring/sync-secret-service"]
+
+# 审查规范 lints:公共组继承 workspace;[lib] 级文档 lint 在此补齐
+# (CLI/GUI 应用 crate 不启用,见根 Cargo.toml 注释)
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+panic_in_result_fn = "warn"
+missing_panics_doc = "warn"
+missing_errors_doc = "warn"
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+fn_params_excessive_bools = "warn"
+struct_excessive_bools = "warn"
+clone_on_ref_ptr = "warn"
+redundant_clone = "warn"
+rc_buffer = "warn"
+string_add = "warn"
+wildcard_imports = "warn"
+dbg_macro = "warn"
+todo = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+doc_markdown = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+module_inception = "allow"
+enum_glob_use = "allow"

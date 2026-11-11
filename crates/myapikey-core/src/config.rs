@@ -1,6 +1,6 @@
 //! 非敏感配置（`config.toml`）。
 //!
-//! 只放设备本地的行为开关与状态，**任何敏感信息（主密码、api_key）都不许进本文件**。
+//! 只放设备本地的行为开关与状态，**任何敏感信息（解锁密码、api_key）都不许进本文件**。
 //! 与 vault 不同，本文件是明文 TOML、不随 git 仓库同步——
 //! 每台设备有自己的偏好（例如墓碑保留期）是合理的。
 
@@ -24,16 +24,18 @@ pub struct AppConfig {
     /// 关闭后仅在本机 commit，跨设备同步完全依赖手动 `mak sync`。
     pub auto_push: bool,
 
-    /// 主密码记住的有效期天数（2026-10-24 决议：输入一次默认记住一周）。
+    /// 空闲自动锁定分钟数（软锁：销毁内存中的解锁状态；D32 起同时是
+    /// 记住副本的唯一时长来源——副本滚动续期至此刻 + N 分钟，0 = 永不
+    /// 锁定，副本不过期）。
     ///
-    /// 每次成功输入都会重置计时；到期后下次命令会要求重新输入一次并再次续期。
-    /// 设为 `0` = 永不记住（每次命令都手动输入）。
-    pub remember_days: u32,
-
-    /// GUI 空闲自动锁定分钟数（软锁：销毁内存中的解锁状态）。
-    ///
-    /// 锁定后回到解锁页；若主密码仍在记忆有效期内，一键解锁即可恢复。
+    /// 锁定后回到解锁页，需要重新输入解锁密码。
     pub auto_lock_minutes: u32,
+
+    /// 文件日志级别（2026-11-05 用户需求：错误详情落日志而非悬停/弹窗）。
+    /// `off` / `error` / `info` / `debug`，默认 `info`；GUI 设置页可控，
+    /// 变更即时生效。文件位于 `<config_dir>/logs/`，按天分文件保留 7 天。
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
 
     /// 最近一次成功同步的时间（RFC 3339，本机展示用，非精确账本）。
     pub last_sync_at: Option<String>,
@@ -57,6 +59,23 @@ pub struct AppConfig {
     /// （本地不再有 git 仓库）。旧版用户的该字段为空而 git remote
     /// 存在时，由一次性迁移读取（见 sync.rs 迁移注释）。
     pub remote_repo: Option<String>,
+
+    /// 新绑定未指定仓库时的默认仓库名（2026-11-10 从硬编码配置化，
+    /// D38）。仅影响 init / 重新绑定的默认值：已绑定的仓库不受影响
+    /// （远端仓库名是用户的 GitHub 资产，不做迁移）。
+    #[serde(default = "default_repo_name")]
+    pub default_repo_name: String,
+}
+
+/// [`AppConfig::log_level`] 的默认值（serde default 与 Default 双用）。
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+/// [`AppConfig::default_repo_name`] 的默认值（serde default 与 Default
+/// 双用），单一来源是 [`crate::github::DEFAULT_REPO_NAME`]。
+fn default_repo_name() -> String {
+    crate::github::DEFAULT_REPO_NAME.to_string()
 }
 
 impl Default for AppConfig {
@@ -64,12 +83,13 @@ impl Default for AppConfig {
         Self {
             tombstone_days: 30,
             auto_push: true,
-            remember_days: 7,
             auto_lock_minutes: 10,
+            log_level: default_log_level(),
             last_sync_at: None,
             last_sync_sha: None,
             push_pending: false,
             remote_repo: None,
+            default_repo_name: default_repo_name(),
         }
     }
 }
@@ -92,6 +112,10 @@ impl AppConfig {
             // （2026-10-31 升级丢绑定事故的防丢加固）
             let bak = dirs.config_path.with_extension("toml.bad");
             let _ = std::fs::copy(&dirs.config_path, &bak);
+            crate::log::error(
+                "config",
+                &format!("config.toml parse failed; saved a copy to config.toml.bad: {e}"),
+            );
             Error::Serde(format!("failed to parse config.toml: {e}"))
         })
     }
@@ -144,5 +168,15 @@ mod tests {
         let back = AppConfig::load(&dirs).expect("回读失败");
         assert_eq!(back.tombstone_days, 7);
         assert_eq!(back.last_sync_at.as_deref(), Some("2026-10-23T00:00:00Z"));
+    }
+
+    /// 旧版 config（无 `default_repo_name` 字段）加载后按缺省值补齐
+    /// （D38 配置化兼容）。
+    #[test]
+    fn legacy_config_gets_default_repo_name() {
+        let toml_src = "tombstone_days = 30\nauto_push = true\nauto_lock_minutes = 10\n";
+        let cfg: AppConfig = toml::from_str(toml_src).expect("旧格式解析失败");
+        assert_eq!(cfg.default_repo_name, crate::github::DEFAULT_REPO_NAME);
+        assert_eq!(cfg.default_repo_name, "makara-vault");
     }
 }

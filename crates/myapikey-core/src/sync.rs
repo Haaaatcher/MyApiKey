@@ -65,6 +65,9 @@ pub fn open_remote(url: &str, token: &str) -> Result<Box<dyn SyncStore>> {
 /// 删、新文件未就位"的非原子窗口，崩溃/掉电即整库丢失）。父目录不存
 /// 在则先建（全新机器接入远端数据时 `repo/` 尚未创建——缺这一步会在
 /// os error 3 上炸掉）。
+///
+/// # Errors
+/// - [`Error::Io`]：父目录创建 / tmp 写盘 / rename 任一步失败。
 pub fn atomic_write_vault(dirs: &AppDirs, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = dirs.vault_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -100,6 +103,7 @@ pub fn mark_synced(dirs: &AppDirs, cfg: &mut AppConfig, sha: String) {
 /// 只动 config 与记账；vault 文件与远端仓库由调用方决定去留，本函数
 /// 不碰。
 pub fn unbind_remote(dirs: &AppDirs, cfg: &mut AppConfig) {
+    crate::log::info("sync", "remote unbound (sync state cleared)");
     cfg.remote_repo = None;
     cfg.last_sync_sha = None;
     cfg.push_pending = false;
@@ -122,10 +126,15 @@ pub const MAX_SYNC_VAULT_BYTES: usize = 1_000_000;
 /// 超限时返回 [`Error::Usage`]（含实际大小与清理指引）。
 fn ensure_sync_size(bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_SYNC_VAULT_BYTES {
+        // usize→f64 经 u32 中转:f64 可精确表示 u32 全域,规避精度损失 lint
+        let mb = f64::from(u32::try_from(bytes.len()).unwrap_or(u32::MAX)) / 1e6;
+        crate::log::error(
+            "sync",
+            &format!("vault too large to sync: {mb:.2} MB exceeds the 1 MB limit"),
+        );
         return Err(Error::Usage(format!(
-            "vault is too large to sync: {:.2} MB exceeds the 1 MB limit of the GitHub Contents API\n  \
+            "vault is too large to sync: {mb:.2} MB exceeds the 1 MB limit of the GitHub Contents API\n  \
              delete unneeded records, then sync again",
-            bytes.len() as f64 / 1e6,
         )));
     }
     Ok(())
@@ -137,7 +146,7 @@ fn push_one(
     dirs: &AppDirs,
     cfg: &mut AppConfig,
     bytes: &[u8],
-    expect: Option<String>,
+    expect: Option<&str>,
     alive: usize,
 ) -> Result<String> {
     // 大小护栏放在上传唯一收口：save/sync/init 三条上传路径全覆盖，
@@ -149,7 +158,11 @@ fn push_one(
         chrono::Utc::now().to_rfc3339(),
         alive
     );
-    let sha = remote.put_blob(&message, bytes, expect.as_deref())?;
+    let sha = remote.put_blob(&message, bytes, expect)?;
+    crate::log::info(
+        "sync",
+        &format!("pushed to remote (sha {}…)", &sha[..12.min(sha.len())]),
+    );
     mark_synced(dirs, cfg, sha.clone());
     Ok(sha)
 }
@@ -167,7 +180,7 @@ pub fn push_and_mark(
     dirs: &AppDirs,
     cfg: &mut AppConfig,
     bytes: &[u8],
-    expect: Option<String>,
+    expect: Option<&str>,
     alive: usize,
 ) -> Result<String> {
     push_one(remote, dirs, cfg, bytes, expect, alive)
@@ -204,9 +217,23 @@ pub fn save_local(
     cfg.push_pending = true;
     cfg.save(dirs)?;
     atomic_write_vault(dirs, &bytes)?;
+    crate::log::info(
+        "sync",
+        &format!(
+            "saved locally ({} bytes ciphertext), push pending",
+            bytes.len()
+        ),
+    );
     Ok(bytes)
 }
 
+/// 保存 + 按配置推送的组合出口（CLI/GUI 的 add/edit/delete/passwd 用）：
+/// 先 [`save_local`] 落盘置位，`auto_push` 且远端在绑时
+/// [`push_one`] 一把推（CAS 基准 = `last_sync_sha`）。
+///
+/// # Errors
+/// [`save_local`] 的加密/写盘失败原样上抛；推送失败**不算错误**——
+/// 收进 [`SyncOutcome::push_error`]，本机仍是保存成功、待补推状态。
 pub fn save(
     dirs: &AppDirs,
     passphrase: &str,
@@ -228,13 +255,14 @@ pub fn save(
             dirs,
             cfg,
             &bytes,
-            cfg.last_sync_sha.clone(),
+            // clone 必要:同一表达式里 cfg 还要以 &mut 传入
+            cfg.last_sync_sha.clone().as_deref(),
             out.alive_records,
         ) {
             Ok(_new_sha) => out.pushed = true,
             Err(Error::RemoteConflict) => {
                 out.push_error = Some(
-                    "the remote vault has new changes; run `mak sync` to merge and push".into(),
+                    "the remote vault has new changes; run `makara sync` to merge and push".into(),
                 );
             }
             Err(e) => out.push_error = Some(e.to_string()),
@@ -248,7 +276,7 @@ fn cfg_remote_label(cfg: &AppConfig) -> String {
     cfg.remote_repo.clone().unwrap_or_default()
 }
 
-/// 执行一次完整同步（`mak sync` / GUI 同步按钮的核心）。
+/// 执行一次完整同步（`makara sync` / GUI 同步按钮的核心）。
 ///
 /// 入参 `tombstone_days` 来自本机配置。
 ///
@@ -257,6 +285,10 @@ fn cfg_remote_label(cfg: &AppConfig) -> String {
 /// - [`Error::Decrypt`]：本机密码错误；
 /// - [`Error::Usage`]：远端 vault 用了不同主密码（两台设备必须同一密码）；
 /// - 网络/认证错误。
+#[expect(
+    clippy::too_many_lines,
+    reason = "同步五场景状态机+冲突重试是线性流程,拆分反而打断对账顺序"
+)]
 pub fn sync(
     dirs: &AppDirs,
     passphrase: &str,
@@ -321,7 +353,7 @@ pub fn sync(
                     dirs,
                     cfg,
                     &bytes,
-                    Some(h.sha.clone()),
+                    Some(h.sha.as_str()),
                     count_alive(&local_data),
                 )?;
                 out.pushed = true;
@@ -340,7 +372,14 @@ pub fn sync(
                 atomic_write_vault(dirs, &bytes)?;
                 local_data = merged;
                 let merged_alive = count_alive(&local_data);
-                match push_one(remote, dirs, cfg, &bytes, Some(h.sha.clone()), merged_alive) {
+                match push_one(
+                    remote,
+                    dirs,
+                    cfg,
+                    &bytes,
+                    Some(h.sha.as_str()),
+                    merged_alive,
+                ) {
                     Ok(_new_sha) => {
                         out.pulled = true;
                         out.merged = true;
@@ -350,6 +389,10 @@ pub fn sync(
                     // 同步期间远端又变了（另一台设备抢先上传）：重拉重合并
                     Err(Error::RemoteConflict) => {
                         attempts += 1;
+                        crate::log::info(
+                            "sync",
+                            &format!("remote changed during sync; retry {attempts}/3"),
+                        );
                         if attempts >= 3 {
                             out.push_error = Some(
                                 "the remote kept changing during sync; try again in a moment"
@@ -402,21 +445,18 @@ pub fn migrate_legacy_git(dirs: &AppDirs, cfg: &mut AppConfig) {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|u| !u.is_empty());
-    match url.as_deref().map(crate::remote::parse_github_repo) {
-        Some(Ok(repo)) => {
-            cfg.remote_repo = Some(repo);
-            let _ = cfg.save(dirs);
-            // 抢救成功才清理 .git；失败保留待下次重试——
-            // 无 git 命令的环境里贸然删除 = 绑定永久丢失
-            // （2026-10-31 升级迁移审查修复）
-            let _ = std::fs::remove_dir_all(&git_dir);
-        }
-        _ => {
-            // 抢救失败（git 不可用 / 非 GitHub 形态）：保留现场，
-            // 并把原 config 留档以防后续写入覆盖（用户可对照恢复）
-            let bak = dirs.config_path.with_extension("toml.migrated-bad");
-            let _ = std::fs::copy(&dirs.config_path, &bak);
-        }
+    if let Some(Ok(repo)) = url.as_deref().map(crate::remote::parse_github_repo) {
+        cfg.remote_repo = Some(repo);
+        let _ = cfg.save(dirs);
+        // 抢救成功才清理 .git；失败保留待下次重试——
+        // 无 git 命令的环境里贸然删除 = 绑定永久丢失
+        // （2026-10-31 升级迁移审查修复）
+        let _ = std::fs::remove_dir_all(&git_dir);
+    } else {
+        // 抢救失败（git 不可用 / 非 GitHub 形态）：保留现场，
+        // 并把原 config 留档以防后续写入覆盖（用户可对照恢复）
+        let bak = dirs.config_path.with_extension("toml.migrated-bad");
+        let _ = std::fs::copy(&dirs.config_path, &bak);
     }
 }
 
@@ -427,7 +467,7 @@ pub fn migrate_legacy_git(dirs: &AppDirs, cfg: &mut AppConfig) {
 /// 限流单独转成不含 "HTTP 403" 的文案，不会误入本判定
 /// （2026-10-31 审查可选采纳）。
 pub fn is_auth_error(msg: &str) -> bool {
-    msg.contains("GitHub authorization failed")
+    msg.contains("GitHub rejected the access")
         || msg.contains("HTTP 401")
         || msg.contains("HTTP 403")
         || msg.contains("Bad credentials")
@@ -451,7 +491,7 @@ fn count_alive(d: &VaultData) -> usize {
     d.records.iter().filter(|r| !r.is_deleted()).count()
 }
 
-/// `mak status` / GUI 状态页需要的同步摘要（纯本地，不联网）。
+/// `makara status` / GUI 状态页需要的同步摘要（纯本地，不联网）。
 #[derive(Debug, Clone)]
 pub struct StatusInfo {
     /// origin 远端地址（None = 单机）。
@@ -485,7 +525,7 @@ mod tests {
     fn dirs_at(tag: &str) -> (AppDirs, AppConfig) {
         let root = std::env::temp_dir().join(format!("mak-sync-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root.join("repo")).unwrap();
+        std::fs::create_dir_all(root.join("repo")).unwrap();
         let dirs = AppDirs {
             config_dir: root.clone(),
             repo_dir: root.join("repo"),
@@ -531,7 +571,7 @@ mod tests {
         let remote_vault = vault_with("from-remote", 10);
         let bytes = vault::encrypt(&remote_vault, "pw").unwrap();
         mem.0.borrow_mut().sha = "sha-r1".into();
-        mem.0.borrow_mut().bytes = bytes.clone();
+        mem.0.borrow_mut().bytes = bytes;
 
         let local = vault_with("local-old", 30);
         let lb = vault::encrypt(&local, "pw").unwrap();
@@ -721,7 +761,7 @@ mod tests {
     #[test]
     fn unbind_remote_clears_repo_and_sync_state() {
         let (dirs, mut cfg) = dirs_at("unbind");
-        cfg.remote_repo = Some("you/myapikey-vault".into());
+        cfg.remote_repo = Some("you/makara-vault".into());
         std::fs::create_dir_all(&dirs.config_dir).unwrap();
         mark_synced(&dirs, &mut cfg, "sha-x".into());
         assert!(cfg.last_sync_at.is_some(), "前置：先有同步记账");
