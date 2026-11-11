@@ -24,3 +24,6 @@ dist/
 *.pem
 *.key
 .zcode/
+
+# GitHub App client secret(内嵌构建用,永不入库)
+client-secret.txt

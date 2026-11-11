@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/myapikey-core", "crates/myapikey-cli", "crates/myapikey-gui"]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 authors = ["Hang Luo (Haaaatcher)"]
@@ -38,12 +38,68 @@ arboard = "3"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = { version = "2", features = [] }
 # 单实例（2026-10-25 需求）：二次启动聚焦已有窗口，官方插件
+tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 
 # 内部 crate 互相引用。
 # core 关闭默认特性继承：是否启用 secret-service 由各前端自己的 feature 决定，
 # 这样 `cargo install --no-default-features myapikey-cli` 才能真正裁掉 dbus 系链。
 myapikey-core = { path = "crates/myapikey-core", default-features = false }
+
+# 审查规范 lints（2026-11-05 审查可选 E 采纳，来源 docs/review/beautiful-rust/）：
+# 蒸馏自 Google Rust Style Guide / Rust API Guidelines / Effective Rust 等，
+# 机器可查的规则交给 clippy 固化。CI 以 `cargo clippy --all-targets -- -D warnings` 收紧。
+# 各成员在 Cargo.toml 里声明 `[lints] workspace = true` 启用。
+# 分阶段策略：以下两组为当前基线；以下项**暂缓**启用（理由随项标注）——
+# - missing_docs / missing_debug_implementations：存量补齐成本高，/// 文化靠 review 维持
+# - missing_assert_message：测试断言数百条机械化标注，噪声大于信号
+# - as_conversions：项目存在大量合法 `u64::from`/截断 cast，逐一改 TryFrom 收益低
+# - print_stdout / print_stderr：CLI 是输出型应用，打印即产品行为
+# - exhaustive_enums / allow_attributes：面向外部发布的演化约束，当前为应用
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# 组先于单项声明,单项覆盖组级别
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# panic 卫生:返回 Result 的函数不再 panic
+panic_in_result_fn = "warn"
+# missing_errors_doc / missing_panics_doc 为 [lib] 级(见 beautiful-rust lints
+# 注释"applications can drop them")——只对 core 启用,配置在 core 自己的
+# [lints] 表;CLI/GUI 是应用薄包装,错误文档的真实载体是 core 的函数。
+# 两者同属 pedantic 组,须显式 allow 压过组级别
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+# 抑制必须有理由
+allow_attributes_without_reason = "warn"
+# unsafe 必须举证
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+# API 形状
+fn_params_excessive_bools = "warn"
+struct_excessive_bools = "warn"
+clone_on_ref_ptr = "warn"
+redundant_clone = "warn"
+rc_buffer = "warn"
+# 惯用法与调试残留
+string_add = "warn"
+wildcard_imports = "warn"
+dbg_macro = "warn"
+todo = "warn"
+# 静默丢信息的 cast
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+# pedantic 中在本项目纯属噪声的项,显式放行
+# doc_markdown:为纯英文文档设计——本项目注释是中文(AGENTS 语言分层),
+# 混排的英文术语(client_id、api_key)不要求反引号
+doc_markdown = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+module_inception = "allow"
+enum_glob_use = "allow"
 
 [profile.release]
 lto = "thin"
