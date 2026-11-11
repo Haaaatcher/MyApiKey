@@ -18,7 +18,7 @@ use dialoguer::{Confirm, FuzzySelect, Input, MultiSelect, Password, Select};
 use myapikey_core::{keychain, vault, Error, Result};
 use std::io::{BufRead, Write};
 
-/// 环境变量名：非交互环境（CI/脚本）传入主密码的逃生通道。
+/// 环境变量名：非交互环境（CI/脚本）传入解锁密码的逃生通道。
 pub const PASSPHRASE_ENV: &str = "MYAPIKEY_PASSPHRASE";
 
 /// dialoguer 组件的统一非 TTY 兜底：stdin/stderr 任一不是终端（管道、
@@ -51,11 +51,11 @@ pub enum PassSource {
     Prompt,
 }
 
-/// 按解析链取得能解开 vault 的主密码。
+/// 按解析链取得能解开 vault 的解锁密码（passphrase）。
 ///
 /// 解析链：环境变量 > 凭据库中未过期的记住密码 > 交互输入。
-/// 交互输入成功后，若 `remember_days > 0` 会自动重新记住并续期
-/// （2026-10-24 决议：输入一次默认有效 7 天，见 core::keychain 的 TTL 模型）。
+/// 交互输入成功后按自动锁定时长记住并续期
+/// （D32 语义统一：记住副本时长 = `auto_lock_minutes`，见 core::keychain）。
 ///
 /// # Errors
 /// - [`Error::NotInitialized`]：vault 文件不存在；
@@ -66,9 +66,7 @@ pub fn unlock(dirs: &myapikey_core::paths::AppDirs) -> Result<(String, PassSourc
         return Err(Error::NotInitialized);
     }
     let bytes = std::fs::read(&dirs.vault_path)?;
-    let remember_days = myapikey_core::config::AppConfig::load(dirs)
-        .map(|c| c.remember_days)
-        .unwrap_or(7);
+    let minutes = myapikey_core::config::AppConfig::load(dirs).map_or(10, |c| c.auto_lock_minutes);
 
     // 1) 环境变量
     if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
@@ -84,6 +82,11 @@ pub fn unlock(dirs: &myapikey_core::paths::AppDirs) -> Result<(String, PassSourc
     //    凭据库不可用时返回 None，同样降级到输入）
     if let Ok(Some(p)) = keychain::get_with_expiry(dirs) {
         if vault::decrypt(&bytes, &p).is_ok() {
+            // D32 语义补齐（2026-11-11）：免输解锁同样滚动续期——此前只有
+            // 手动输入路径续期，持续使用时免输窗口死板地停在第一次写入的
+            // TTL，一到点就要重输；GUI 侧常驻 tick 是持续滚动的，用户实测
+            // 「CLI 锁定时间比 GUI 短」正是此处缺失
+            let _ = keychain::set_ttl(dirs, &p, minutes);
             return Ok((p, PassSource::Keychain));
         }
         // 记住的密码解不开（已在别处改过）：清掉，避免每次都走一遍无效尝试
@@ -91,15 +94,13 @@ pub fn unlock(dirs: &myapikey_core::paths::AppDirs) -> Result<(String, PassSourc
         eprintln!("Note: the saved passphrase is stale, likely changed on another device. Enter it again.");
     }
 
-    // 3) 交互输入：最多两次机会；成功后按 remember_days 续期记住
+    // 3) 交互输入：最多两次机会；成功后按自动锁定时长续期记住
     for _ in 0..2 {
-        let p = prompt_hidden("Master passphrase");
+        let p = prompt_hidden("Passphrase");
         if vault::decrypt(&bytes, &p).is_ok() {
-            if remember_days > 0 {
-                // 记不住（无头 Linux 等）不视为错误，只提示一次
-                if keychain::set_ttl(dirs, &p, remember_days).is_err() {
-                    eprintln!("Note: cannot remember the passphrase on this machine; it will be asked every time.");
-                }
+            // 记不住（无头 Linux 等）不视为错误，只提示一次
+            if keychain::set_ttl(dirs, &p, minutes).is_err() {
+                eprintln!("Note: cannot remember the passphrase on this machine; it will be asked every time.");
             }
             return Ok((p, PassSource::Prompt));
         }
@@ -108,39 +109,49 @@ pub fn unlock(dirs: &myapikey_core::paths::AppDirs) -> Result<(String, PassSourc
     Err(Error::Decrypt)
 }
 
-/// 设置新主密码：隐藏输入 + 二次确认（dialoguer 内建比对重试），
-/// 过短只警告不阻止（用户自己权衡）；非 TTY 降级为两次行输入比对。
+/// 设置新解锁密码：隐藏输入 + 二次确认（dialoguer 内建比对重试）；
+/// 长度硬性限制（core `vault::validate_passphrase` 同规则：8–128 字符，
+/// 越界原地重问，2026-11-04 用户要求）；非 TTY 降级为两次行输入比对。
 ///
 /// # Errors
-/// 理论上不失败（空密码由组件原地重问）；保留 `Result` 与调用方契约。
+/// 理论上不失败（空密码/不匹配/越界均原地重问）；保留 `Result` 与调用方契约。
 pub fn new_passphrase() -> Result<String> {
-    println!("Set the master passphrase.");
+    println!("Set the passphrase.");
     println!("  If you forget it, ALL data is unrecoverable.\n  Keep it in a password manager.");
-    let p = if is_interactive() {
-        match Password::with_theme(theme())
-            .with_prompt("New master passphrase")
-            .with_confirmation("Confirm passphrase", "Passphrases do not match, try again")
-            .allow_empty_password(false)
-            .interact()
-        {
-            Ok(p) => p,
-            // 组件异常（极少见）时降级到行输入而不是失败
-            Err(_) => new_passphrase_fallback()?,
+    loop {
+        let p = if is_interactive() {
+            match Password::with_theme(theme())
+                .with_prompt("New passphrase")
+                .with_confirmation("Confirm passphrase", "Passphrases do not match, try again")
+                .allow_empty_password(false)
+                .interact()
+            {
+                Ok(p) => p,
+                // 组件异常（极少见）时降级到行输入而不是失败
+                Err(_) => new_passphrase_fallback()?,
+            }
+        } else {
+            new_passphrase_fallback()?
+        };
+        // 长度硬性限制:越界原地重问(与 GUI/后端同一规则)
+        let n = p.chars().count();
+        if n < myapikey_core::vault::PASSPHRASE_MIN_CHARS {
+            println!("  Passphrase must be at least 8 characters; try again.");
+            continue;
         }
-    } else {
-        new_passphrase_fallback()?
-    };
-    if p.chars().count() < 8 {
-        println!("  Warning: shorter than 8 characters. Consider a longer one.");
+        if n > myapikey_core::vault::PASSPHRASE_MAX_CHARS {
+            println!("  Passphrase must be at most 128 characters; try again.");
+            continue;
+        }
+        return Ok(p);
     }
-    Ok(p)
 }
 
 /// 非 TTY 的密码设置：两次行输入比对；EOF（输入耗尽）返回错误退出，
 /// 而不是把空值喂给重试循环死循环（2026-10-26 审查修复）。
 fn new_passphrase_fallback() -> Result<String> {
     loop {
-        let a = prompt_line_opt("New master passphrase: ").ok_or(Error::Usage(
+        let a = prompt_line_opt("New passphrase: ").ok_or(Error::Usage(
             "input ended before the passphrase was set".into(),
         ))?;
         if a.is_empty() {
@@ -157,7 +168,7 @@ fn new_passphrase_fallback() -> Result<String> {
     }
 }
 
-/// 隐藏输入一行敏感信息（不回显）：主密码、API key。
+/// 隐藏输入一行敏感信息（不回显）：解锁密码、API key。
 /// 非 TTY 下降级为回显行输入——脚本场景输入本来就来自管道，可接受。
 pub fn prompt_hidden(label: &str) -> String {
     interact_or(
@@ -167,7 +178,7 @@ pub fn prompt_hidden(label: &str) -> String {
 }
 
 /// 隐藏输入的**可空变体**：回车返回空串而非原地重问——供"Enter keeps
-/// current"语义使用（如 `mak edit` 的 key 保留现值）。dialoguer 的
+/// current"语义使用（如 `makara edit` 的 key 保留现值）。dialoguer 的
 /// `Password` 默认拒绝空输入并静默重问，直接复用 [`prompt_hidden`] 会让
 /// "回车保留"永远无法提交（2026-10-27 用户实测反馈）。
 /// 非 TTY 下降级为回显行输入（回车 = 空串，语义一致）。
@@ -268,10 +279,10 @@ pub fn prompt_line_opt(label: &str) -> Option<String> {
     print!("{label}");
     let _ = std::io::stdout().flush();
     let mut buf = String::new();
+    // EOF(0 行)与读错误同语义:视为无输入
     match std::io::stdin().lock().read_line(&mut buf) {
-        Ok(0) => None,
-        Ok(_) => Some(buf.trim().to_string()),
-        Err(_) => None,
+        Ok(n) if n > 0 => Some(buf.trim().to_string()),
+        _ => None,
     }
 }
 
@@ -303,10 +314,10 @@ pub fn prompt_default(label: &str, current: &str) -> String {
             print!("{label} [{current}]: ");
             let _ = std::io::stdout().flush();
             let mut buf = String::new();
+            // EOF(0 行)与读错误同语义:保留原值
             match std::io::stdin().lock().read_line(&mut buf) {
-                Ok(0) => current.to_string(), // EOF = 保留
-                Ok(_) => buf.trim().to_string(),
-                Err(_) => current.to_string(),
+                Ok(n) if n > 0 => buf.trim().to_string(),
+                _ => current.to_string(),
             }
         },
     )
@@ -387,13 +398,15 @@ pub fn ok(msg: &str) {
 }
 
 /// 警告行标记：黄色 `⚠`（ColorfulTheme 的警告色系），非交互态无色。
+/// 警告与错误同走 stderr（clig.dev：数据/结果归 stdout，诊断归
+/// stderr——管道重定向时日志不被警告污染）。
 pub fn warn(msg: &str) {
     let mark = if is_interactive() {
         "\x1b[33m\u{26a0}\x1b[0m"
     } else {
         "⚠"
     };
-    println!("{mark} {msg}");
+    eprintln!("{mark} {msg}");
 }
 
 /// 是/否确认，回车取默认值；Esc/中断视为否定（保守侧）。
@@ -560,8 +573,8 @@ pub fn select_from_with_default(
     }
 }
 
-/// 交互式选择一条记录（`mak apply` 无 target 时用）：菜单项 =
-/// `name  (protocol · 掩码 key)`，按最近更新倒序（与 `mak list` 一致，
+/// 交互式选择一条记录（`makara apply` 无 target 时用）：菜单项 =
+/// `name  (protocol · 掩码 key)`，按最近更新倒序（与 `makara list` 一致，
 /// 最常用的记录排最前）。返回选中记录的 **id**——调用方用 id 在自己的
 /// 记录集合中定位，绝不返回下标：传入切片与调用方集合的索引基準不同
 /// （调用方可能含墓碑），下标跨集合使用会写错记录（2026-10-27 实锤
@@ -573,7 +586,7 @@ pub fn select_record(records: &[myapikey_core::model::Record]) -> Result<uuid::U
     use myapikey_core::model::Record;
     if records.is_empty() {
         return Err(Error::Usage(
-            "no records yet; add one first with `mak add`".into(),
+            "no records yet; add one first with `makara add`".into(),
         ));
     }
     let mut order: Vec<usize> = (0..records.len()).collect();
@@ -666,36 +679,16 @@ pub fn multiselect_from(items: &[String], prompt: &str, precheck_all: bool) -> V
     picked.into_iter().map(|i| items[i].clone()).collect()
 }
 
-/// 模型清单"小清单"阈值：不超过该数量直接多选勾选；超过则用模糊搜索
-/// 逐个添加（182 个模型的聚合网关清单，翻页多选不可用）。
+/// 模型清单非交互态的返回上限（管道/CI 宁多勿缺，用户可后续裁剪）。
 pub const MODEL_LIST_SMALL_MAX: usize = 12;
 
-/// 清单是否走模糊搜索添加。
-fn models_need_fuzzy(count: usize) -> bool {
-    count > MODEL_LIST_SMALL_MAX
-}
-
-/// 模糊搜索单选（大清单用）：输入即过滤，回车选中；Esc/无匹配视为
-/// 结束选择。返回 `None` = 用户结束。
-fn fuzzy_pick(remaining: &[String], prompt: &str) -> Option<usize> {
-    if !is_interactive() || remaining.is_empty() {
-        return None;
-    }
-    FuzzySelect::with_theme(theme())
-        .with_prompt(format!("{prompt} (type to filter, Esc to finish)"))
-        .items(remaining)
-        .interact_opt()
-        .ok()
-        .flatten()
-}
-
 /// 拉取到的模型清单 → 用户选定的模型列表（通用入口，add/edit/apply
-/// 共用）。分档：
-/// - 清单 ≤ [`MODEL_LIST_SMALL_MAX`]：多选勾选（默认全选）；
-/// - 清单更大：模糊搜索逐个添加（输入过滤 → 回车加入 → 继续/Esc 结束），
-///   避免在大清单里翻页找型号；
-/// - 两种方式都允许退出后手输逗号分隔清单覆盖（端点清单之外的私有
-///   型号也能加）。
+/// 共用）。交互统一为**勾选式**（2026-11-11 用户定稿）：↑↓ 移动、
+/// 空格选中/取消（可反复切换）、回车提交——取代此前「小清单勾选 +
+/// 大清单模糊循环」的双模式：模糊循环选中即加入、无法反悔，用户实测
+/// 不便；长列表滚动浏览，勾错一个空格即可撤回。
+///
+/// 全不选回车 = 可能要填清单之外的私有型号 → 手动输入兜底。
 ///
 /// 非 TTY（管道/CI）：直接返回**前 [`MODEL_LIST_SMALL_MAX`] 项**——
 /// 自动化场景没有交互，宁多勿缺，用户可后续 edit 裁剪。
@@ -703,46 +696,16 @@ pub fn pick_models(fetched: &[String]) -> Vec<String> {
     if fetched.is_empty() {
         return vec![];
     }
-    if is_interactive() {
-        if !models_need_fuzzy(fetched.len()) {
-            let picked = multiselect_from(fetched, "Models to apply", false);
-            if !picked.is_empty() {
-                return picked;
-            }
-            // 全不选 = 可能要填清单之外的型号 → 手动输入兜底
-            return manual_models_fallback();
-        } else {
-            let mut remaining: Vec<String> = fetched.to_vec();
-            let mut chosen: Vec<String> = Vec::new();
-            while let Some(i) = fuzzy_pick(
-                &remaining,
-                &format!("Pick models ({}/{} added)", chosen.len(), fetched.len()),
-            ) {
-                chosen.push(remaining.remove(i));
-                if remaining.is_empty() {
-                    break;
-                }
-            }
-            if !chosen.is_empty() {
-                let raw = prompt_line(&format!(
-                    "Selected: {}
-Enter to keep, or type more (comma-separated): ",
-                    chosen.join(", ")
-                ));
-                for m in parse_comma_list(&raw) {
-                    if !chosen.contains(&m) {
-                        chosen.push(m);
-                    }
-                }
-                return chosen;
-            }
-            // 立即结束（什么都没加）→ 手动输入兜底
-            return manual_models_fallback();
-        }
+    if !is_interactive() {
+        let n = fetched.len().min(MODEL_LIST_SMALL_MAX);
+        return fetched[..n].to_vec();
     }
-    // 非 TTY / 交互被取消：取前 N 项（自动化场景宁多勿缺，可后续裁剪）
-    let n = fetched.len().min(MODEL_LIST_SMALL_MAX);
-    fetched[..n].to_vec()
+    // 全不选回车 = 清单里没有想要的 → 手动输入兜底（私有型号也能填）
+    let picked = multiselect_from(fetched, "Models to apply", false);
+    if picked.is_empty() {
+        return manual_models_fallback();
+    }
+    picked
 }
 
 /// 手动输入兜底（交互选择后一无所获时）：逗号分隔填写；空输入返回空
@@ -780,14 +743,6 @@ pub fn fuzzy_select_one(labels: &[String], prompt: &str, default_idx: usize) -> 
 #[cfg(test)]
 mod model_picker_tests {
     use super::*;
-
-    /// 阈值分派：≤12 多选、>12 模糊。
-    #[test]
-    fn threshold_dispatch() {
-        assert!(!models_need_fuzzy(0));
-        assert!(!models_need_fuzzy(MODEL_LIST_SMALL_MAX));
-        assert!(models_need_fuzzy(MODEL_LIST_SMALL_MAX + 1));
-    }
 
     /// 非 TTY：pick_models 返回前 N 项（宁多勿缺，可后续裁剪）。
     #[test]

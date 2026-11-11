@@ -1,6 +1,6 @@
-//! # myapikey-cli
+//! # makara
 //!
-//! MyApiKey 的终端前端。`myapikey` 与 `mak` 两个二进制共享本 crate 的
+//! Makara 的终端前端。`makara` 二进制使用本 crate 的
 //! [`cli::run`]，行为完全一致（ADR D11）。
 //!
 //! 分层铁律：本 crate 只负责“交互”（参数解析、终端输入输出、剪贴板），

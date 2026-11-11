@@ -1,6 +1,6 @@
 [package]
 name = "myapikey-cli"
-description = "MyApiKey 终端前端（同时产出 myapikey 与 mak 两个二进制）"
+description = "Makara 终端前端（产出 makara 二进制）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,12 +12,8 @@ name = "myapikey_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "myapikey"
+name = "makara"
 path = "src/main.rs"
-
-[[bin]]
-name = "mak"
-path = "src/bin/mak.rs"
 
 [dependencies]
 myapikey-core.workspace = true
@@ -34,3 +30,7 @@ default = ["secret-service"]
 # 透传 myapikey-core 的 secret-service 后端开关，让
 # `cargo install --no-default-features myapikey-cli` 在无头 Linux 上可用。
 secret-service = ["myapikey-core/secret-service"]
+
+# 审查规范 lints(见根 Cargo.toml [workspace.lints])
+[lints]
+workspace = true

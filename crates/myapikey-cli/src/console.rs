@@ -36,27 +36,30 @@ mod imp {
     impl Drop for ConsoleGuard {
         fn drop(&mut self) {
             // 恢复失败（控制台已消失等）无需处理：会话随进程一起结束
-            unsafe {
-                SetConsoleCP(self.in_cp);
-                SetConsoleOutputCP(self.out_cp);
-            }
+            // SAFETY: in_cp 来自构造时对同一控制台的 GetConsoleCP
+            unsafe { SetConsoleCP(self.in_cp) };
+            // SAFETY: out_cp 同上,来自 GetConsoleOutputCP
+            unsafe { SetConsoleOutputCP(self.out_cp) };
         }
     }
 
     /// 把当前控制台切到 UTF-8，返回恢复守卫。
     /// 无控制台（输出重定向到管道/文件）时两个 Get 都返回 0，跳过切换；
     /// 返回的守卫 Drop 时恢复原值（0 值恢复调用无害）。
-    pub fn enter_utf8() -> ConsoleGuard {
-        unsafe {
-            let (in_cp, out_cp) = (GetConsoleCP(), GetConsoleOutputCP());
-            if in_cp != 0 && in_cp != CP_UTF8 {
-                SetConsoleCP(CP_UTF8);
-            }
-            if out_cp != 0 && out_cp != CP_UTF8 {
-                SetConsoleOutputCP(CP_UTF8);
-            }
-            ConsoleGuard { in_cp, out_cp }
+    pub(super) fn enter_utf8() -> ConsoleGuard {
+        // SAFETY: GetConsoleCP 仅读取当前进程控制台的输入代码页属性
+        let in_cp = unsafe { GetConsoleCP() };
+        // SAFETY: GetConsoleOutputCP 仅读取输出代码页属性
+        let out_cp = unsafe { GetConsoleOutputCP() };
+        if in_cp != 0 && in_cp != CP_UTF8 {
+            // SAFETY: CP_UTF8 是合法代码页;0 = 无控制台已被上面跳过
+            unsafe { SetConsoleCP(CP_UTF8) };
         }
+        if out_cp != 0 && out_cp != CP_UTF8 {
+            // SAFETY: 同上,对输出侧代码页
+            unsafe { SetConsoleOutputCP(CP_UTF8) };
+        }
+        ConsoleGuard { in_cp, out_cp }
     }
 }
 

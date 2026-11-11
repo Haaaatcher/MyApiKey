@@ -1,4 +1,4 @@
-//! `myapikey` 二进制入口（与 `mak` 行为完全一致，见 ADR D11）。
+//! `makara` 二进制入口。
 
 use std::io::IsTerminal;
 

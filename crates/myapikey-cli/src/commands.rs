@@ -40,11 +40,11 @@ fn remote_of(c: &Ctx) -> Result<Option<Box<dyn myapikey_core::remote::SyncStore>
     let Some(url) = c.config.remote_repo.clone() else {
         return Ok(None);
     };
+    // 绑定失效折叠为未绑定(2026-11-10 用户拍板:用户只感知绑定与未绑定
+    // 两态,不感知失效):凭据条目不在即按单机处理——sync 给单机引导,
+    // 写操作跳过推送(本地照常保存,重绑后 sync 一次带上去,数据无损)
     let Some(token) = myapikey_core::github::keychain_token()? else {
-        return Err(Error::Usage(
-            "a remote is bound but no GitHub authorization exists on this machine.              Run `mak init` to re-authorize"
-                .into(),
-        ));
+        return Ok(None);
     };
     Ok(Some(myapikey_core::sync::open_remote(&url, &token)?))
 }
@@ -66,7 +66,7 @@ fn load_vault(c: &Ctx, passphrase: &str) -> Result<VaultData> {
 /// 保存与推送是两个独立感知的阶段：
 /// - "Saving…" → 本地加密落盘（成功即数据安全，与网络无关）；
 /// - "Syncing to GitHub…" → 上传（可能因网络失败，失败后本地仍可用，
-///   `mak sync` 补推）。令牌现读现用（重试自然用续期后的新凭据）。
+///   `makara sync` 补推）。令牌现读现用（重试自然用续期后的新凭据）。
 fn save_and_report(c: &mut Ctx, passphrase: &str, data: &VaultData) -> Result<()> {
     let run = |c: &mut Ctx| -> Result<()> {
         // ---- 阶段 1：本地保存（毫秒级，无网络）----
@@ -78,7 +78,7 @@ fn save_and_report(c: &mut Ctx, passphrase: &str, data: &VaultData) -> Result<()
 
         // ---- 阶段 2：推送（auto_push 且已绑远端才执行）----
         if !c.config.auto_push {
-            println!("  Auto-push is off; run `mak sync` to sync manually.");
+            println!("  Auto-push is off; run `makara sync` to sync manually.");
             return Ok(());
         }
         let remote = remote_of(c)?;
@@ -86,39 +86,49 @@ fn save_and_report(c: &mut Ctx, passphrase: &str, data: &VaultData) -> Result<()
             println!("  Standalone mode: nothing to sync.");
             return Ok(());
         };
-        let _spin = prompt::wait_spinner("Syncing to GitHub…");
+        let spin = prompt::wait_spinner("Syncing to GitHub…");
         let expect = c.config.last_sync_sha.clone();
         // 推送失败不整体报错（2026-10-31 审查修复 M2）：本地阶段 1 已
-        // 保存成功，push_pending 已置位，`mak sync` 会补推——两阶段解耦
+        // 保存成功，push_pending 已置位，`makara sync` 会补推——两阶段解耦
         // 的语义就是网络失败不掩盖保存成功
         if let Err(e) = push_initialized(
             remote.as_ref(),
             &c.dirs,
             &mut c.config,
             &bytes,
-            expect,
+            expect.as_deref(),
             data.alive_records().count(),
         ) {
-            drop(_spin);
+            drop(spin);
             prompt::warn(&format!(
-                "Sync failed: {e}\n  Data is saved locally; run `mak sync` to retry."
+                "Sync failed: {e}\n  Data is saved locally; run `makara sync` to retry."
             ));
             return Ok(());
         }
-        drop(_spin);
+        drop(spin);
         prompt::ok("Synced to GitHub");
         Ok(())
     };
-    // 认证失败 → 刷新令牌静默续期后重试一次（与 sync 同策略）
+    // 认证失败 → 刷新令牌静默续期后重试一次（与 sync 同策略）；续期
+    // 失败时把原因并入错误——只看到 401 不知道续期为何没救场，等于
+    // 诊断线索被吞（2026-11-03 修复：原布尔封装吞掉了失败原因）
     match run(c) {
-        Err(e)
-            if sync::is_auth_error(&e.to_string())
-                && myapikey_core::github::try_refresh_and_store(
-                    &myapikey_core::github::effective_client_id()?,
-                ) =>
-        {
-            println!("⟳ GitHub authorization refreshed; retrying…");
-            run(c)
+        Err(e) if sync::is_auth_error(&e.to_string()) => {
+            match myapikey_core::github::refresh_access_token(
+                &myapikey_core::github::effective_client_id()?,
+            ) {
+                Ok(_) => {
+                    myapikey_core::log::info("cli", "token refreshed; retrying command");
+                    println!("⟳ Reconnected to GitHub; retrying…");
+                    run(c)
+                }
+                Err(re) => {
+                    myapikey_core::log::error("cli", &format!("token refresh failed: {re}"));
+                    Err(myapikey_core::Error::Usage(format!(
+                        "{e} — re-bind with: makara remote set <owner/repo>"
+                    )))
+                }
+            }
         }
         other => other,
     }
@@ -134,8 +144,12 @@ fn save_and_report(c: &mut Ctx, passphrase: &str, data: &VaultData) -> Result<()
 /// - 带仓库参数（`owner/name`、完整 URL 或裸名）：跳过询问直接绑定。
 ///
 /// 同步路径自动处理：授权（有效令牌复用，否则浏览器 Device Flow）、
-/// 建仓/复用、数据对账（远端有数据 → 输入主密码接入，密码错误原地
-/// 重问；空仓库 → 设置新主密码并上传基线）。
+/// 建仓/复用、数据对账（远端有数据 → 输入解锁密码接入，密码错误原地
+/// 重问；空仓库 → 设置新解锁密码并上传基线）。
+#[expect(
+    clippy::too_many_lines,
+    reason = "init 的远端探测/授权/建仓/对账编排是线性状态机,拆分会打断阅读顺序"
+)]
 pub fn init(repo: Option<&str>) -> Result<()> {
     let mut c = ctx()?;
     let reinit = c.dirs.is_initialized();
@@ -144,9 +158,9 @@ pub fn init(repo: Option<&str>) -> Result<()> {
     if reinit && repo.is_none() {
         return Err(Error::Usage(
             "already initialized on this machine.\n  \
-             Re-bind / switch repo: mak remote set <owner/repo>\n  \
-             Unbind (standalone):   mak remote unset\n  \
-             Reconcile with remote: mak sync"
+             Re-bind / switch repo: makara remote set <owner/repo>\n  \
+             Unbind (standalone):   makara remote unset\n  \
+             Reconcile with remote: makara sync"
                 .into(),
         ));
     }
@@ -155,7 +169,7 @@ pub fn init(repo: Option<&str>) -> Result<()> {
     let wants_remote =
         repo.is_some() || prompt::confirm("Sync to a private GitHub repository?", true);
 
-    // ---- 分支 A：纯单机（不同步）——设置新的主密码，零远端操作 ----
+    // ---- 分支 A：纯单机（不同步）——设置新的解锁密码，零远端操作 ----
     if !wants_remote {
         let passphrase = match std::env::var(prompt::PASSPHRASE_ENV) {
             Ok(p) if !p.is_empty() => {
@@ -173,13 +187,11 @@ pub fn init(repo: Option<&str>) -> Result<()> {
             false,
             &mut c.config,
         )?;
-        let days = c.config.remember_days;
-        if days > 0 {
-            let _ = keychain::set_ttl(&c.dirs, &passphrase, days);
-        }
+        // 记住副本按统一锁定时长写入（0 = 永不锁定，副本不过期；D32）
+        let _ = keychain::set_ttl(&c.dirs, &passphrase, c.config.auto_lock_minutes);
         prompt::ok("Initialized (standalone).");
         println!("  Vault: {}", c.dirs.vault_path.display());
-        println!("  Bind a remote later: mak remote set <owner/repo>");
+        println!("  Bind a remote later: makara remote set <owner/repo>");
         return Ok(());
     }
 
@@ -190,9 +202,9 @@ pub fn init(repo: Option<&str>) -> Result<()> {
     if reinit {
         return Err(Error::Usage(
             "already initialized on this machine.\n  \
-             Re-bind / switch repo: mak remote set <owner/repo>\n  \
-             Unbind (standalone):   mak remote unset\n  \
-             Reconcile with remote: mak sync"
+             Re-bind / switch repo: makara remote set <owner/repo>\n  \
+             Unbind (standalone):   makara remote unset\n  \
+             Reconcile with remote: makara sync"
                 .into(),
         ));
     }
@@ -214,16 +226,13 @@ pub fn init(repo: Option<&str>) -> Result<()> {
             // 裸名字 → 归属当前授权账号
             _ => (login.clone(), arg.to_string()),
         },
-        None => (
-            login.clone(),
-            myapikey_core::github::DEFAULT_REPO_NAME.to_string(),
-        ),
+        None => (login.clone(), c.config.default_repo_name.clone()),
     };
     if owner != login {
         return Err(Error::Usage(format!(
-            "repo owner `{owner}` does not match the authorized account `{login}`.\n  \
-             mak syncs to a private repo under the authorized account.\n  \
-             Tip: `mak init {name}` places it under your account automatically."
+            "repo owner `{owner}` does not match your GitHub account (`{login}`).\n  \
+             makara syncs to a private repo under your own account.\n  \
+             Tip: `makara init {name}` places it under your account automatically."
         )));
     }
 
@@ -241,125 +250,96 @@ pub fn init(repo: Option<&str>) -> Result<()> {
 
     let record_count;
 
-    match head {
-        Some(h) => {
-            // 发现远端加密数据 → 此刻才要求输入主密码（解锁语义），
-            // 密码错误原地重问；管道 EOF 直接报错退出。
-            // env 密码只读一次、失败即退（2026-10-31 审查修复 M3：读在
-            // 循环体内时，错误的 env 密码 + 交互终端 = 每轮重读同一个
-            // 错误值无限重问）
-            let remote_data;
-            let pw;
-            let env_pw = match std::env::var(prompt::PASSPHRASE_ENV) {
-                Ok(p) if !p.is_empty() => Some(p),
-                _ => None,
-            };
-            loop {
-                let attempt = match &env_pw {
-                    Some(p) => {
-                        println!("Using the passphrase from {}.", prompt::PASSPHRASE_ENV);
-                        p.clone()
-                    }
-                    None => prompt::prompt_hidden_optional("Master passphrase"),
-                };
-                match vault::decrypt(&h.bytes, &attempt) {
-                    Ok(d) => {
-                        remote_data = d;
-                        pw = attempt;
-                        break;
-                    }
-                    Err(_) => {
-                        if !prompt::is_interactive() {
-                            return Err(Error::Usage(
-                                "cannot decrypt the remote vault with the given passphrase. \
-                                 All devices must use the same master passphrase"
-                                    .into(),
-                            ));
-                        }
-                        // env 密码错误没有重试意义（每轮都是同一个值）
-                        if env_pw.is_some() {
-                            return Err(Error::Usage(
-                                "cannot decrypt the remote vault with the passphrase from \
-                                 the environment variable"
-                                    .into(),
-                            ));
-                        }
-                        println!("Wrong passphrase or corrupted data; try again.");
-                    }
-                }
-            }
-            record_count = remote_data.alive_records().count();
-            sync::atomic_write_vault(&c.dirs, &h.bytes)?;
-
-            let mut cfg = c.config.clone();
-            cfg.remote_repo = Some(repo_id.clone());
-            cfg.save(&c.dirs)?;
-            c.config = cfg;
-            // 接入 = 本地与远端一致：统一走 mark_synced 记账（含
-            // last_sync_at——此前手写漏了这个字段，绑定即同步却显示 never）
-            sync::mark_synced(&c.dirs, &mut c.config, h.sha);
-
-            // ---- 按 TTL 记住密码 ----
-            let days = c.config.remember_days;
-            if days > 0 {
-                match keychain::set_ttl(&c.dirs, &pw, days) {
-                    Ok(()) => {}
-                    Err(e) => prompt::warn(&format!(
-                        "Cannot remember the passphrase: {e}\n  It will be asked every time."
-                    )),
-                }
-            }
-
-            prompt::ok(&format!(
-                "Initialized with {}.",
-                plural(record_count as u32, "record")
-            ));
-            if days > 0 {
-                println!(
-                    "  Passphrase remembered for {} (lock: mak passwd unset).",
-                    plural(days, "day")
-                );
-            } else {
-                println!("  Passphrase remembering is disabled.");
-            }
-            println!("  Vault: {}", c.dirs.vault_path.display());
-            Ok(())
-        }
-        None => {
-            // 远端空仓库：设置新的主密码 → 建 vault 上传基线
-            let passphrase = match std::env::var(prompt::PASSPHRASE_ENV) {
-                Ok(p) if !p.is_empty() => {
+    if let Some(h) = head {
+        // 发现远端加密数据 → 此刻才要求输入解锁密码（解锁语义），
+        // 密码错误原地重问；管道 EOF 直接报错退出。
+        // env 密码只读一次、失败即退（2026-10-31 审查修复 M3：读在
+        // 循环体内时，错误的 env 密码 + 交互终端 = 每轮重读同一个
+        // 错误值无限重问）
+        let remote_data;
+        let pw;
+        let env_pw = match std::env::var(prompt::PASSPHRASE_ENV) {
+            Ok(p) if !p.is_empty() => Some(p),
+            _ => None,
+        };
+        loop {
+            let attempt = match &env_pw {
+                Some(p) => {
                     println!("Using the passphrase from {}.", prompt::PASSPHRASE_ENV);
-                    p
+                    p.clone()
                 }
-                _ => new_passphrase()?,
+                None => prompt::prompt_hidden_optional("Passphrase"),
             };
-            c.dirs.ensure_dirs()?;
-            let bytes = vault::encrypt(&VaultData::empty(), &passphrase)?;
-            sync::atomic_write_vault(&c.dirs, &bytes)?;
-            let _new_sha = push_initialized(gh_dyn, &c.dirs, &mut c.config, &bytes, None, 0)?;
-            let mut cfg = c.config.clone();
-            cfg.remote_repo = Some(repo_id.clone());
-            cfg.save(&c.dirs)?;
-            c.config = cfg;
-
-            let days = c.config.remember_days;
-            if days > 0 {
-                let _ = keychain::set_ttl(&c.dirs, &passphrase, days);
+            if let Ok(d) = vault::decrypt(&h.bytes, &attempt) {
+                remote_data = d;
+                pw = attempt;
+                break;
             }
-            prompt::ok("Initialized with an empty vault.");
-            println!("  Baseline uploaded to: https://github.com/{repo_id}");
-            if days > 0 {
-                println!(
-                    "  Passphrase remembered for {} (lock: mak passwd unset).",
-                    plural(days, "day")
-                );
-            } else {
-                println!("  Passphrase remembering is disabled.");
+            if !prompt::is_interactive() {
+                return Err(Error::Usage(
+                    "cannot decrypt the remote vault with the given passphrase. \
+                     All devices must use the same passphrase"
+                        .into(),
+                ));
             }
-            println!("  Vault: {}", c.dirs.vault_path.display());
-            Ok(())
+            // env 密码错误没有重试意义（每轮都是同一个值）
+            if env_pw.is_some() {
+                return Err(Error::Usage(
+                    "cannot decrypt the remote vault with the passphrase from \
+                     the environment variable"
+                        .into(),
+                ));
+            }
+            println!("Wrong passphrase or corrupted data; try again.");
         }
+        record_count = remote_data.alive_records().count();
+        sync::atomic_write_vault(&c.dirs, &h.bytes)?;
+
+        let mut cfg = c.config.clone();
+        cfg.remote_repo = Some(repo_id.clone());
+        cfg.save(&c.dirs)?;
+        c.config = cfg;
+        // 接入 = 本地与远端一致：统一走 mark_synced 记账（含
+        // last_sync_at——此前手写漏了这个字段，绑定即同步却显示 never）
+        sync::mark_synced(&c.dirs, &mut c.config, h.sha);
+
+        // ---- 按 TTL 记住密码(统一锁定时长,0 = 永不过期;D32) ----
+        if let Err(e) = keychain::set_ttl(&c.dirs, &pw, c.config.auto_lock_minutes) {
+            prompt::warn(&format!(
+                "Cannot remember the passphrase: {e}\n  It will be asked every time."
+            ));
+        }
+
+        prompt::ok(&format!(
+            "Initialized with {}.",
+            plural(u32::try_from(record_count).unwrap_or(u32::MAX), "record")
+        ));
+        println!("  Vault: {}", c.dirs.vault_path.display());
+        Ok(())
+    } else {
+        // 远端空仓库：设置新的解锁密码 → 建 vault 上传基线
+        let passphrase = match std::env::var(prompt::PASSPHRASE_ENV) {
+            Ok(p) if !p.is_empty() => {
+                println!("Using the passphrase from {}.", prompt::PASSPHRASE_ENV);
+                p
+            }
+            _ => new_passphrase()?,
+        };
+        c.dirs.ensure_dirs()?;
+        let bytes = vault::encrypt(&VaultData::empty(), &passphrase)?;
+        sync::atomic_write_vault(&c.dirs, &bytes)?;
+        let _new_sha = push_initialized(gh_dyn, &c.dirs, &mut c.config, &bytes, None, 0)?;
+        let mut cfg = c.config.clone();
+        cfg.remote_repo = Some(repo_id.clone());
+        cfg.save(&c.dirs)?;
+        c.config = cfg;
+
+        // 记住副本按统一锁定时长写入(0 = 永不过期;D32)
+        let _ = keychain::set_ttl(&c.dirs, &passphrase, c.config.auto_lock_minutes);
+        prompt::ok("Initialized with an empty vault.");
+        println!("  Baseline uploaded to: https://github.com/{repo_id}");
+        println!("  Vault: {}", c.dirs.vault_path.display());
+        Ok(())
     }
 }
 
@@ -481,10 +461,10 @@ pub fn add(
     let shown_name = record.name.clone();
     data.records.push(record);
     save_and_report(&mut c, &passphrase, &data)?;
-    println!(
-        "✓ Added \"{shown_name}\" (id: {}…)",
+    prompt::ok(&format!(
+        "Added \"{shown_name}\" (id: {}…)",
         &id.simple().to_string()[..8]
-    );
+    ));
 
     // 保存后自动探测一次（失败不阻塞，ADR D5）
     run_probe(&c, &data, &id);
@@ -518,7 +498,7 @@ pub fn list(query: Option<&str>) -> Result<()> {
 
     if rows.is_empty() {
         if query.is_empty() {
-            println!("No records yet. Add the first one with `mak add`.");
+            println!("No records yet. Add the first one with `makara add`.");
         } else {
             println!("No records match your search.");
         }
@@ -538,7 +518,7 @@ pub fn list(query: Option<&str>) -> Result<()> {
     );
     println!("{}", "-".repeat(125));
     for (i, r) in rows.iter().enumerate() {
-        let check = cache.get(&r.id).map(|e| e.status.label()).unwrap_or("-");
+        let check = cache.get(&r.id).map_or("-", |e| e.status.label());
         println!(
             "{} {} {} {} {} {} {}",
             table::pad_to(&(i + 1).to_string(), 4),
@@ -551,7 +531,7 @@ pub fn list(query: Option<&str>) -> Result<()> {
         );
     }
     println!("{}", "-".repeat(125));
-    // 序号定位（#index）只对 `mak list` 的顺序有效；search 按相关度排序，
+    // 序号定位（#index）只对 `makara list` 的顺序有效；search 按相关度排序，
     // 行首序号是显示行号——提示用户用名称或 id 定位，避免对错记录操作
     let locator_hint = if query.is_empty() {
         "<name|#index|id>"
@@ -559,8 +539,8 @@ pub fn list(query: Option<&str>) -> Result<()> {
         "<name|id>"
     };
     println!(
-        "{}. Use `mak show {locator_hint}` for full details",
-        plural(rows.len() as u32, "record")
+        "{}. Use `makara show {locator_hint}` for full details",
+        plural(u32::try_from(rows.len()).unwrap_or(u32::MAX), "record")
     );
     Ok(())
 }
@@ -620,23 +600,39 @@ pub fn show(target: &str, copy: bool) -> Result<()> {
     println!("Updated    : {}", r.updated_at.format("%Y-%m-%d %H:%M"));
 
     if copy {
-        copy_to_clipboard(&r.api_key)?;
+        copy_to_clipboard(&r.api_key);
     } else {
-        println!("\nUse `mak show {target} --copy` to copy the full key to the clipboard.");
+        println!("\nUse `makara key {target}` to copy the full key to the clipboard.");
     }
     Ok(())
 }
 
+/// `key`：把一条记录的完整 key 复制进剪贴板——`show <t> --copy` 的
+/// 直达形态（复制 key 是高频动作，值得独立命令）。安全红线不变：
+/// key 只进剪贴板，永远不打印到终端。
+pub fn key(target: &str) -> Result<()> {
+    let c = ctx()?;
+    require_init(&c)?;
+    let (passphrase, _) = prompt::unlock(&c.dirs)?;
+    let data = load_vault(&c, &passphrase)?;
+    let r = data
+        .records
+        .get(resolve_target(&data, target)?)
+        .ok_or_else(|| Error::NotFound(target.into()))?;
+    copy_to_clipboard(&r.api_key);
+    Ok(())
+}
+
 /// 复制到剪贴板（失败给出手动替代方案，不让命令失败）。
-fn copy_to_clipboard(text: &str) -> Result<()> {
+fn copy_to_clipboard(text: &str) {
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string())) {
         Ok(()) => {
-            println!("✓ API key copied.\n  The CLI cannot auto-clear it — clear the clipboard history after pasting.");
-            Ok(())
+            prompt::ok("API key copied.\n  The CLI cannot auto-clear it — clear the clipboard history after pasting.");
         }
         Err(e) => {
-            println!("⚠ Clipboard copy failed: {e}\n  Try again, or use `mak export` (asks twice) to write it to a file.");
-            Ok(())
+            prompt::warn(&format!(
+                "Clipboard copy failed: {e}\n  Try again, or use `makara export` (asks twice) to write it to a file."
+            ));
         }
     }
 }
@@ -711,7 +707,7 @@ pub fn edit(target: &str) -> Result<()> {
     record.updated_at = chrono::Utc::now();
     let id = record.id;
     save_and_report(&mut c, &passphrase, &data)?;
-    println!("✓ Updated \"{}\"", data.records[idx].name);
+    prompt::ok(&format!("Updated \"{}\"", data.records[idx].name));
     run_probe(&c, &data, &id);
     Ok(())
 }
@@ -734,7 +730,7 @@ pub fn delete(target: &str) -> Result<()> {
     }
     data.records[idx].mark_deleted();
     save_and_report(&mut c, &passphrase, &data)?;
-    println!("✓ Deleted \"{name}\"");
+    prompt::ok(&format!("Deleted \"{name}\""));
     Ok(())
 }
 
@@ -777,12 +773,12 @@ pub fn check(target: Option<&str>) -> Result<()> {
     } else {
         // 全部：核心层并发探测（2026-10-31 一键检测全部）——总耗时从
         // "逐条之和"降为约最慢一条；结果与输入同序，输出表格不变
-        let _spin = prompt::wait_spinner(&format!(
+        let spin = prompt::wait_spinner(&format!(
             "Checking {} concurrently…",
-            plural(targets.len() as u32, "record")
+            plural(u32::try_from(targets.len()).unwrap_or(u32::MAX), "record")
         ));
         let results = probe::probe_all(&targets);
-        drop(_spin);
+        drop(spin);
         for (r, (_id, status, http)) in targets.iter().zip(&results) {
             cache.put(r.id, *status, *http);
             println!(
@@ -810,9 +806,9 @@ fn run_probe(c: &Ctx, data: &VaultData, id: &uuid::Uuid) {
         return;
     };
     // 探测最长 10s 超时（D5），给等待指示
-    let _spin = prompt::wait_spinner("Checking key against the endpoint…");
+    let spin = prompt::wait_spinner("Checking key against the endpoint…");
     let (status, http) = probe::probe(r);
-    drop(_spin);
+    drop(spin);
     println!(
         "Key check: {} {}",
         status.label(),
@@ -821,7 +817,7 @@ fn run_probe(c: &Ctx, data: &VaultData, id: &uuid::Uuid) {
     let mut cache = check_cache::CheckCache::load(&c.dirs);
     cache.put(*id, status, http);
     if let Err(e) = cache.save(&c.dirs) {
-        eprintln!("⚠ Failed to save the check cache: {e}");
+        prompt::warn(&format!("Failed to save the check cache: {e}"));
     }
 }
 
@@ -841,15 +837,14 @@ pub fn sync() -> Result<()> {
     // 认证失败（token 过期/被回收）→ 用刷新令牌静默续期后重试一次；
     // 刷新失败维持原错误（错误文本指向重新授权）
     let run = |c: &mut Ctx| -> Result<SyncOutcome> {
-        let _spin = prompt::wait_spinner("Syncing with remote…");
+        let spin = prompt::wait_spinner("Syncing with remote…");
         let remote = remote_of(c)?;
         let Some(remote) = remote else {
             return Ok(SyncOutcome {
                 alive_records: std::fs::read(&c.dirs.vault_path)
                     .ok()
                     .and_then(|b| vault::decrypt(&b, &passphrase).ok())
-                    .map(|d| d.alive_records().count())
-                    .unwrap_or(0),
+                    .map_or(0, |d| d.alive_records().count()),
                 ..Default::default()
             });
         };
@@ -860,25 +855,33 @@ pub fn sync() -> Result<()> {
             c.config.tombstone_days,
             &mut c.config,
         );
-        drop(_spin);
+        drop(spin);
         out
     };
     let out = match run(&mut c) {
-        Err(e)
-            if sync::is_auth_error(&e.to_string())
-                && myapikey_core::github::try_refresh_and_store(
-                    &myapikey_core::github::effective_client_id()?,
-                ) =>
-        {
-            println!("⟳ GitHub authorization refreshed; retrying sync…");
-            run(&mut c)?
+        Err(e) if sync::is_auth_error(&e.to_string()) => {
+            match myapikey_core::github::refresh_access_token(
+                &myapikey_core::github::effective_client_id()?,
+            ) {
+                Ok(_) => {
+                    myapikey_core::log::info("cli", "token refreshed; retrying sync");
+                    println!("⟳ Reconnected to GitHub; retrying sync…");
+                    run(&mut c)?
+                }
+                Err(re) => {
+                    myapikey_core::log::error("cli", &format!("token refresh failed: {re}"));
+                    Err(myapikey_core::Error::Usage(format!(
+                        "{e} — re-bind with: makara remote set <owner/repo>"
+                    )))?
+                }
+            }
         }
         other => other?,
     };
 
     match (&out.remote, out.pulled, out.pushed) {
         (None, _, _) => println!(
-            "Standalone mode, no remote. Nothing to sync.\n  Bind one with: mak remote set <owner/repo>"
+            "Standalone mode, no remote. Nothing to sync.\n  Bind one with: makara remote set <owner/repo>"
         ),
         (_, true, true) => prompt::ok(&format!(
             "Synced: pulled remote changes{} and pushed",
@@ -895,7 +898,13 @@ pub fn sync() -> Result<()> {
     if let Some(err) = &out.push_error {
         prompt::warn(&format!("Push failed: {err}"));
     }
-    println!("{}", plural(out.alive_records as u32, "active record"));
+    println!(
+        "{}",
+        plural(
+            u32::try_from(out.alive_records).unwrap_or(u32::MAX),
+            "active record"
+        )
+    );
 
     // 同步状态（含 last_sync_at）由 core 的 mark_synced 在"达成一致"
     // 时记账（上传成功/下载替换/已是最新），此处不再手写——单机模式
@@ -907,21 +916,26 @@ pub fn sync() -> Result<()> {
 pub fn status() -> Result<()> {
     let mut c = ctx()?;
     if !c.dirs.is_initialized() {
-        println!("Not initialized. Start with: mak init");
+        println!("Not initialized. Start with: makara init");
         return Ok(());
     }
     // 1.0.0 → 1.1.0 升级迁移（幂等）：升级用户跑一次 status 即恢复绑定
     sync::migrate_legacy_git(&c.dirs, &mut c.config);
     let info = sync::status_summary(&c.dirs, &c.config)?;
 
-    match &info.remote {
+    // 绑定失效折叠为未绑定:凭据条目不在,Remote 显示 none(standalone)
+    let remote_shown = info
+        .remote
+        .clone()
+        .filter(|_| myapikey_core::github::keychain_token().is_ok());
+    match &remote_shown {
         Some(u) => println!("Remote     : {u}"),
         None => println!("Remote     : none (standalone mode)"),
     }
     println!(
         "Unpushed   : {}",
         if info.pending {
-            "yes (run mak sync)"
+            "yes (run makara sync)"
         } else {
             "no"
         }
@@ -937,9 +951,7 @@ pub fn status() -> Result<()> {
     );
 
     // 记录数需要解锁；密码环节失败时只跳过这部分（status 不应强制输密码）
-    if std::env::var(prompt::PASSPHRASE_ENV)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+    if std::env::var(prompt::PASSPHRASE_ENV).is_ok_and(|v| !v.is_empty())
         || keychain::get_with_expiry(&c.dirs).ok().flatten().is_some()
     {
         if let Ok((pass, _)) = prompt::unlock(&c.dirs) {
@@ -965,30 +977,42 @@ pub fn remote(action: RemoteAction) -> Result<()> {
             cfg.remote_repo = Some(repo.clone());
             cfg.save(&c.dirs)?;
             c.config = cfg;
+            myapikey_core::log::info("cli", &format!("remote set: {repo}"));
             prompt::ok(&format!("Remote set: {repo}"));
             // 绑定后确保授权就绪（无有效令牌 → 现场走浏览器授权）：
-            // 用户只感知仓库地址，令牌由 mak 自动打理——set 完 sync 必定可用
+            // 用户只感知仓库地址，令牌由 makara 自动打理——set 完 sync 必定可用
             match ensure_github_token() {
-                Ok(_) => println!("  GitHub ready. Sync now with: mak sync"),
-                Err(e) => prompt::warn(&format!("{e}\n  Sync will fail until authorized.")),
+                Ok(_) => println!("  GitHub ready. Sync now with: makara sync"),
+                Err(e) => prompt::warn(&format!(
+                    "{e}\n  Sync will fail until the binding is complete."
+                )),
             }
         }
-        RemoteAction::Show => match c.config.remote_repo.clone() {
-            Some(repo) => println!("https://github.com/{repo}"),
-            None => println!("no remote bound"),
-        },
+        RemoteAction::Show => {
+            // 绑定失效折叠为未绑定:凭据条目不在即显示 no remote bound
+            // (2026-11-10 用户拍板:用户只感知绑定,不感知失效)
+            let bound = c
+                .config
+                .remote_repo
+                .take_if(|_| myapikey_core::github::keychain_token().is_ok());
+            match bound {
+                Some(repo) => println!("https://github.com/{repo}"),
+                None => println!("no remote bound"),
+            }
+        }
         // 撤销 set：解绑远端并清除本机的 GitHub 授权（回到单机）。
         // 解绑统一走 core 的 unbind_remote（remote_repo + 记账三件套
         // 一次写清，与 mark_synced 对称）。vault 原样不动——数据与
         // 远端仓库都不受影响
         RemoteAction::Unset => {
+            myapikey_core::log::info("cli", "remote unset (unbind + forget authorization)");
             let mut cfg = c.config.clone();
             myapikey_core::sync::unbind_remote(&c.dirs, &mut cfg);
             let token_cleared = myapikey_core::github::keychain_delete_token()?;
-            prompt::ok("Remote unbound; GitHub authorization forgotten.");
+            prompt::ok("Unbound.");
             if token_cleared {
                 println!(
-                    "  The remote repository on GitHub is untouched.\n  Re-bind anytime with: mak remote set <owner/repo>"
+                    "  The remote repository on GitHub is untouched.\n  Re-bind anytime with: makara remote set <owner/repo>"
                 );
             }
         }
@@ -997,14 +1021,13 @@ pub fn remote(action: RemoteAction) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// passwd（set / unset）
+// passwd（set）与 lock
 // ---------------------------------------------------------------------------
 
-/// `passwd`：修改主密码（无参 / `set`）；`unset` 清除本机记住的密码
-/// 副本（立即锁定；vault 不动）。
-pub fn passwd(action: Option<PasswdAction>) -> Result<()> {
+/// `passwd`：修改解锁密码（无参 / `set` 等价；D32 语义统一后 `unset`
+/// 子命令删除，立即锁定改用 `makara lock`）。
+pub fn passwd(action: Option<&PasswdAction>) -> Result<()> {
     match action {
-        Some(PasswdAction::Unset) => return passwd_unset(),
         Some(PasswdAction::Set) | None => {}
     }
     let mut c = ctx()?;
@@ -1014,35 +1037,27 @@ pub fn passwd(action: Option<PasswdAction>) -> Result<()> {
     let data = load_vault(&c, &old_pw)?;
 
     let new_pw = new_passphrase()?;
-    let remote = remote_of(&c)?;
-    let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
-        .as_ref()
-        .map(|r| r as &dyn myapikey_core::remote::SyncStore);
-    sync::save(
-        &c.dirs,
-        &new_pw,
-        &data,
-        remote_dyn,
-        c.config.auto_push,
-        &mut c.config,
-    )?;
+    // 保存+推送走 save_and_report 两阶段展示（2026-11-11 用户指出改密
+    // 后看不到同步过程）：改密是关键操作，静默完成让用户无从确认远端
+    // 是否已更新；推送失败也不硬报错——本地已落新密文，pending 补推
+    save_and_report(&mut c, &new_pw, &data)?;
 
-    // 凭据库同步：统一按 TTL 模型记住新密码（remember_days = 0 时跳过）
-    let remembered = c.config.remember_days > 0
-        && keychain::set_ttl(&c.dirs, &new_pw, c.config.remember_days).is_ok();
-    prompt::ok("Master passphrase changed.");
-    if remembered {
+    // 记住副本随新密码按统一锁定时长重写（0 = 永不锁定 = 副本不过期；
+    // D32 语义统一）。写失败静默：改密码本身已成功，副本缺失只会让
+    // 下次回退手动输入，无损害
+    if keychain::set_ttl(&c.dirs, &new_pw, c.config.auto_lock_minutes).is_ok() {
         println!("  Credential store updated.");
     }
     println!("  Other devices will need the new passphrase on their next sync.");
     Ok(())
 }
 
-/// `passwd unset`：清除本机记住的主密码（立即锁定）。
+/// `makara lock`：立即锁定——清除本机记住的解锁密码副本（vault 不动）。
 ///
-/// TTL 模型下的语义：unset = "现在锁起来"。下次命令会要求输入一次，
-/// 输入后又开始新的记住周期（默认 7 天）——适合借出电脑前手动上锁。
-pub fn passwd_unset() -> Result<()> {
+/// D32 语义统一后接替原 `makara passwd unset`：下次命令要求输入解锁密码，
+/// 输入后又按自动锁定时长重新记住——适合借出电脑前手动上锁。
+pub fn lock_now() -> Result<()> {
+    myapikey_core::log::info("cli", "locked now (remembered copy cleared)");
     let c = ctx()?;
     let cleared = keychain::delete(&c.dirs)?;
     if cleared {
@@ -1061,7 +1076,7 @@ fn push_initialized(
     dirs: &AppDirs,
     cfg: &mut AppConfig,
     bytes: &[u8],
-    expect: Option<String>,
+    expect: Option<&str>,
     alive: usize,
 ) -> Result<String> {
     myapikey_core::sync::push_and_mark(remote, dirs, cfg, bytes, expect, alive)
@@ -1073,34 +1088,29 @@ fn ensure_github_token() -> Result<String> {
     use myapikey_core::github;
     let client_id = github::effective_client_id()?;
 
-    match github::valid_keychain_token()? {
-        Some(t) => {
-            println!("Using the saved GitHub authorization.");
-            Ok(t)
+    if let Some(t) = github::valid_keychain_token()? {
+        println!("Using the existing binding.");
+        Ok(t)
+    } else {
+        let dc = github::start_device_flow(&client_id)?;
+        println!("Finish binding in the browser (one-time):");
+        println!("  1. Open: {}", dc.verification_uri);
+        println!("  2. Enter this code: {}", dc.user_code);
+        if github::open_browser(&dc.verification_uri).is_err() {
+            println!("  Could not open a browser automatically. Copy the link above.");
         }
-        None => {
-            let dc = github::start_device_flow(&client_id)?;
-            println!("GitHub authorization (one-time only):");
-            println!("  1. Open: {}", dc.verification_uri);
-            println!("  2. Enter this code: {}", dc.user_code);
-            if github::open_browser(&dc.verification_uri).is_err() {
-                println!("  Could not open a browser automatically. Copy the link above.");
-            }
-            println!("Waiting for authorization… this continues automatically.");
-            let t = github::poll_device_token(&dc, &client_id)?;
-            // scope 可见化（2026-10-30 排查教训：零权限令牌是黑盒灾难）；
-            // 输出职责在 CLI——core 只回传数据
-            println!(
-                "  Token scopes: {}",
-                t.scope.as_deref().unwrap_or("(none!)")
-            );
-            // refresh token 在 poll 内部已入 keychain（有才写）；这里只存 access
-            github::keychain_set_token(&t.access_token)?;
-            prompt::ok(
-                "Authorized. Token saved to the credential store.\n  Forget it: mak remote unset.",
-            );
-            Ok(t.access_token)
-        }
+        println!("Waiting for you to finish in the browser… this continues automatically.");
+        let t = github::poll_device_token(&dc, &client_id)?;
+        // scope 可见化（2026-10-30 排查教训：零权限令牌是黑盒灾难）进
+        // 日志而非终端——排查依据保留，用户不感知令牌细节
+        myapikey_core::log::info(
+            "cli",
+            &format!("token scopes: {}", t.scope.as_deref().unwrap_or("(none!)")),
+        );
+        // refresh token 在 poll 内部已入 keychain（有才写）；这里只存 access
+        github::keychain_set_token(&t.access_token)?;
+        prompt::ok("Binding complete.\n  Unbind anytime: makara remote unset.");
+        Ok(t.access_token)
     }
 }
 
@@ -1108,15 +1118,15 @@ fn ensure_github_token() -> Result<String> {
 // export / import
 // ---------------------------------------------------------------------------
 
-/// 在目录下生成不冲突的导出文件名：myapikey-export.json，已存在则
-/// myapikey-export-2.json、-3 递增——绝不覆盖用户已有的导出。
+/// 在目录下生成不冲突的导出文件名：makara-export.json，已存在则
+/// makara-export-2.json、-3 递增——绝不覆盖用户已有的导出。
 fn unique_export_path(dir: &Path) -> std::path::PathBuf {
-    let base = dir.join("myapikey-export.json");
+    let base = dir.join("makara-export.json");
     if !base.exists() {
         return base;
     }
     for i in 2u32.. {
-        let p = dir.join(format!("myapikey-export-{i}.json"));
+        let p = dir.join(format!("makara-export-{i}.json"));
         if !p.exists() {
             return p;
         }
@@ -1124,16 +1134,25 @@ fn unique_export_path(dir: &Path) -> std::path::PathBuf {
     unreachable!("序号递增必然找到空位")
 }
 
-/// `export`：明文导出（两次确认 + 0600 权限）。
-pub fn export(path: &Path) -> Result<()> {
+/// `export`：明文导出（两次确认 + 0600 权限）。无参数 = 导出到当前
+/// 目录（2026-11-11 用户要求），复用目录分支的不冲突命名。
+pub fn export(path: Option<&Path>) -> Result<()> {
+    let path = match path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    myapikey_core::log::info(
+        "cli",
+        &format!("plaintext export requested -> {}", path.display()),
+    );
     // 目标是目录：自动生成不冲突的文件名并告知（2026-10-26 主人决议：
     // 不报错、不覆盖已有文件——已存在时递增序号）
     let out_path = if path.is_dir() {
-        let p = unique_export_path(path);
+        let p = unique_export_path(&path);
         println!("Output path is a directory; exporting to: {}", p.display());
         p
     } else {
-        path.to_path_buf()
+        path
     };
     let c = ctx()?;
     require_init(&c)?;
@@ -1148,7 +1167,7 @@ pub fn export(path: &Path) -> Result<()> {
 
     println!(
         "⚠ About to write {} with PLAINTEXT API keys to:",
-        plural(alive.len() as u32, "record")
+        plural(u32::try_from(alive.len()).unwrap_or(u32::MAX), "record")
     );
     println!("  {}", out_path.display());
     println!("  Plaintext is a leak risk — delete it when done.");
@@ -1163,10 +1182,10 @@ pub fn export(path: &Path) -> Result<()> {
         .map_err(|e| Error::Serde(format!("export serialization failed: {e}")))?;
     std::fs::write(&out_path, &json)?;
     restrict_permissions(&out_path);
-    println!(
-        "✓ Exported to {}.\n  Contains plaintext keys. Delete it when done",
+    prompt::ok(&format!(
+        "Exported to {}.\n  Contains plaintext keys. Delete it when done",
         out_path.display()
-    );
+    ));
     Ok(())
 }
 
@@ -1185,6 +1204,7 @@ fn restrict_permissions(path: &Path) {
 
 /// `import`：从 JSON 导入（兼容导出格式与裸数组）。
 pub fn import(path: &Path) -> Result<()> {
+    myapikey_core::log::info("cli", &format!("import from {}", path.display()));
     let mut c = ctx()?;
     require_init(&c)?;
     let _guard = lock::acquire(&c.dirs)?;
@@ -1208,25 +1228,36 @@ pub fn import(path: &Path) -> Result<()> {
     let (passphrase, _) = prompt::unlock(&c.dirs)?;
     let mut data = load_vault(&c, &passphrase)?;
 
-    let (mut added, mut updated) = (0usize, 0usize);
-    for mut r in imported {
-        match data.records.iter_mut().find(|x| x.id == r.id) {
-            // 同 id：按 updated_at 新者胜，导入数据与手工编辑同一套语义
-            Some(existing) => {
-                if r.updated_at > existing.updated_at {
-                    *existing = r;
-                    updated += 1;
-                }
-            }
-            None => {
-                r.updated_at = chrono::Utc::now();
-                data.records.push(r);
-                added += 1;
-            }
-        }
+    // 合并在 core（与 GUI 导入共用同一语义，D47）
+    let report = myapikey_core::merge::import_records(&mut data, imported, chrono::Utc::now());
+    if report.added + report.updated == 0 {
+        // 幂等导入（逐条全部跳过，如导入刚导出的文件）：数据未变——
+        // 不重加密落盘、不推送，避免一次无意义的远端空提交
+        // （2026-11-11 用户指出）
+        prompt::ok("Import done: 0 added, 0 updated.");
+        return Ok(());
+    }
+    // 导入前快照（D52）：被覆盖的本地旧版本写当前目录——误导入时数据
+    // 有保底（明文文件，权限收紧，用完即删；其 updated_at 早于现数据，
+    // 直接再导入会被 LWW 跳过——是保底而非一键回滚）
+    if !report.overwritten.is_empty() {
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let snap = std::path::PathBuf::from(format!("makara-import-backup-{ts}.json"));
+        let json = serde_json::to_string_pretty(&report.overwritten)
+            .map_err(|e| Error::Usage(format!("cannot serialize the backup: {e}")))?;
+        std::fs::write(&snap, json)?;
+        restrict_permissions(&snap);
+        prompt::warn(&format!(
+            "{} record(s) were overwritten. Pre-import snapshot: {}",
+            report.overwritten.len(),
+            snap.display()
+        ));
     }
     save_and_report(&mut c, &passphrase, &data)?;
-    println!("✓ Import done: {added} added, {updated} updated.");
+    prompt::ok(&format!(
+        "Import done: {} added, {} updated.",
+        report.added, report.updated
+    ));
     Ok(())
 }
 
@@ -1245,31 +1276,240 @@ pub fn version() -> Result<()> {
     Ok(())
 }
 
-/// `update`：联网查最新 Release 并提示升级命令。
+/// `update`：联网查最新 Release，对照当前版本；有新版时**零依赖自更新**
+/// ——下载 GitHub Release 的平台压缩包、解压、替换自身（D40），全程
+/// 不要求 cargo / Rust 工具链（产品面向大众用户）。
+///
+/// Windows 自锁的解法（D16 当年放弃自替换的原因）：运行中的 exe 不能
+/// 被覆盖，但**可以重命名**——先把自身改名备份，新二进制落到原路径，
+/// 下次启动即新版。非交互环境（管道/脚本）不自动动手，只打印直链。
 /// 网络失败/无 Release 都不报错——检查只是增强，不该让命令失败。
 pub fn update() -> Result<()> {
-    // GitHub API 网络请求，给等待指示（失败不阻塞，见下）
-    let _spin = prompt::wait_spinner("Checking for updates…");
-    let release = myapikey_core::github::latest_release_tag();
-    drop(_spin);
+    let current = env!("CARGO_PKG_VERSION");
+    println!("Current version: v{current}");
+    // GitHub API 网络请求，给等待指示（失败不阻塞，见下）。
+    // 令牌从凭据库带上：匿名限额 60 次/小时/IP 对检查太紧，有授权升到
+    // 5000/小时；未授权机器降级匿名调用，行为不变
+    let token = myapikey_core::github::keychain_token()?;
+    let spin = prompt::wait_spinner("Checking for updates…");
+    let release = myapikey_core::github::latest_release_tag(token.as_deref());
+    drop(spin);
     match release {
         Ok(Some(tag)) => {
             let latest = tag.trim_start_matches('v');
-            let current = env!("CARGO_PKG_VERSION");
+            println!("Latest version:  {tag}");
             if is_newer(latest, current) {
-                // 目前唯一实际可用的更新通道是 cargo（2026-10-26 主人确认：
-                // Release 二进制分发尚未启用）。--tag 锁定与提示一致的版本，
-                // 避免装到 main 分支未发布的代码
-                println!("New version {latest} is available.");
-                println!("  Upgrade: cargo install --git https://github.com/Haaaatcher/MyApiKey --tag {tag} myapikey-cli");
+                // 有新版直接自更新，不询问（2026-11-11 用户拍板的流程）；
+                // 仅限交互终端——管道/脚本里静默替换二进制有意外性，
+                // 降级为打印直链（安全侧）
+                println!("⚠ A newer version is available.");
+                if prompt::is_interactive() {
+                    do_upgrade(&tag)?;
+                } else {
+                    let (url, _) = release_asset(&tag)?;
+                    println!("  Download manually: {url}");
+                }
             } else {
-                println!("Up to date.");
+                prompt::ok("Up to date.");
             }
         }
         Ok(None) => println!("No releases published yet."),
         Err(e) => println!("Could not check for updates: {e}"),
     }
     Ok(())
+}
+
+/// 当前编译目标对应的 Release 附件平台串（与 release.yml 矩阵一一
+/// 对齐）；无预编译包的平台返回 `None`，`update` 给出手动下载出路。
+fn release_target() -> Option<&'static str> {
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("x86_64-pc-windows-msvc")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("aarch64-apple-darwin")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("x86_64-apple-darwin")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("x86_64-unknown-linux-gnu")
+    } else {
+        None
+    }
+}
+
+/// 最新 tag 对应的平台附件直链与扩展名（CI 平铺打包：包内根直接是
+/// 二进制）。完整 URL 形如
+/// `…/releases/download/v1.1.1/makara-v1.1.1-x86_64-pc-windows-msvc.zip`。
+fn release_asset(tag: &str) -> Result<(String, &'static str)> {
+    let target = release_target().ok_or_else(|| {
+        Error::Usage(
+            "no prebuilt binary for this platform.\n  \
+             Download from: https://github.com/Haaaatcher/MyApiKey/releases"
+                .into(),
+        )
+    })?;
+    let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
+    let url = format!(
+        "https://github.com/Haaaatcher/MyApiKey/releases/download/{tag}/makara-{tag}-{target}.{ext}"
+    );
+    Ok((url, ext))
+}
+
+/// 下载附件，TTY 下行内百分比进度（`\r` 刷新），管道/脚本静默。
+/// 下载在 core 完成（复用其 HTTP 栈），这里只负责进度呈现。
+fn download_asset(url: &str, dest: &Path) -> Result<()> {
+    use std::io::Write as _;
+    let token = myapikey_core::github::keychain_token()?;
+    let show = prompt::is_interactive();
+    myapikey_core::github::download_asset(token.as_deref(), url, dest, &mut |done, total| {
+        if show {
+            match total {
+                Some(t) if t > 0 => print!("\r  Downloading… {}%", done * 100 / t),
+                // 总长未知：退化为已下载量（整数 KiB，免浮点转换）
+                _ => print!("\r  Downloading… {} KiB", done / 1024),
+            }
+            std::io::stdout().flush().ok();
+        }
+    })?;
+    if show {
+        println!("\r  Downloading… 100%");
+    }
+    Ok(())
+}
+
+/// 解压更新包：Windows 与 POSIX 都用系统自带 tar（Windows 10 1803+
+/// 内置 bsdtar，支持 zip 读取）——零新依赖。
+fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
+    let mut cmd = std::process::Command::new("tar");
+    if cfg!(windows) {
+        cmd.arg("-xf");
+    } else {
+        cmd.arg("-xzf");
+    }
+    let status = cmd
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .status()
+        .map_err(|e| Error::Usage(format!("cannot run the system tar: {e}")))?;
+    if !status.success() {
+        return Err(Error::Usage(format!(
+            "extract failed (tar exit code {}).\n  \
+             Download and update manually: https://github.com/Haaaatcher/MyApiKey/releases",
+            status.code().unwrap_or(-1)
+        )));
+    }
+    Ok(())
+}
+
+/// 用新二进制替换自身（D40 的核心技巧）：拷到同目录暂存名 → 自身
+/// 改名 `.update-old`（Windows 允许重命名运行中的 exe，句柄保持有效）
+/// → 暂存名落位；落位失败把备份放回原位（回滚），`.old` 残留无害。
+fn replace_self(new_bin: &Path) -> Result<()> {
+    let cur = std::env::current_exe()
+        .map_err(|e| Error::Usage(format!("cannot locate the running binary: {e}")))?;
+    let staging = cur.with_extension("update-new");
+    let backup = cur.with_extension("update-old");
+    std::fs::copy(new_bin, &staging)?;
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(&cur, &backup)
+        .map_err(|e| Error::Usage(format!("cannot rename the running binary: {e}")))?;
+    if let Err(e) = std::fs::rename(&staging, &cur) {
+        // 回滚：优先把备份 rename 回原位；rename 也失败（极罕见）则用
+        // copy 兜底——无论如何不能让 makara 命令从磁盘上消失
+        if std::fs::rename(&backup, &cur).is_err() {
+            let _ = std::fs::copy(&backup, &cur);
+        }
+        return Err(Error::Usage(format!("cannot place the new binary: {e}")));
+    }
+    Ok(())
+}
+
+/// 检查通过后的升级动作：下载（行内进度 + sha256 校验）→ 解压 →
+/// 替换自身。每步一行状态；任一步失败即上抛（用户回到可手动下载的
+/// 出路）。临时目录成败都清理（④）。
+fn do_upgrade(tag: &str) -> Result<()> {
+    let tmp = std::env::temp_dir().join(format!("makara-update-{tag}"));
+    std::fs::create_dir_all(&tmp)
+        .map_err(|e| Error::Usage(format!("cannot create a temp dir: {e}")))?;
+    let result = do_upgrade_in(tag, &tmp);
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+fn do_upgrade_in(tag: &str, tmp: &Path) -> Result<()> {
+    let (url, ext) = release_asset(tag)?;
+    let archive = tmp.join(format!("makara-{tag}.{ext}"));
+    let hash_url = format!("{url}.sha256");
+    let hash_file = tmp.join(format!("makara-{tag}.{ext}.sha256"));
+    download_asset(&url, &archive)?;
+    // 完整性校验（D40 后续加强落地）：Release 附件旁的 .sha256 与
+    // 本地文件逐一比对（⑥）
+    download_asset(&hash_url, &hash_file)?;
+    let expected = parse_sha256_file(&hash_file);
+    let actual = sha256_of_file(&archive)?;
+    if let Some(expected) = expected {
+        if !expected.eq_ignore_ascii_case(&actual) {
+            return Err(Error::Usage(format!(
+                "checksum mismatch (expected {expected}, got {actual}).\n  \
+                 Download and update manually: https://github.com/Haaaatcher/MyApiKey/releases"
+            )));
+        }
+    }
+    println!("  Extracting…");
+    extract_archive(&archive, tmp)?;
+    let bin = tmp.join(if cfg!(windows) {
+        "makara.exe"
+    } else {
+        "makara"
+    });
+    if !bin.exists() {
+        return Err(Error::Usage(format!(
+            "unexpected archive layout (no {} inside)",
+            bin.display()
+        )));
+    }
+    println!("  Replacing binary…");
+    replace_self(&bin)?;
+    println!("✓ Upgraded to {tag}.");
+    println!("  Takes effect on the next launch.");
+    Ok(())
+}
+
+/// 解析 .sha256 附件：`sha256sum` 形态（`<hash>  <filename>`）取第一
+/// 段；解析失败返回 `None`（跳过校验不阻塞）。
+fn parse_sha256_file(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let hash = text.split_whitespace().next()?.to_string();
+    (hash.len() == 64).then_some(hash)
+}
+
+/// 用系统工具算文件 SHA-256（零依赖：Windows `certutil` / POSIX
+/// `sha256sum`），返回小写十六进制。
+fn sha256_of_file(path: &Path) -> Result<String> {
+    let output = if cfg!(windows) {
+        std::process::Command::new("certutil")
+            .args(["-hashfile"])
+            .arg(path)
+            .arg("SHA256")
+            .output()
+    } else {
+        std::process::Command::new("sha256sum").arg(path).output()
+    }
+    .map_err(|e| Error::Usage(format!("cannot run the hash tool: {e}")))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // certutil 的输出混有「SHA256」标题与本地化说明，只有哈希行整行
+    // 均为十六进制——按行精确提取，避免字符级过滤混入标题里的数字
+    let hex = if cfg!(windows) {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| l.len() >= 60 && l.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect::<String>()
+    } else {
+        text.split_whitespace().next().unwrap_or("").to_string()
+    };
+    if hex.len() != 64 {
+        return Err(Error::Usage("cannot compute the file checksum".into()));
+    }
+    Ok(hex.to_ascii_lowercase())
 }
 
 /// 语义化版本比较：`candidate` 是否严格新于 `current`。
@@ -1289,7 +1529,7 @@ fn is_newer(candidate: &str, current: &str) -> bool {
 
 // ---------------------------------------------------------------------------
 // M5 生态集成：apply / restore（供给 = 写配置文件，D21）。
-// 环境变量供给（mak env）已按 D21 移除——不做用不上的能力。
+// 环境变量供给（makara env）已按 D21 移除——不做用不上的能力。
 // ---------------------------------------------------------------------------
 
 /// 逗号分隔的模型名解析：逐项 trim、去空（中英逗号都接受）。
@@ -1317,9 +1557,9 @@ fn fetch_models_interactive(
         api_key.to_string(),
     );
     // 网络拉取，同样给等待指示
-    let _spin = prompt::wait_spinner("Fetching model list from the endpoint…");
+    let spin = prompt::wait_spinner("Fetching model list from the endpoint…");
     let fetched = probe::fetch_models(&tmp);
-    drop(_spin);
+    drop(spin);
     if let Some(fetched) = fetched {
         // 展示：≤8 个全列；更多只列前 8 + 总数（中转端可能返回上百个）
         let preview = if fetched.len() <= 8 {
@@ -1343,7 +1583,83 @@ fn fetch_models_interactive(
 #[cfg(test)]
 mod tests {
     //! 版本比较回归（D16）：提示新版本的前提是比较不误报。
-    use super::{is_newer, parse_model_list};
+    //! 自更新机制回归（D40）：解压与 rename 替换是全链路里唯一能在
+    //! 无网络环境下验证的核心——真链路待真实发版自然验证。
+    use super::{extract_archive, is_newer, parse_model_list, release_asset, replace_self};
+
+    /// 平台附件 URL 形态（D40）：仓库前缀、tag、目标串与扩展名全部
+    /// 就位——自更新下载按它构造，错一个字符就是 404。
+    #[test]
+    fn release_asset_url_shape() {
+        let (url, ext) = release_asset("v9.9.9").expect("当前编译平台应有预编译包");
+        assert!(url.starts_with(
+            "https://github.com/Haaaatcher/MyApiKey/releases/download/v9.9.9/makara-v9.9.9-"
+        ));
+        if cfg!(windows) {
+            assert_eq!(ext, "zip");
+            assert!(url.ends_with("x86_64-pc-windows-msvc.zip"));
+        } else {
+            assert_eq!(ext, "tar.gz");
+            assert!(url.ends_with(".tar.gz"));
+        }
+    }
+
+    /// 解压机制（D40）：构造一个与 release.yml 平铺打包同构的 tar.gz，
+    /// 解压后包根直接是二进制——自更新按包根取文件。
+    #[test]
+    fn extract_archive_flattens_ci_layout() {
+        let tmp = std::env::temp_dir().join(format!("mak-extract-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("临时目录创建");
+        // 构造包：与 release.yml 打包同构（tar -C pkg makara.exe）
+        let payload = tmp.join("makara.exe");
+        std::fs::write(&payload, b"fake binary").expect("写假二进制");
+        let archive = tmp.join("update.tar.gz");
+        let built = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&tmp)
+            .arg("makara.exe")
+            .status()
+            .expect("系统 tar 可用")
+            .success();
+        assert!(built, "构造 tar.gz 失败");
+        let out = tmp.join("out");
+        std::fs::create_dir_all(&out).expect("输出目录创建");
+        extract_archive(&archive, &out).expect("解压成功");
+        assert_eq!(
+            std::fs::read(out.join("makara.exe")).expect("读解压产物"),
+            b"fake binary",
+            "解压产物应与原始文件一致"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 替换机制（D40）——rename 策略三断言：原路径落位新内容、备份
+    /// 存在、内容正确。current_exe 是测试二进制自身，与真实场景同构
+    /// （Windows 重命名运行中的 exe 合法，句柄保持）。
+    #[test]
+    fn replace_self_swaps_binary_and_keeps_backup() {
+        let cur = std::env::current_exe().expect("current exe");
+        let dir = cur.parent().expect("exe 目录");
+        // "新版" = 自身的一个副本：验证对象是替换机制而非文件内容
+        let fake = dir.join("makara-selftest-new.bin");
+        std::fs::copy(&cur, &fake).expect("构造新版");
+        replace_self(&fake).expect("替换成功");
+        let backup = cur.with_extension("update-old");
+        assert!(cur.exists(), "原路径应存在落位的新二进制");
+        assert!(backup.exists(), "旧版备份应存在");
+        assert_eq!(
+            std::fs::read(&cur).expect("读落位文件"),
+            std::fs::read(&fake).expect("读新版"),
+            "落位内容应与新版一致"
+        );
+        // 备份指向正在运行的测试 exe——Windows 锁定运行中文件的删除，
+        // 残留是机制的自然产物（真实场景由下次 update 的 replace_self
+        // 顺手清理：那时旧文件已不在运行）
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(&fake);
+    }
 
     #[test]
     fn semver_compare() {
@@ -1367,7 +1683,7 @@ mod tests {
             vec!["GLM-5.2", "GLM-5-Air"]
         );
         assert_eq!(parse_model_list("a，b"), vec!["a", "b"]);
-        assert!(parse_model_list(" , ,").is_empty());
-        assert!(parse_model_list("").is_empty());
+        assert_eq!(parse_model_list(" , ,"), [] as [std::string::String; 0]);
+        assert_eq!(parse_model_list(""), [] as [std::string::String; 0]);
     }
 }

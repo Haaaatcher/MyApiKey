@@ -7,10 +7,10 @@ use crate::commands;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-/// 顶层命令行定义。`mak` 与 `myapikey` 共用。
+/// 顶层命令行定义。`makara` 与 `myapikey` 共用。
 #[derive(Debug, Parser)]
 #[command(
-    name = "myapikey",
+    name = "makara",
     version,
     about = "Record and sync AI API credentials. Encrypted, synced via your own GitHub private repo",
     disable_help_subcommand = true
@@ -25,7 +25,7 @@ pub struct Cli {
 pub enum Command {
     /// 初始化：设主密码、建本地仓库，可选绑远端。
     #[command(
-        about = "Initialize: set the master passphrase, create the local repo, optionally bind a remote"
+        about = "Initialize: set the passphrase, create the local repo, optionally bind a remote"
     )]
     /// 初始化本机（已初始化时自动转为保险合并式重绑，数据不丢）。
     ///
@@ -107,6 +107,14 @@ pub enum Command {
         copy: bool,
     },
 
+    /// 复制一条记录的完整 key 到剪贴板（key 永不打印到终端）。
+    #[command(about = "Copy a record's API key to the clipboard (the key is never printed)")]
+    Key {
+        /// 记录的 id（前缀即可）或名称。
+        #[arg(help = "Record id, prefix ok, or name")]
+        target: String,
+    },
+
     /// 编辑一条记录。
     #[command(about = "Edit a record field by field. Enter keeps the current value")]
     Edit {
@@ -146,22 +154,27 @@ pub enum Command {
         action: RemoteAction,
     },
 
-    /// 修改主密码（无参）；或清除本机记住的密码副本（`unset` 子命令）。
-    #[command(
-        subcommand_required = false,
-        about = "Change the master passphrase, or `unset` to clear the remembered copy on this machine"
-    )]
+    /// 修改解锁密码（无参）。
+    #[command(subcommand_required = false, about = "Change the passphrase")]
     Passwd {
         #[command(subcommand)]
         action: Option<PasswdAction>,
     },
 
+    /// 立即锁定：清除本机记住的解锁密码（vault 不变）。
+    #[command(
+        about = "Lock now: forget the remembered passphrase on this machine (the vault is untouched)"
+    )]
+    Lock,
+
     /// 明文导出。
-    #[command(about = "Export all records to a JSON file in PLAINTEXT. Asks twice before writing")]
+    #[command(
+        about = "Export all records to a JSON file in PLAINTEXT. Asks twice before writing; no argument = the current directory"
+    )]
     Export {
-        /// 导出文件路径。
-        #[arg(help = "Output file path")]
-        path: PathBuf,
+        /// 导出文件路径（省略 = 当前目录下 makara-export.json）。
+        #[arg(help = "Output file path (default: current directory)")]
+        path: Option<PathBuf>,
     },
 
     /// 导入。
@@ -189,17 +202,12 @@ pub enum RemoteAction {
     Unset,
 }
 
-/// `mak passwd` 的子命令。
+/// `makara passwd` 的子命令。
 #[derive(Debug, clap::Subcommand)]
 pub enum PasswdAction {
-    /// 修改主密码（`mak passwd` 无参的等价显式形式）。
-    #[command(about = "Change the master passphrase")]
+    /// 修改解锁密码（`makara passwd` 无参的等价显式形式）。
+    #[command(about = "Change the passphrase")]
     Set,
-    /// 清除本机记住的主密码（立即锁定；vault 不变）。
-    #[command(
-        about = "Clear the remembered master passphrase on this machine (locks immediately; the vault is untouched)"
-    )]
-    Unset,
 }
 
 /// 入口：控制台编码守卫 → 解析 + 分发。
@@ -211,6 +219,15 @@ pub enum PasswdAction {
 /// 子命令的任何错误原样上抛。
 pub fn run() -> myapikey_core::Result<()> {
     let _console_guard = crate::console::enter_utf8();
+    // 文件日志:静默动作(自动续期/迁移抢救/降级)落文件可查;目录来自
+    // AppDirs(尊重 MYAPIKEY_HOME 隔离)。init 失败(目录建不了)降级无日志
+    if let Ok(dirs) = myapikey_core::paths::AppDirs::load() {
+        myapikey_core::log::init(&dirs.config_dir);
+        if let Ok(cfg) = myapikey_core::config::AppConfig::load(&dirs) {
+            myapikey_core::log::set_level(&cfg.log_level);
+        }
+        myapikey_core::log::info("cli", "command started");
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Init { repo } => commands::init(repo.as_deref()),
@@ -226,14 +243,16 @@ pub fn run() -> myapikey_core::Result<()> {
         Command::List => commands::list(None),
         Command::Search { query } => commands::list(Some(&query)),
         Command::Show { target, copy } => commands::show(&target, copy),
+        Command::Key { target } => commands::key(&target),
         Command::Edit { target } => commands::edit(&target),
         Command::Delete { target } => commands::delete(&target),
         Command::Check { target } => commands::check(target.as_deref()),
         Command::Sync => commands::sync(),
         Command::Status => commands::status(),
         Command::Remote { action } => commands::remote(action),
-        Command::Passwd { action } => commands::passwd(action),
-        Command::Export { path } => commands::export(&path),
+        Command::Passwd { action } => commands::passwd(action.as_ref()),
+        Command::Lock => commands::lock_now(),
+        Command::Export { path } => commands::export(path.as_deref()),
         Command::Import { path } => commands::import(&path),
     }
 }
