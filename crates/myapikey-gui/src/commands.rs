@@ -14,13 +14,18 @@
 //! - 纯内存命令（lock / list / reveal / copy）保持同步，零开销。
 //!
 //! `State<'_>` 的借用不能逃出 async 函数体（Tauri 的生命周期约束），
-//! 统一先 `state.inner().clone()` 克隆 `Arc` 再移动进闭包。
+//! 统一先 `Arc::clone(state.inner())` 克隆 `Arc` 再移动进闭包。
 
 use crate::SharedState;
+use std::sync::Arc;
+
 use tauri::State;
 
-/// ops 错误 → 前端可展示字符串。
-fn err_str(e: myapikey_core::Error) -> String {
+/// ops 错误 → 前端可展示字符串。**统一日志出口**：完整错误链在此落
+/// 文件日志(error 级)——界面只展示简短现象，排查依据在日志里
+/// (2026-11-05 用户需求：错误详情不进悬停/弹窗)。
+fn err_str(e: &myapikey_core::Error) -> String {
+    myapikey_core::log::error("commands", &e.to_string());
     e.to_string()
 }
 
@@ -33,44 +38,52 @@ fn join_err(e: impl std::fmt::Display) -> String {
 /// 启动状态（读凭据库判断“一键解锁”是否可用，放线程池）。
 #[tauri::command]
 pub async fn gui_state(state: State<'_, SharedState>) -> Result<crate::GuiState, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::state_view(&shared))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 手动输入解锁（Argon2 派生约 1 秒，放线程池）。
 #[tauri::command]
 pub async fn unlock(passphrase: String, state: State<'_, SharedState>) -> Result<(), String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::unlock_with(&shared, &passphrase))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 一键解锁：用记忆中的密码（读凭据库 + Argon2，放线程池）。
 /// false = 无可用记忆，前端回退手动输入。
 #[tauri::command]
 pub async fn unlock_remembered(state: State<'_, SharedState>) -> Result<bool, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::unlock_remembered(&shared))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 手动锁定（纯内存，同步即可）。
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri 命令签名由 IPC 框架反序列化决定"
+)]
 pub fn lock(state: State<'_, SharedState>) {
     crate::lock(state.inner());
 }
 
 /// 记录列表（掩码；会话内存 + 本机缓存文件，同步即可）。
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri 命令签名由 IPC 框架反序列化决定"
+)]
 pub fn list_records(state: State<'_, SharedState>) -> Result<Vec<crate::RecordView>, String> {
-    crate::list_view(state.inner()).map_err(err_str)
+    crate::list_view(state.inner()).map_err(|e| err_str(&e))
 }
 
 /// 新增/编辑记录（重加密 + git commit/push，放线程池）。
@@ -80,49 +93,65 @@ pub async fn save_record(
     editing_id: Option<String>,
     state: State<'_, SharedState>,
 ) -> Result<crate::RecordView, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
         crate::save_record(&shared, input, editing_id.as_deref())
     })
     .await
-    .map_err(join_err)?
-    .map_err(err_str)
+    .map_err(|e| join_err(&e))?
+    .map_err(|e| err_str(&e))
 }
 
 /// 删除记录（重加密 + git commit/push，放线程池）。
 #[tauri::command]
 pub async fn delete_record(id: String, state: State<'_, SharedState>) -> Result<(), String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::delete_record(&shared, &id))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 显式查看完整 key（reveal 按钮；纯内存，同步即可）。
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri 命令签名由 IPC 框架反序列化决定"
+)]
 pub fn reveal_key(id: String, state: State<'_, SharedState>) -> Result<String, String> {
-    crate::reveal_key(state.inner(), &id).map_err(err_str)
+    crate::reveal_key(state.inner(), &id).map_err(|e| err_str(&e))
 }
 
 /// 复制 key（30 秒后自动清除；剪贴板写入是毫秒级，同步即可）。
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri 命令签名由 IPC 框架反序列化决定"
+)]
 pub fn copy_key(id: String, state: State<'_, SharedState>) -> Result<(), String> {
-    crate::copy_key(state.inner(), &id).map_err(err_str)
+    crate::copy_key(state.inner(), &id).map_err(|e| err_str(&e))
 }
 
 /// 复制 Base URL（非敏感，不自动清除；字段级复制）。
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri 命令签名由 IPC 框架反序列化决定"
+)]
 pub fn copy_base_url(id: String, state: State<'_, SharedState>) -> Result<(), String> {
     crate::copy_base_url(state.inner(), &id)
         .map(|_| ())
-        .map_err(err_str)
+        .map_err(|e| err_str(&e))
 }
 
 /// 复制任意文本（授权码等短期非敏感值，不自动清除）。
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri 命令签名由 IPC 框架反序列化决定"
+)]
 pub fn copy_text(text: String) -> Result<(), String> {
-    crate::copy_plain(&text).map_err(err_str)
+    crate::copy_plain(&text).map_err(|e| err_str(&e))
 }
 
 /// 校验单条记录（网络请求最长 10 秒，必须放线程池）。
@@ -131,11 +160,11 @@ pub async fn check_key(
     id: String,
     state: State<'_, SharedState>,
 ) -> Result<crate::CheckView, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::check_key(&shared, &id))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 一键校验全部记录（核心层并发探测，总耗时约最慢一条；放线程池）。
@@ -145,41 +174,101 @@ pub async fn check_all_keys(
     on_progress: tauri::ipc::Channel<crate::CheckResultView>,
     state: State<'_, SharedState>,
 ) -> Result<Vec<crate::CheckResultView>, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::check_all_keys(&shared, &on_progress))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 同步（git fetch/merge/push 网络操作，放线程池）。
 #[tauri::command]
 pub async fn sync_now(state: State<'_, SharedState>) -> Result<crate::SyncView, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::sync_now(&shared))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
+}
+
+/// 修改主密码（旧密码 Argon2 校验 + 新密码重加密 + 可推送，放线程池）。
+#[tauri::command]
+pub async fn change_passphrase(
+    old_passphrase: String,
+    new_passphrase: String,
+    state: State<'_, SharedState>,
+) -> Result<(), String> {
+    let shared = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::change_passphrase(&shared, &old_passphrase, &new_passphrase)
+    })
+    .await
+    .map_err(|e| join_err(&e))?
+    .map_err(|e| err_str(&e))
+}
+
+/// GitHub 授权/安装诊断（网络探测，放线程池；无会话要求）。
+#[tauri::command]
+pub async fn diagnose_github(state: State<'_, SharedState>) -> Result<crate::GhDiagView, String> {
+    let shared = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || crate::github_diagnose(&shared))
+        .await
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
+}
+
+/// 安装页 URL（纯内存，同步即可）。前端合成诊断的占位不带 URL 时，
+/// 点击安装按钮经此懒取——slug 单一来源在 core（2026-11-05 审查可选 C）。
+#[tauri::command]
+pub fn github_install_url() -> String {
+    myapikey_core::github::app_install_url()
 }
 
 /// 状态页数据（git 子进程查询，放线程池）。
 #[tauri::command]
 pub async fn status(state: State<'_, SharedState>) -> Result<crate::StatusView, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::status_view(&shared))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
+}
+
+/// 明文导出（D49）：写到用户经另存为对话框选定的路径，返回完整路径。
+#[tauri::command]
+pub async fn export_records(
+    state: State<'_, SharedState>,
+    path: String,
+) -> Result<crate::ExportedView, String> {
+    let shared = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || crate::export_records(&shared, &path))
+        .await
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
+}
+
+/// JSON 导入（D47）：按 id LWW 合并（与 CLI import 同语义），返回
+/// 合并计数。
+#[tauri::command]
+pub async fn import_records(
+    state: State<'_, SharedState>,
+    json: String,
+) -> Result<crate::ImportedView, String> {
+    let shared = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || crate::import_records_cmd(&shared, &json))
+        .await
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 读取设置（含一次 git remote 读取，放线程池）。
 #[tauri::command]
 pub async fn get_settings(state: State<'_, SharedState>) -> Result<crate::SettingsView, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::settings_view(&shared))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 保存设置（写配置 + 更新 git remote，放线程池）。
@@ -188,11 +277,11 @@ pub async fn set_settings(
     settings: crate::SettingsView,
     state: State<'_, SharedState>,
 ) -> Result<(), String> {
-    let shared = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || crate::set_settings(&shared, settings))
+    let shared = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || crate::set_settings(&shared, &settings))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 初始化第一步（可能触发设备授权网络请求 / 远端探测，放线程池）。
@@ -203,13 +292,13 @@ pub async fn init_start(
     github_repo: Option<String>,
     state: State<'_, SharedState>,
 ) -> Result<crate::InitStage, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
         crate::init_start(&shared, remote.as_deref(), github_repo.as_deref())
     })
     .await
-    .map_err(join_err)?
-    .map_err(err_str)
+    .map_err(|e| join_err(&e))?
+    .map_err(|e| err_str(&e))
 }
 
 /// 忘记 GitHub 授权：清除本机凭据库里的 access/refresh 令牌。
@@ -219,11 +308,11 @@ pub async fn init_start(
 /// 凭据库操作失败。
 #[tauri::command]
 pub async fn forget_github_token(state: State<'_, SharedState>) -> Result<bool, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::forget_github(&shared))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 /// 设备授权完成后收尾（阻塞轮询 + 网络 + git，放线程池）。
@@ -231,7 +320,7 @@ pub async fn forget_github_token(state: State<'_, SharedState>) -> Result<bool, 
 pub async fn init_device_authorized(
     state: tauri::State<'_, crate::SharedState>,
 ) -> Result<crate::InitStage, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::init_device_authorized(&shared))
         .await
         .map_err(|e| e.to_string())?
@@ -244,7 +333,11 @@ pub async fn init_device_authorized(
 /// # Errors
 /// 系统打开浏览器失败。
 #[tauri::command]
-pub async fn open_external(url: String) -> Result<(), String> {
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri 命令签名由 IPC 框架反序列化决定"
+)]
+pub fn open_external(url: String) -> Result<(), String> {
     crate::open_external(&url).map_err(|e| e.to_string())
 }
 
@@ -258,11 +351,11 @@ pub async fn init_finish(
     passphrase: String,
     state: State<'_, SharedState>,
 ) -> Result<crate::InitStage, String> {
-    let shared = state.inner().clone();
+    let shared = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::init_finish(&shared, &passphrase))
         .await
-        .map_err(join_err)?
-        .map_err(err_str)
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +368,7 @@ pub async fn search_records(
     state: tauri::State<'_, crate::SharedState>,
     query: String,
 ) -> Result<Vec<crate::RecordView>, String> {
-    let sh = state.inner().clone();
+    let sh = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::search_view(&sh, &query))
         .await
         .map_err(|e| e.to_string())?
@@ -301,7 +394,7 @@ pub async fn fetch_models(
 pub async fn github_reauthorize(
     state: tauri::State<'_, crate::SharedState>,
 ) -> Result<crate::InitStage, String> {
-    let sh = state.inner().clone();
+    let sh = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || crate::github_reauthorize(&sh))
         .await
         .map_err(|e| e.to_string())?
@@ -310,6 +403,10 @@ pub async fn github_reauthorize(
 
 /// 当前应用版本号（设置页常态显示，不联网）。
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri 命令签名由 IPC 框架反序列化决定"
+)]
 pub fn app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }

@@ -5,11 +5,47 @@
  * 界面层不包含任何加密/同步逻辑——全部经 bridge 调后端 command。
  */
 
-import { invoke, onLocked, ProgressChannel } from "./bridge";
+import { invoke, onAuthInvalid, onLocked, ProgressChannel, saveDialog } from "./bridge";
+
+// zxcvbn 懒加载实例（模块级缓存，首次评强度时才拉取）：语料 + 匹配器
+// 配置一次成型。动态 import 把 ~300KB 语料拆出主 chunk——改密码抽屉
+// 是低频场景，不该拖累首屏（2026-11-05 审查可选 B）。
+// 纯 zxcvbn 标准（2026-11-04 用户定调），不注入本地语料——拼音组合
+// 等 zxcvbn 覆盖不到的模式按其原判输出，不做本地化加权。
+interface ZxcvbnChecker {
+  check(pw: string): { score: number };
+}
+let zxcvbnChecker: ZxcvbnChecker | null = null;
+async function ensureZxcvbnChecker(): Promise<ZxcvbnChecker> {
+  if (zxcvbnChecker === null) {
+    const [{ ZxcvbnFactory }, { dictionary }] = await Promise.all([
+      import("@zxcvbn-ts/core"),
+      import("@zxcvbn-ts/language-common"),
+    ]);
+    zxcvbnChecker = new ZxcvbnFactory({ dictionary: { ...dictionary } });
+  }
+  return zxcvbnChecker;
+}
 
 // ---------------------------------------------------------------------------
 // 与 Rust 侧对应的数据形状
 // ---------------------------------------------------------------------------
+
+/** GitHub 授权/安装诊断(后端 diagnose_github,2026-11-04 分步引导)。 */
+interface GhDiag {
+  /** 凭据库有 GitHub 令牌(device flow 授权完成过)。 */
+  authorized: boolean;
+  /** 令牌对 GET /user 有效(未过期/未被撤销)。 */
+  tokenValid: boolean;
+  /** GitHub App 已安装(未安装 = 令牌对仓库无权)。 */
+  installed: boolean;
+  /** 未安装时的安装页 URL(引导直达)。 */
+  installUrl: string | null;
+  /** 已绑定远端仓库(单机模式不引导)。 */
+  remoteBound: boolean;
+  /** 绑定仓库可访问;null = 未绑定或未安装,无从判断。 */
+  repoAccessible: boolean | null;
+}
 
 interface CheckView {
   status: string;
@@ -64,8 +100,9 @@ interface SettingsView {
   remote: string | null;
   tombstone_days: number;
   auto_push: boolean;
-  remember_days: number;
   auto_lock_minutes: number;
+  /** 文件日志级别(off/error/info/debug)——设置页可控,即时生效。 */
+  log_level: string;
 }
 
 type InitStage =
@@ -185,11 +222,27 @@ function flagInvalid(input: HTMLInputElement | HTMLSelectElement): void {
  * （https/ssh/git/file…）或本地绝对路径（/ 、盘符、\\）放行，只拒
  * 裸域名笔误。
  */
+/** 与 core::remote::parse_github_repo 同接受集的前置校验（前端即时反馈，
+ * 后端 set_remote 兜底）：github.com URL 或 owner/name 两段。2026-11-03
+ * 修复：此前接受集含本地路径、缺 owner/name，裸仓库名被误拒——与后端
+ * 实际接受集（只认 GitHub 形态）背离。 */
 function isValidRemoteUrl(t: string): boolean {
-  const v = t.trim();
+  const v = t
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/(?:\.git)+$/, "");
   if (!v || /\s/.test(v)) return false;
-  if (v.includes("://")) return true;
-  return v.startsWith("/") || v.startsWith("\\\\") || /^[a-zA-Z]:/.test(v);
+  const tail = v.startsWith("https://github.com/")
+    ? v.slice("https://github.com/".length)
+    : v.startsWith("http://github.com/")
+      ? v.slice("http://github.com/".length)
+      : v.includes("://")
+        ? null // 其他 scheme 后端同样不接受，整串当 owner/name 必败
+        : v;
+  if (tail === null || tail === "") return false;
+  if (tail.includes(":")) return false; // SSH 形态（git@…）与后端同拒绝
+  const parts = tail.split("/");
+  return parts.length === 2 && parts.every((p) => p !== "");
 }
 
 /** 按名字生成一个内联 SVG 图标元素。 */
@@ -279,36 +332,85 @@ const STRINGS: Record<string, [string, string]> = {
   // 通用
   unlock: ["Unlock", "解锁"],
   unlocking: ["Unlocking…", "正在解锁…"],
-  unlockPlaceholder: ["Master passphrase", "主密码"],
-  lockedHint: ["Locked. Enter the master passphrase to continue.", "已锁定，输入主密码继续。"],
+  unlockPlaceholder: ["Passphrase", "解锁密码"],
+  lockedHint: ["Locked. Enter the passphrase to continue.", "已锁定，输入解锁密码继续。"],
   cancel: ["Cancel", "取消"],
   save: ["Save", "保存"],
+  backupSection: ["Backup & migration", "备份与迁移"],
+  exportLabel: ["Export records", "导出记录"],
+  exportBtn: ["Export", "导出"],
+  exportConfirm: [
+    "Export writes all records as plaintext JSON — delete the file when done.",
+    "导出将以明文 JSON 写入全部记录，用完即删。",
+  ],
+  exportedPath: ["Exported: {0}", "已导出：{0}"],
+  importLabel: ["Import records", "导入记录"],
+  importBtn: ["Import", "导入"],
+  importedSummary: [
+    "Import done: {0} added, {1} updated",
+    "导入完成：新增 {0} 条，更新 {1} 条",
+  ],
+  importedBackup: ["Pre-import snapshot: {0}", "导入前快照：{0}"],
+  importedNone: ["File matches current records.", "文件与当前记录一致。"],
+  syncInstallFailed: [
+    "GitHub App is not installed — sync needs it. Follow the banner above.",
+    "GitHub App 未安装，同步需要它——按上方引导条操作。",
+  ],
   saving: ["Saving…", "正在保存…"],
   settings: ["Settings", "设置"],
   back: ["Back", "返回"],
   // 初始化
   initSubtitle: ["Set up this device. Choose how to create your sync repository.", "初始化本设备，选择同步仓库的创建方式。"],
-  confirmPass: ["Confirm passphrase", "确认主密码"],
+  confirmPass: ["Confirm passphrase", "确认解锁密码"],
   modeGithub: ["GitHub, auto-create a private repo", "GitHub，自动创建私有仓库"],
   modeRemote: ["Existing repository URL", "已有仓库地址"],
   modeSolo: ["Standalone", "单机使用"],
   initWarn: [
-    "If you forget the master passphrase, all data is unrecoverable. All devices must use the same passphrase.",
-    "忘记主密码将无法恢复数据。所有设备必须使用同一主密码。",
+    "If you forget the passphrase, all data is unrecoverable. All devices must use the same passphrase.",
+    "忘记解锁密码将无法恢复数据。所有设备必须使用同一解锁密码。",
   ],
   createVault: ["Create vault", "创建保险库"],
   creating: ["Creating…", "正在创建…"],
-  passMismatch: ["Passphrases do not match", "两次输入的主密码不一致"],
+  passMismatch: ["Passphrases do not match", "两次输入的解锁密码不一致"],
+  passTooShort: ["At least 8 characters", "至少 8 个字符"],
+  passTooLong: ["At most 128 characters", "至多 128 个字符"],
+  installNeededBanner: [
+    "GitHub App is not installed — repo sync unavailable.",
+    "GitHub App 尚未安装，仓库同步不可用。",
+  ],
+  installApp: ["Install GitHub App", "安装 GitHub App"],
+  // 已安装但安装范围不含当前绑定的同步仓库:装了≠装全,GitHub App 按
+  // 仓库授权,范围缺失时 Contents API 依旧 404(2026-11-04 用户实测:
+  // installed=true 使引导条消失,同步却仍 404,无任何提示)
+  installScopeBanner: [
+    "GitHub App is installed, but the sync repo is not in its repository access — sync unavailable.",
+    "GitHub App 已安装，但未包含同步仓库，同步不可用。",
+  ],
+  installScopeBtn: ["Adjust repository access", "调整仓库范围"],
+  // 日志区（2026-11-05 用户需求:错误详情落日志,不进悬停/弹窗）
+  logSection: ["Logs", "日志"],
+  logLevel: ["Log level", "日志级别"],
+  logOff: ["Off", "关闭"],
+  logError: ["Errors only", "仅错误"],
+  logInfo: ["Info (default)", "信息（默认）"],
+  logDebug: ["Debug", "调试"],
+  savedLogLevel: ["Log level set to {0}", "日志级别已改为 {0}"],
+
+
+  strength0: ["Weak", "弱"],
+  strength1: ["Fair", "中"],
+  strength2: ["Strong", "强"],
+  strength3: ["Very strong", "极强"],
   remoteRequired: ["Remote URL is required", "请填写仓库地址"],
   vaultCreated: ["Vault created", "保险库已创建"],
   joinedVaultPlain: ["Joined the existing vault", "已接入现有保险库"],
   // 设备授权
-  githubAuth: ["GitHub authorization", "GitHub 授权"],
+  githubAuth: ["Finish binding", "完成绑定"],
   stepOpen: ["Open the page below in your browser", "在浏览器打开下方链接"],
   stepEnter: ["Enter the code below", "在页面中输入下方代码"],
   deviceNote: [
-    "Code copied to clipboard · expires in 15 minutes · this page continues automatically once you authorize.",
-    "授权码已自动复制到剪贴板，15 分钟内有效；授权完成后本页面会自动继续。",
+    "Code copied to clipboard · expires in 15 minutes · this page continues automatically once you finish in the browser.",
+    "授权码已自动复制到剪贴板，15 分钟内有效；在浏览器完成后本页面会自动继续。",
   ],
   iAuthorized: ["I have authorized", "我已完成授权"],
   retryAuth: ["Retry", "重试"],
@@ -353,6 +455,8 @@ const STRINGS: Record<string, [string, string]> = {
   checkDone: ["Done: {0}", "检测完成：{0}"],
   deleting: ["Deleting…", "正在删除…"],
   copied: ["API key copied, clears in 30 s", "已复制 API key，30 秒后自动清除"],
+  copy: ["Copy", "复制"],
+  modelCopied: ["Model copied", "已复制模型名"],
   keyCheck: ["Key check: {0}{1}", "校验结果：{0}{1}"],
   httpCode: [" (HTTP {0})", " (HTTP {0})"],
   confirmDelete: ['Delete "{0}"?', "确定删除“{0}”？"],
@@ -395,16 +499,18 @@ const STRINGS: Record<string, [string, string]> = {
   behaviorSection: ["Behavior", "行为"],
   appearanceSection: ["Appearance", "外观"],
   remotePlaceholder: ["Remote repository URL", "远端仓库地址"],
-  remoteHint: ["Leave empty for standalone mode", "留空为单机模式"],
-  reauthorizeGithub: ["Re-authorize GitHub", "重新授权 GitHub"],
+  repoLabel: ["Remote repository", "远端仓库"],
+  repoUnbound: ["Not bound", "未绑定"],
+  bindRepo: ["Bind repository", "绑定仓库"],
+  authorizeGithub: ["Bind repository", "绑定仓库"],
   passJoinTitle: [
-    "Found an existing vault on the remote. Enter the master passphrase to join it.",
-    "发现已有保险库，输入主密码以接入。",
+    "Found an existing vault on the remote. Enter the passphrase to join it.",
+    "发现已有保险库，输入解锁密码以接入。",
   ],
-  passSetTitle: ["Set a new master passphrase.", "设置新的主密码。"],
+  passSetTitle: ["Set a new passphrase.", "设置新的解锁密码。"],
   initWarnJoin: [
-    "All devices must use the same master passphrase.",
-    "所有设备必须使用同一主密码。",
+    "All devices must use the same passphrase.",
+    "所有设备必须使用同一解锁密码。",
   ],
   passJoinBtn: ["Join the vault", "接入保险库"],
   unpushedPending: ["Unpushed changes — run sync", "有未推送的修改——请同步"],
@@ -414,32 +520,50 @@ const STRINGS: Record<string, [string, string]> = {
   relMinutesAgo: ["{0} min ago", "{0} 分钟前"],
   relHoursAgo: ["{0} h ago", "{0} 小时前"],
   relDaysAgo: ["{0} d ago", "{0} 天前"],
-  reauthorizing: ["Opening GitHub authorization…", "正在打开 GitHub 授权…"],
-  reAuthorized: ["GitHub authorization updated.", "GitHub 授权已更新。"],
+  reauthorizing: ["Finishing binding in the browser…", "正在浏览器中完成绑定…"],
+  reAuthorized: ["Binding restored.", "绑定已恢复。"],
   daysUnit: ["days", "天"],
-  rememberFor: ["Remember passphrase for", "记住密码时长"],
-  daysNeverHint: ["0 = never remember", "填 0 为永不记住密码"],
   autoLock: ["Auto-lock after idle", "空闲自动锁定"],
-  minutesUnit: ["minutes", "分钟"],
-  minutesOffHint: ["0 = disable auto-lock", "填 0 为关闭自动锁定"],
+  lockNever: ["Never", "永不"],
+  lockMinutesOpt: ["{0} min", "{0} 分钟"],
+  lockHours: ["{0} h", "{0} 小时"],
   autoPush: ["Auto-push after changes", "修改后自动推送"],
   themeLabel: ["Theme", "主题"],
   themeLight: ["Light", "明亮"],
   themeDark: ["Dark", "暗黑"],
   themeSystem: ["Follow system", "跟随系统"],
   langLabel: ["Language", "语言"],
-  saveSettings: ["Save settings", "保存设置"],
-  settingsSaved: ["Settings saved", "设置已保存"],
+  savedLock: ["Auto-lock set to {0}", "自动锁定已改为 {0}"],
+  savedAutoPushOn: ["Auto-push enabled", "修改后自动推送已开启"],
+  savedAutoPushOff: ["Auto-push disabled", "修改后自动推送已关闭"],
+  savedRemote: ["Remote address set to {0}", "远端地址已改为 {0}"],
+  savedRemoteCleared: ["Remote address cleared, syncing stopped", "远端地址已清空，本机停止同步"],
+  savedTheme: ["Theme set to {0}", "主题已改为 {0}"],
+  savedLang: ["Language set to {0}", "界面语言已改为 {0}"],
   // 设置页 · 更新（D16 应用内更新）
   updateSection: ["Update", "更新"],
   currentVersion: ["Version {0}", "当前版本 {0}"],
   checkUpdate: ["Check for updates", "检查更新"],
   unbindGithub: ["Unbind GitHub", "解绑 GitHub"],
   unbindGithubConfirm: [
-    "Unbind the remote repo and clear the GitHub token on this machine? The remote repo and vault data are untouched.",
-    "解绑远端仓库并清除本机记住的 GitHub 授权？远端仓库与保险库数据不受影响。",
+    "Unbind the remote repo? The remote repo and vault data are untouched.",
+    "解绑远端仓库？远端仓库与保险库数据不受影响。",
   ],
   unboundGithub: ["GitHub unbound.", "已解绑 GitHub。"],
+  // 设置页 · 安全（改解锁密码，2026-11-03 补齐入口）
+  securitySection: ["Security", "安全"],
+  changePassphrase: ["Change passphrase", "修改解锁密码"],
+  changePassTitle: ["Confirm the current passphrase, then set a new one.", "验证当前解锁密码，设置新的解锁密码。"],
+  oldPass: ["Current passphrase", "当前解锁密码"],
+  newPass: ["New passphrase", "新解锁密码"],
+  confirmNewPass: ["Confirm new passphrase", "确认新解锁密码"],
+  oldPassRequired: ["Current passphrase must not be empty.", "请输入当前解锁密码。"],
+  newPassRequired: ["New passphrase must not be empty.", "请输入新解锁密码。"],
+  passChanged: ["Passphrase changed.", "解锁密码已修改。"],
+  passChangeWarn: [
+    "The remote vault will be re-encrypted with the new passphrase. Other devices must enter it on their next sync.",
+    "远端保险库将以新解锁密码重新加密，其他设备下次同步需输入新密码。",
+  ],
   checkingUpdate: ["Checking…", "正在检查…"],
   upToDate: ["Up to date.", "已是最新版本。"],
   notChecked: ["not checked", "未校验"],
@@ -451,14 +575,14 @@ const STRINGS: Record<string, [string, string]> = {
   checkUnverifiable: ["unverifiable", "无法验证"],
   invalidUrl: [
     "Must start with http:// or https:// followed by a host.",
-    "需以 http:// 或 https:// 开头并带主机名。",
+    "需为 http:// 或 https:// 开头并带主机名。",
   ],
   nameRequired: ["Record name must not be empty.", "记录名称不能为空。"],
   baseUrlRequired: ["Base URL must not be empty.", "Base URL 不能为空。"],
   apiKeyRequired: ["API key must not be empty.", "API key 不能为空。"],
   invalidRemote: [
-    "Expected https://… or an absolute local path.",
-    "需为 https://… 网址或本地绝对路径。",
+    "Expected owner/name or a github.com URL.",
+    "需为 owner/name 或 github.com 网址。",
   ],
   protoCustomOpt: ["custom…", "自定义…"],
   newVersionAvail: ["Version {0} is available.", "新版本 {0} 可用。"],
@@ -587,6 +711,202 @@ function toast(msg: string, ok = true): void {
 }
 
 /**
+ * GitHub 授权失效状态（2026-11-03）：同步/写路径撞认证错误且自动续期
+ * 未救场时置位——主界面常驻引导条 + 顶栏 chip 变「授权已失效」，用户
+ * 不必从一条转瞬即逝的错误 toast 里猜原因。重新授权成功（showDeviceCode
+ * 的 done 分支）时清除。
+ */
+let authInvalid = false;
+/** GitHub 授权/安装诊断结果(后端 diagnose_github,2026-11-04 分步引导):
+ * 非空且检测到未完成步骤时,引导条按诊断渲染对应步骤与按钮。 */
+let authDiag: GhDiag | null = null;
+/** 设备授权轮询的代号:每次进入授权页(或重试)递增——旧码 poll 的迟到
+ * 结果凭代号丢弃,避免污染新码页面(2026-11-04 卡死修复配套)。 */
+let devicePollSeq = 0;
+
+/** 与 core::sync::is_auth_error 同规则的 TS 镜像（前端置位判断用）。 */
+function isAuthError(msg: string): boolean {
+  return (
+    msg.includes("GitHub rejected the access") ||
+    msg.includes("HTTP 401") ||
+    msg.includes("HTTP 403") ||
+    msg.includes("Bad credentials")
+  );
+}
+
+/** 同步/写失败的用户可感知错误(2026-11-06 用户需求:令牌/刷新是
+ * App 内部的事,用户不应感知):授权类 -> 一句人话指路重新授权;
+ * 仓库不可见 -> 指路安装引导;其余(网络等)原样透出。完整技术链
+ * 一律落文件日志,不进界面。 */
+function syncUserError(msg: string): string {
+  if (isAuthError(msg)) return t('syncStandaloneHint');
+  if (msg.includes('HTTP 404') || msg.includes('not installed'))
+    return t('syncInstallFailed');
+  return msg;
+}
+
+/** 绑定失效判定(与主界面引导条同一规则):authInvalid 标记,或诊断显示
+ * 绑定存在但访问不可用(令牌缺失/令牌失效——用户视角同为一个语义:
+ * 绑定失效,2026-11-10 原子化)。诊断未取到时退回标记。 */
+function bindingBroken(): boolean {
+  if (authInvalid) return true;
+  const d = authDiag;
+  return d !== null && d.remoteBound && (!d.authorized || !d.tokenValid);
+}
+
+/** 授权失效置位：立即填充主界面的引导条与顶栏 chip（主界面可见时），
+ * 并触发一次诊断刷新(网络探测,异步回来后引导条按最新状态重渲染)。
+ * 错误详情不进界面——完整原因已由后端落文件日志(2026-11-05 用户
+ * 反馈:悬停/弹窗输出详情是坏习惯,排查走日志)。 */
+function markAuthInvalid(suggestInstall = false): void {
+  if (suggestInstall) {
+    // 404(仓库不可见)≠ 授权失效:令牌失效时 GitHub 回 401,走不到这里;
+    // 对 GitHub App 这意味着「未安装/未含此仓」。合成安装语义诊断并立即
+    // 渲染安装引导,**不置 authInvalid**——置了会把引导条顶进「授权已
+    // 失效」分支,把用户推进重授权死循环(2026-11-04 状态错显实测)。
+    // 异步诊断回来后按真实状态修正(含后端 install_url)。
+    authDiag = {
+      authorized: true,
+      tokenValid: true,
+      installed: false,
+      // URL 不在此硬编码(2026-11-05 审查可选 C):slug 单一来源是 core
+      // 的 APP_SLUG 配置,点击按钮时经 github_install_url 命令懒取。
+      // 曾误写 myapikey:软件把用户带到无关 App 的安装页(2026-11-04 实测)
+      installUrl: null,
+      remoteBound: true,
+      repoAccessible: null,
+    };
+    const slot = document.querySelector<HTMLElement>(".auth-banner-slot");
+    if (slot) renderAuthBanner(slot);
+    void refreshAuthDiag();
+    return;
+  }
+  // 绑定失效折叠为未绑定(2026-11-10 用户拍板):不渲染失效引导条、
+  // 不显示失效字样——置位内部判定供设置页折叠渲染,chip 显示单机,
+  // 诊断刷新后各界面自然按未绑定呈现
+  authInvalid = true;
+  const chip = document.querySelector(".chip-remote");
+  if (chip) {
+    chip.className = "chip";
+    chip.textContent = t("standaloneMode");
+  }
+  void refreshAuthDiag();
+}
+
+/** 拉取授权/安装诊断并重渲染引导条(boot 与失效置位时调用)。 */
+async function refreshAuthDiag(): Promise<void> {
+  // 诊断失败保留旧诊断:网络抖动不该把已确立的引导条清空
+  // (2026-11-04 用户实测「引导条与 toast 一同消失」的场景之一)
+  const d = await invoke<GhDiag>("diagnose_github").catch(() => null);
+  if (d !== null) authDiag = d;
+  const slot = document.querySelector<HTMLElement>(".auth-banner-slot");
+  if (slot) renderAuthBanner(slot);
+}
+
+/** 按当前状态渲染引导条(空 = 正常,无引导条)。绑定失效已折叠为未绑定
+ * (2026-11-10 用户拍板),不再有失效引导条;剩余两态均为 GitHub App
+ * 安装语义——needInstall(令牌有效,未安装 **或安装范围不含同步仓库**)
+ * → 安装/调整范围按钮。GitHub App 按仓库授权,「已安装」≠「装全」:
+ * 范围缺失时 Contents API 依旧 404(2026-11-04 用户实测)。 */
+function renderAuthBanner(slot: HTMLElement): void {
+  slot.replaceChildren();
+  const diag = authDiag;
+  // 绑定失效折叠为未绑定(2026-11-10 用户拍板):失效引导条已删——
+  // 用户只见绑定与未绑定两态。剩余引导条均为 GitHub App 安装语义
+  // (未安装/范围缺失),与绑定状态无关
+  const needInstall =
+    diag !== null &&
+    diag.authorized &&
+    diag.tokenValid &&
+    diag.remoteBound &&
+    (!diag.installed || diag.repoAccessible === false);
+  if (!needInstall) return;
+  const banner = el("div", "auth-banner");
+  const textWrap = el("div", "auth-banner-text-wrap");
+  // 错误详情不进界面(title 悬停已废除,2026-11-05):完整错误链由后端
+  // 统一落文件日志,设置页可开日志文件夹
+  // scopeGap = 已安装但仓库范围不含同步仓库:按钮改指安装配置页
+  // (installations 列表页,Configure 里调整 Repository access)
+  const scopeGap = diag.installed === true;
+  textWrap.append(
+    el("span", "", scopeGap ? t("installScopeBanner") : t("installNeededBanner")),
+  );
+  banner.append(textWrap);
+  const actions = el("div", "auth-banner-actions");
+  const installBtn = el(
+    "button",
+    "btn btn-small btn-primary",
+    scopeGap ? t("installScopeBtn") : t("installApp"),
+  );
+  installBtn.type = "button";
+  installBtn.addEventListener("click", () => {
+    // URL 懒取(2026-11-05 审查可选 C):诊断里没有时向 core 要——
+    // slug 单一来源,前端永不硬编码
+    void (async () => {
+      let url = authDiag?.installUrl ?? "";
+      if (!url) {
+        url = await invoke<string>("github_install_url").catch(() => "");
+      }
+      if (!url) return;
+      // 安装配置页 = 去掉安装页 URL 尾部的 /new
+      if (scopeGap) url = url.replace(/\/new$/, "");
+      void invoke("open_external", { url }).catch(() => {
+        window.open(url, "_blank");
+      });
+      // 打开安装/配置页后自动检测:用户装好或调完范围 → 引导条自动
+      // 消失,全程无需回应用里手动刷新
+      startInstallWatch();
+    })();
+  });
+  actions.append(installBtn);
+  banner.append(actions);
+  slot.append(banner);
+}
+/** 安装/配置完成检测轮询(installWatchTimer):用户打开安装或配置页后
+ * 每 5 秒复查一次诊断,恢复健康(已安装**且**范围含同步仓库)即引导条
+ * 消失。已安装但范围缺失时继续轮询——用户调完 Repository access 后
+ * 引导条自动撤下,无需手动刷新。诊断失败(网络抖动)静默跳过本轮,
+ * 下轮继续;计时器未启动时不重复启动。
+ * 有总时长上限(INSTALL_WATCH_MAX_MS):这是「打开安装页后的伴随检测」,
+ * 不是常驻服务——上限到了自动停,用户再次点按钮即重启(2026-11-05
+ * 审查可选 A)。 */
+let installWatchTimer: number | null = null;
+let installWatchStartedAt = 0;
+const INSTALL_WATCH_MAX_MS = 10 * 60 * 1000;
+
+function startInstallWatch(): void {
+  if (installWatchTimer !== null) return;
+  installWatchStartedAt = Date.now();
+  installWatchTimer = window.setInterval(async () => {
+    if (Date.now() - installWatchStartedAt > INSTALL_WATCH_MAX_MS) {
+      if (installWatchTimer !== null) {
+        clearInterval(installWatchTimer);
+        installWatchTimer = null;
+      }
+      return;
+    }
+    try {
+      const d = await invoke<GhDiag>("diagnose_github");
+      authDiag = d;
+      const slot = document.querySelector<HTMLElement>(".auth-banner-slot");
+      if (slot) renderAuthBanner(slot);
+      const unhealthy =
+        authDiag !== null &&
+        authDiag.authorized &&
+        authDiag.tokenValid &&
+        authDiag.remoteBound &&
+        (!authDiag.installed || authDiag.repoAccessible === false);
+      if (!unhealthy && installWatchTimer !== null) {
+        clearInterval(installWatchTimer);
+        installWatchTimer = null;
+      }
+    } catch {
+      // 网络抖动静默跳过本轮
+    }
+  }, 5000);
+}
+
+/**
  * 按钮级等待反馈：耗时操作期间禁用按钮、文案切换为 `busyText`
  * 并显示旋转指示（.btn-busy），结束后恢复原状。
  *
@@ -631,6 +951,9 @@ async function boot(): Promise<void> {
     renderUnlock(true);
     toast(t("autoLocked"));
   });
+  // 启动期主动续期失败(后端线程发出):置失效态——进入主界面后
+  // 引导条 + chip 立即可见,不必等用户点同步撞 401(2026-11-03 需求 2)
+  void onAuthInvalid(() => markAuthInvalid());
   const st = await invoke<GuiState>("gui_state");
   if (!st.initialized) renderInit();
   else if (st.unlocked) renderMain();
@@ -641,6 +964,9 @@ async function boot(): Promise<void> {
     if (await invoke<boolean>("unlock_remembered")) renderMain();
     else renderUnlock(false);
   } else renderUnlock(false);
+  // 启动诊断(2026-11-04 分步引导):令牌失效/App 未安装时引导条立即
+  // 呈现,不必等用户点同步撞错。单机(未绑定远端)时诊断返回不引导
+  void refreshAuthDiag();
 }
 
 /**
@@ -774,9 +1100,70 @@ function restoreFields(vals: Record<string, { v: string; t?: string }>): void {
  * 密码输入行：输入框 + 行内眼睛按钮切换可见性。
  * WebView2 会给 type=password 渲染原生"眼睛"（::-ms-reveal），但它只在
  * 悬停时出现、点击一次即消失且行为不受页面控制，已在 CSS 隐藏；初始化页
- * 与解锁页的主密码框统一用本按钮（2026-10-25 修复"点击一次后消失"）。
+ * 与解锁页的解锁密码框统一用本按钮（2026-10-25 修复"点击一次后消失"）。
  * 眼睛为纯图标按钮，语义由 title / aria-label 悬停提示给出。
  */
+/**
+ * 解锁密码强度分（0 弱 / 1 中 / 2 强 / 3 极强）。软提示用，不做硬性拦截
+ * （2026-11-03 决议）。**前置条件：长度合法（8–128，D32 硬性限制）且由
+ * 调用方保证**——长度不足 8 根本不被允许，不参与强度评价。
+ *
+ * 评分引擎为 **zxcvbn**（Dropbox 算法，业界事实标准；2026-11-04 用户
+ * 要求改用公认库，推翻同日手写启发式决议——手写规则漏评质数拼接
+ * 23571113 一类模式）。zxcvbn 输出 0–4，映射到四档：0/1 → 弱、
+ * 2 → 中、3 → 强、4 → 极强。
+ */
+async function passStrength(pw: string): Promise<number> {
+  const checker = await ensureZxcvbnChecker();
+  const { score } = checker.check(pw);
+  return score <= 1 ? 0 : score - 1;
+}
+
+/**
+ * 密码强度条（软提示）：4 段色块 + 文字标签，随输入实时刷新。
+ * 空输入整块隐藏——未输入时不占位也不预判；不拦截提交。返回 sync
+ * 供语言切换整页重建后回填密码时手动刷新（restoreFields 直赋 value
+ * 不触发 input 事件）。
+ */
+function strengthMeter(input: HTMLInputElement): { el: HTMLDivElement; sync: () => void } {
+  const wrap = el("div", "strength-meter hidden");
+  const bars = el("div", "strength-bars");
+  const segs: HTMLElement[] = [];
+  for (let i = 0; i < 4; i++) {
+    const s = el("span", "strength-seg");
+    segs.push(s);
+    bars.append(s);
+  }
+  const label = el("span", "strength-label");
+  wrap.append(bars, label);
+  // 评分代守卫:zxcvbn 首次加载与计算是异步的,快速输入时旧评分的
+  // 迟到结果不得覆盖新输入的评分(与搜索竞态守卫同型)
+  let strengthSeq = 0;
+  const sync = (): void => {
+    const pw = input.value;
+    // 只有长度合法(8–128,与 validate_passphrase 同规则)才评强度:
+    // 长度不足时「至少 8 个字符」的错误提示与强度条并存会互相打架
+    // (2026-11-04 用户反馈)
+    const n = [...pw].length;
+    if (!pw || n < 8 || n > 128) {
+      wrap.classList.add("hidden");
+      return;
+    }
+    wrap.classList.remove("hidden");
+    const gen = ++strengthSeq;
+    void passStrength(pw).then((sc) => {
+      if (gen !== strengthSeq) return;
+      segs.forEach((s, i) => {
+        s.className = i <= sc ? `strength-seg strength-s${sc}` : "strength-seg";
+      });
+      label.textContent = t(`strength${sc}`);
+      label.className = `strength-label strength-s${sc}`;
+    });
+  };
+  input.addEventListener("input", sync);
+  return { el: wrap, sync };
+}
+
 function passField(input: HTMLInputElement): HTMLDivElement {
   const row = el("div", "field-row pass-row");
   const toggle = el("button", "btn btn-icon");
@@ -966,7 +1353,7 @@ function renderInit(): void {
   const card = el("div", "card init-card");
 
   const brand = el("h1", "brand-row");
-  brand.append(icon("key"), el("span", "brand", "MyApiKey"), langToggle(renderInit));
+  brand.append(icon("key"), el("span", "brand", "Makara"), langToggle(renderInit));
   card.append(brand);
   card.append(el("p", "muted", t("initSubtitle")));
 
@@ -1016,7 +1403,9 @@ function renderInit(): void {
         githubRepo: mode.value === "github" ? "myapikey-vault" : null,
       });
       if (stage.stage === "device_code") {
-        showDeviceCode(stage.user_code, stage.verification_uri);
+        showDeviceCode(stage.user_code, stage.verification_uri, () =>
+          void renderInit(),
+        );
         return;
       }
       if (stage.stage === "probe_done") {
@@ -1026,7 +1415,7 @@ function renderInit(): void {
       toast(stage.joined ? t("joinedVault", stage.records) : t("vaultCreated"));
       renderMain();
     } catch (e) {
-      toast(String(e), false);
+      toast(syncUserError(String(e)), false);
     }
   }
   // withBusy 负责禁用与等待文案（建仓 + 探测需要一两秒）
@@ -1043,11 +1432,11 @@ function renderInit(): void {
   syncRemote(mode.value);
 }
 
-/** 初始化第二页：主密码表单。语义由远端状态决定——
- * `hasData = true` 显示"输入主密码接入已有数据"（单框）；
- * `false` 显示"设置新的主密码"（双框确认）。提交走 init_finish。 */
+/** 初始化第二页：解锁密码表单。语义由远端状态决定——
+ * `hasData = true` 显示"输入解锁密码接入已有数据"（单框）；
+ * `false` 显示"设置新的解锁密码"（双框确认）。提交走 init_finish。 */
 function renderPassphrase(hasData: boolean): void {
-  // 语言切换整页重建：已输入的主密码照 renderUnlock 模式快照回填
+  // 语言切换整页重建：已输入的解锁密码照 renderUnlock 模式快照回填
   // （2026-10-31 审查修复 M2：两阶段密码页漏了这对机制）
   const keep = snapshotFields();
   $app.replaceChildren();
@@ -1055,7 +1444,7 @@ function renderPassphrase(hasData: boolean): void {
   const card = el("div", "card init-card");
 
   const brand = el("h1", "brand-row");
-  brand.append(icon("key"), el("span", "brand", "MyApiKey"), langToggle(() => renderPassphrase(hasData)));
+  brand.append(icon("key"), el("span", "brand", "Makara"), langToggle(() => renderPassphrase(hasData)));
   card.append(brand);
   card.append(el("p", "muted", hasData ? t("passJoinTitle") : t("passSetTitle")));
 
@@ -1064,8 +1453,13 @@ function renderPassphrase(hasData: boolean): void {
   pass.placeholder = t("unlockPlaceholder");
   pass.dataset.field = "pass";
   const rows: HTMLElement[] = [passField(pass)];
+  // 强度条仅在设置新密码时显示（接入已有保险库输的是已设过的密码，
+  // 事后提示无意义）；紧贴新密码输入框，先于确认框
+  let meter: { el: HTMLDivElement; sync: () => void } | null = null;
 
   if (!hasData) {
+    meter = strengthMeter(pass);
+    rows.push(meter.el);
     const pass2 = el("input", "input grow");
     pass2.type = "password";
     pass2.placeholder = t("confirmPass");
@@ -1081,16 +1475,27 @@ function renderPassphrase(hasData: boolean): void {
   );
 
   async function doFinish(): Promise<void> {
-    if (!hasData && (!pass.value || pass.value !== pass2value())) {
-      toast(t("passMismatch"), false);
-      return;
+    if (!hasData) {
+      // 新设密码:长度硬性限制(8–128 字符,与后端 validate_passphrase 同规则)
+      if ([...pass.value].length < 8) {
+        toast(t("passTooShort"), false);
+        return;
+      }
+      if ([...pass.value].length > 128) {
+        toast(t("passTooLong"), false);
+        return;
+      }
+      if (pass.value !== pass2value()) {
+        toast(t("passMismatch"), false);
+        return;
+      }
     }
     try {
       await invoke<InitStage>("init_finish", { passphrase: pass.value });
       toast(hasData ? t("joinedVaultPlain") : t("vaultCreated"));
       renderMain();
     } catch (e) {
-      toast(String(e), false);
+      toast(syncUserError(String(e)), false);
     }
   }
   function pass2value(): string {
@@ -1102,6 +1507,8 @@ function renderPassphrase(hasData: boolean): void {
   wrap.append(card);
   $app.append(wrap);
   restoreFields(keep);
+  // 回填的密码不触发 input 事件，强度条要手动对齐
+  meter?.sync();
 }
 
 /**
@@ -1109,28 +1516,50 @@ function renderPassphrase(hasData: boolean): void {
  * 复用同一 in-flight 请求——后端 poll 会一次性消费 device code，并发
  * 第二个轮询只会空转到码过期。settle（成功或失败）后置空，允许重试。
  */
-let devicePoll: Promise<InitStage> | null = null;
+/**
+ * 设备授权轮询（按 device code 键控，2026-11-04 重构）：同一码复用同一
+ * in-flight 请求（后端 poll 一次性消费 device code，同码并发必有一个
+ * 空转到码过期）；不同码各自独立——「重新授权」发新码后，旧码的 poll
+ * 留在原地自然结束（expired_token），不再阻塞新码的轮询（原单例实现
+ * 让新码永远无人轮询，重新授权+返回场景必然卡死，用户真机命中）。
+ */
+const devicePolls = new Map<string, Promise<InitStage>>();
 
-function ensureDevicePoll(): Promise<InitStage> {
-  if (!devicePoll) {
-    devicePoll = invoke<InitStage>("init_device_authorized").finally(() => {
-      devicePoll = null;
+function ensureDevicePoll(code: string): Promise<InitStage> {
+  let p = devicePolls.get(code);
+  if (!p) {
+    p = invoke<InitStage>("init_device_authorized").finally(() => {
+      devicePolls.delete(code);
     });
+    devicePolls.set(code, p);
   }
-  return devicePoll;
+  return p;
 }
 
-function showDeviceCode(code: string, uri: string): void {
+function showDeviceCode(code: string, uri: string, onBack?: () => void): void {
   $app.replaceChildren();
   const wrap = el("div", "center-wrap");
   const card = el("div", "card init-card");
   const headRow = el("div", "device-head");
-  headRow.append(el("h2", "", t("githubAuth")), langToggle(() => showDeviceCode(code, uri)));
+  headRow.append(el("h2", "", t("githubAuth")), langToggle(() => showDeviceCode(code, uri, onBack)));
   card.append(headRow);
-  const steps = el("ol", "steps");
+  // 返回入口(2026-11-04 用户要求「所有界面必须能正常返回」):授权页
+  // 此前是死胡同,想放弃授权只能重启。返回只切 UI,后台轮询继续——
+  // 若期间授权完成,apply 的自动流转照常接管(完成是用户主动发起的
+  // 流程,完成即切走属合理)。按钮钉在页面最左上角(用户指定的位置),
+  // 不随卡片布局走;不传 onBack(理论上不存在)则不渲染
+  if (onBack) {
+    const backBtn = el("button", "btn btn-small btn-ghost device-back", t("back"));
+    backBtn.type = "button";
+    backBtn.prepend(icon("back"));
+    backBtn.addEventListener("click", onBack);
+    $app.append(backBtn);
+  }
+  // 步骤用自定义编号结构（D32 配套微调）：链接行要插在步骤 1 与步骤 2
+  // 之间（「下方链接」紧随步骤 1 文本），ol 的自动序号做不到中间插行
+  const steps = el("div", "steps");
   steps.append(
-    el("li", "", t("stepOpen")),
-    el("li", "", t("stepEnter")),
+    el("div", "step-line", t("stepOpen")),
   );
   const link = el("a", "link", uri);
   link.href = uri;
@@ -1142,7 +1571,13 @@ function showDeviceCode(code: string, uri: string): void {
       window.open(uri, "_blank");
     });
   });
-  steps.children[0].appendChild(link);
+  // 链接独立成行放在步骤下方（2026-11-04 修复：原为行内拼接在步骤 1
+  // 尾部，文案「打开下方链接」与实际位置不符）；步进 2 的「下方代码」
+  // 同理由紧随其后的授权码大字框承接
+  const linkRow = el("div", "device-link-row");
+  linkRow.append(link);
+  steps.append(linkRow);
+  steps.append(el("div", "step-line", t("stepEnter")));
   // 授权码行：大字框 + 行内复制按钮（2026-10-25 需求；码 15 分钟有效，
   // 非长期敏感值，复制后不做延时清除）
   const codeEl = el("div", "device-code", code);
@@ -1156,7 +1591,7 @@ function showDeviceCode(code: string, uri: string): void {
         await invoke("copy_text", { text: code });
         toast(t("codeCopied"));
       } catch (e) {
-        toast(String(e), false);
+        toast(syncUserError(String(e)), false);
       }
     }),
   );
@@ -1178,8 +1613,13 @@ function showDeviceCode(code: string, uri: string): void {
   // 轮询挂在模块级单例上——语言切换等整页重建复用同一 in-flight 请求，
   // 避免重复起轮询（后端 poll 一次性消费 device code，并发轮询必有一个
   // 空转到码过期）
+  // 代守卫:重新授权发新码后,旧码 poll 的迟到结果不再污染新码页面
+  const gen = ++devicePollSeq;
   const apply = (stage: InitStage): void => {
     if (stage.stage === "done") {
+      // 新凭据已入库：授权失效引导条与 chip 就此恢复（无论失效因何而起，
+      // 重新授权成功即视为恢复）
+      authInvalid = false;
       // refresh = 已初始化机器的授权刷新（token 失效自愈），vault 未动
       toast(stage.refresh ? t("reAuthorized") : stage.joined ? t("joinedVault", stage.records) : t("vaultCreated"));
       if (stage.refresh) {
@@ -1202,21 +1642,49 @@ function showDeviceCode(code: string, uri: string): void {
   const wait = (): void => {
     btn.disabled = true;
     btn.textContent = t("waitingGithub");
-    ensureDevicePoll()
+    ensureDevicePoll(code)
       .then((stage) => {
+        // 旧码 poll 的迟到结果丢弃(页面已是新码)
+        if (gen !== devicePollSeq) return;
         apply(stage);
       })
       .catch((e) => {
-        toast(String(e), false);
-        status.textContent = t("authFailedHint");
-        // 失败后按钮复活为重试入口（pending_device 仍在，可直接重发）
-        btn.disabled = false;
-        btn.textContent = t("retryAuth");
+        if (gen !== devicePollSeq) return;
+        toast(syncUserError(String(e)), false);
+        // 轮询拿到令牌后令牌即已入库；报错也可能发生在**后续步骤**（建仓/
+        // 远端探测）。此时「请在浏览器完成授权后重试」是死胡同：授权并没
+        // 有失败，重试只会撞同一个错（2026-11-04 用户建仓 403 实测：App
+        // 未安装 → 授权成功但建仓被拒，页面却引导用户无限重试授权）。
+        // 用诊断区分两种情况：
+        // - 令牌有效 → 视作授权已成功，回到原界面，由引导条按诊断接管
+        //   （未安装则渲染安装引导）；
+        // - 令牌无效 → 才是真授权失败，留在本页等待重试。
+        void invoke<GhDiag>("diagnose_github")
+          .then((d) => {
+            if (gen !== devicePollSeq) return;
+            if (d.authorized && d.tokenValid) {
+              authInvalid = false;
+              authDiag = d;
+              if (onBack) onBack();
+              else void renderMain();
+            } else {
+              status.textContent = t("authFailedHint");
+              btn.disabled = false;
+              btn.textContent = t("retryAuth");
+            }
+          })
+          .catch(() => {
+            // 诊断失败（网络抖动）：退回原「授权失败重试」文案，不静默
+            if (gen !== devicePollSeq) return;
+            status.textContent = t("authFailedHint");
+            btn.disabled = false;
+            btn.textContent = t("retryAuth");
+          });
       });
   };
   btn.addEventListener("click", () => {
-    // 轮询进行中点击无新动作；失败后点击 = 重试
-    if (devicePoll) return;
+    // 同码轮询进行中点击无新动作；失败后点击 = 重试
+    if (devicePolls.has(code)) return;
     wait();
   });
   wait();
@@ -1227,7 +1695,7 @@ function showDeviceCode(code: string, uri: string): void {
 // ---------------------------------------------------------------------------
 
 /**
- * 解锁页：一律手动输入主密码（2026-10-24 决议，主人确认）。
+ * 解锁页：一律手动输入解锁密码（2026-10-24 决议，主人确认）。
  *
  * GUI 不提供任何形式的一键解锁——应用启动与锁定后的解锁页完全一致：
  * 密码输入框 + Unlock 按钮（Enter 也可提交）。"记住的密码"（TTL）只服务
@@ -1244,7 +1712,7 @@ function renderUnlock(afterLock: boolean): void {
   const wrap = el("div", "center-wrap");
   const card = el("div", "card init-card");
   const brandH = el("h1", "brand-row");
-  brandH.append(icon("key"), el("span", "brand", "MyApiKey"), langToggle(() => renderUnlock(afterLock)));
+  brandH.append(icon("key"), el("span", "brand", "Makara"), langToggle(() => renderUnlock(afterLock)));
   card.append(brandH);
   if (afterLock) {
     card.append(el("p", "muted", t("lockedHint")));
@@ -1262,7 +1730,11 @@ function renderUnlock(afterLock: boolean): void {
           await invoke("unlock", { passphrase: pass.value });
           renderMain();
         } catch (e) {
-          toast(String(e), false);
+          // 密码错误:清空输入框(2026-11-08 用户需求)——错误的整串
+          // 密码对下次输入毫无价值,保留只会逼用户手动清除
+          pass.value = "";
+          pass.focus();
+          toast(syncUserError(String(e)), false);
         }
       }),
     );
@@ -1294,7 +1766,7 @@ async function renderMain(): Promise<void> {
   try {
     records = await invoke<RecordView[]>("list_records");
   } catch (e) {
-    toast(String(e), false);
+    toast(syncUserError(String(e)), false);
     renderUnlock(false);
     return;
   }
@@ -1304,7 +1776,7 @@ async function renderMain(): Promise<void> {
   // 顶栏
   const top = el("div", "topbar");
   const brand = el("div", "topbar-brand");
-  brand.append(icon("key"), el("span", "brand", "MyApiKey"));
+  brand.append(icon("key"), el("span", "brand", "Makara"));
   const chips = el("div", "chips");
   const syncBtn = el("button", "btn btn-small", t("syncNow"));
   syncBtn.prepend(icon("sync"));
@@ -1367,7 +1839,7 @@ async function renderMain(): Promise<void> {
           .map(([label, n]) => `${n} ${checkLabel(label)}`);
         toast(t("checkDone", parts.join(" · ")));
       } catch (e) {
-        toast(String(e), false);
+        toast(syncUserError(String(e)), false);
       } finally {
         checkAllBtn.disabled = false;
         checkAllBtn.replaceChildren(icon("shield"), document.createTextNode(t("checkAll")));
@@ -1422,7 +1894,12 @@ async function renderMain(): Promise<void> {
   toolbar.append(searchWrap, addBtn);
 
   const list = el("div", "record-list");
-  shell.append(top, toolbar, list);
+  // 授权失效引导条插槽（2026-11-03）：常驻占位，authInvalid 时填充——
+  // 同步/写路径撞认证错误后用户看到的不是转瞬即逝的 toast，而是
+  // 持久的「授权已失效 → 重新授权」引导
+  const authSlot = el("div", "auth-banner-slot");
+  renderAuthBanner(authSlot);
+  shell.append(top, toolbar, authSlot, list);
   $app.append(shell);
 
   function renderList(): void {
@@ -1499,7 +1976,7 @@ async function renderMain(): Promise<void> {
           await invoke("copy_base_url", { id: r.id });
           toast(t("urlCopied"));
         } catch (e) {
-          toast(String(e), false);
+          toast(syncUserError(String(e)), false);
         }
       }),
     );
@@ -1516,7 +1993,7 @@ async function renderMain(): Promise<void> {
           await invoke("copy_key", { id: r.id });
           toast(t("copied"));
         } catch (e) {
-          toast(String(e), false);
+          toast(syncUserError(String(e)), false);
         }
       }),
     );
@@ -1535,6 +2012,24 @@ async function renderMain(): Promise<void> {
       for (const m of r.models) {
         const chip = el("span", `model-chip mc-${modelColorIndex(m)}`);
         chip.append(el("code", "mono", m));
+        // 单击胶囊 → 复制模型名（2026-11-11 用户定稿：右键菜单只有复制
+        // 一项，不值得绕一层）：剪贴板走后端 copy_text（与授权码同路，
+        // 非敏感内容不做 30 秒清除）；右键同效并压掉 WebView 默认菜单
+        const copyModel = (): void => {
+          void (async () => {
+            try {
+              await invoke("copy_text", { text: m });
+              toast(t("modelCopied"));
+            } catch (e) {
+              toast(syncUserError(String(e)), false);
+            }
+          })();
+        };
+        chip.addEventListener("click", copyModel);
+        chip.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault();
+          copyModel();
+        });
         modelsRow.append(chip);
       }
     }
@@ -1559,7 +2054,7 @@ async function renderMain(): Promise<void> {
           refresh();
           toast(t("keyCheck", checkLabel(c.label), c.http ? t("httpCode", c.http) : ""));
         } catch (e) {
-          toast(String(e), false);
+          toast(syncUserError(String(e)), false);
         }
       }),
     );
@@ -1581,7 +2076,16 @@ async function renderMain(): Promise<void> {
             toast(t("deleted", r.name));
             await refresh();
           } catch (e) {
-            toast(String(e), false);
+            if (isAuthError(String(e))) {
+          markAuthInvalid();
+        } else if (/\bHTTP 404\b|not installed/.test(String(e))) {
+          // 404(仓库不可见):合成「未安装」诊断,引导条立即渲染安装
+          // 引导,不等异步诊断(2026-11-04 卸载后同步实测)。**只有 404
+          // 进此分支**——旧写法 else 吞一切,绑定失效串曾落此处又被
+          // 真实诊断顶掉,引导条消失(2026-11-10 用户实测)
+          markAuthInvalid(true);
+        }
+            toast(syncUserError(String(e)), false);
           }
         });
       })();
@@ -1615,6 +2119,8 @@ async function renderMain(): Promise<void> {
       // 禁用而非点了再报"已是最新"的假成功
       syncBtn.disabled = !st.remote;
       syncBtn.dataset.tip = st.remote ? "" : t("syncStandaloneHint");
+      // 绑定失效折叠为未绑定(2026-11-10 用户拍板):rust 侧 status 的
+      // remote 已按凭据存在折叠,chip 自然显示「已绑定远端/单机模式」
       const remoteChip = el("span", "chip chip-remote", st.remote ? t("remoteBound") : t("standaloneMode"));
       if (st.pending) chips.append(el("span", "chip chip-warn", t("unpushedPending")));
       if (st.last_sync) {
@@ -1640,7 +2146,17 @@ async function renderMain(): Promise<void> {
         toast(fmtSyncResult(v), !v.push_error);
         await refresh();
       } catch (e) {
-        toast(String(e), false);
+        // 认证失败且续期未救场 → 置授权失效态（引导条 + chip）
+        if (isAuthError(String(e))) {
+          markAuthInvalid();
+        } else if (/\bHTTP 404\b|not installed/.test(String(e))) {
+          // 404(仓库不可见):合成「未安装」诊断,引导条立即渲染安装
+          // 引导,不等异步诊断(2026-11-04 卸载后同步实测)。**只有 404
+          // 进此分支**——旧写法 else 吞一切,绑定失效串曾落此处又被
+          // 真实诊断顶掉,引导条消失(2026-11-10 用户实测)
+          markAuthInvalid(true);
+        }
+        toast(syncUserError(String(e)), false);
       }
     }),
   );
@@ -1689,6 +2205,127 @@ function clearDrawerDraft(): void {
   drawerDraft = null;
 }
 
+
+/**
+ * 修改解锁密码抽屉（设置页「安全」区块入口，2026-11-03 补齐）：验当前
+ * 密码 → 输新密码（带强度条，软提示不拦截）→ 确认后落盘。
+ *
+ * 绑定远端时显示"其他设备需用新密码"的提示（远端将以新密文覆盖）。
+ * 键盘与关闭语义对齐记录抽屉：Escape / 点遮罩关闭（busy 态禁关），
+ * 输入框内 Enter 直接保存。
+ */
+function openPassDrawer(remoteBound: boolean): void {
+  if (document.querySelector(".overlay")) return; // 幂等：不叠抽屉
+  const overlay = el("div", "overlay");
+  const drawer = el("div", "drawer");
+  drawer.append(el("h2", "", t("changePassphrase")));
+  drawer.append(el("p", "muted", t("changePassTitle")));
+
+  const field = (labelText: string, control: HTMLElement): HTMLElement => {
+    const wrap = el("div", "field");
+    wrap.append(el("div", "field-label", labelText), control);
+    return wrap;
+  };
+
+  const oldPass = el("input", "input grow");
+  oldPass.type = "password";
+  oldPass.placeholder = t("oldPass");
+  const newPass = el("input", "input grow");
+  newPass.type = "password";
+  newPass.placeholder = t("newPass");
+  // 新密码强度条（软提示）：紧贴新密码框，空输入隐藏
+  const meter = strengthMeter(newPass);
+  const newPass2 = el("input", "input grow");
+  newPass2.type = "password";
+  newPass2.placeholder = t("confirmNewPass");
+
+  const errBox = el("p", "warn hidden");
+  const actions = el("div", "drawer-actions");
+  const cancel = el("button", "btn", t("cancel"));
+  cancel.type = "button";
+  const save = el("button", "btn btn-primary", t("save"));
+  save.type = "button";
+  const closeDrawer = () => overlay.remove();
+  cancel.addEventListener("click", closeDrawer);
+
+  save.addEventListener("click", () => {
+    // 全量同步校验（一次标出所有错误，焦点落第一个出错框）
+    const bads: HTMLInputElement[] = [];
+    const bad = (i: HTMLInputElement, msg: string) => {
+      fieldError(i, msg);
+      bads.push(i);
+    };
+    if (!oldPass.value) bad(oldPass, t("oldPassRequired"));
+    if (!newPass.value) bad(newPass, t("newPassRequired"));
+    // 长度硬性限制(8–128 字符,与后端 validate_passphrase 同规则)
+    else if ([...newPass.value].length < 8) bad(newPass, t("passTooShort"));
+    else if ([...newPass.value].length > 128) bad(newPass, t("passTooLong"));
+    else if (newPass.value !== newPass2.value) bad(newPass2, t("passMismatch"));
+    if (bads.length > 0) {
+      bads[0].focus();
+      return;
+    }
+    errBox.classList.add("hidden");
+    // 保存 = 重加密 + 可推送远端（网络），需要一两秒
+    void withBusy(save, t("saving"), async () => {
+      cancel.disabled = true; // 保存进行中禁止中途关闭，防止状态不清
+      try {
+        await invoke("change_passphrase", {
+          oldPassphrase: oldPass.value,
+          newPassphrase: newPass.value,
+        });
+        toast(t("passChanged"));
+        overlay.remove();
+      } catch (e) {
+        if (isAuthError(String(e))) {
+          markAuthInvalid();
+        } else if (/\bHTTP 404\b|not installed/.test(String(e))) {
+          // 404(仓库不可见):合成「未安装」诊断,引导条立即渲染安装
+          // 引导,不等异步诊断(2026-11-04 卸载后同步实测)。**只有 404
+          // 进此分支**——旧写法 else 吞一切,绑定失效串曾落此处又被
+          // 真实诊断顶掉,引导条消失(2026-11-10 用户实测)
+          markAuthInvalid(true);
+        }
+        errBox.textContent = syncUserError(String(e));
+        errBox.classList.remove("hidden");
+      } finally {
+        cancel.disabled = false;
+      }
+    });
+  });
+
+  overlay.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      if (!save.disabled) closeDrawer();
+    } else if (ev.key === "Enter" && (ev.target as HTMLElement).tagName === "INPUT") {
+      ev.preventDefault();
+      save.click();
+    }
+  });
+  actions.append(cancel, save);
+
+  drawer.append(
+    field(t("oldPass"), passField(oldPass)),
+    field(t("newPass"), passField(newPass)),
+    meter.el,
+    field(t("confirmNewPass"), passField(newPass2)),
+  );
+  if (remoteBound) drawer.append(el("p", "warn", t("passChangeWarn")));
+  drawer.append(errBox, actions);
+  overlay.append(drawer);
+  // 遮罩空白关闭的 mousedown 守卫：与记录抽屉同因（WebView2 密码框
+  // 自动填充会产生合成 click，必须确认"先在遮罩按下"）
+  let pressedOnOverlay = false;
+  overlay.addEventListener("mousedown", (ev) => {
+    pressedOnOverlay = ev.target === overlay;
+  });
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay && pressedOnOverlay && !save.disabled) closeDrawer();
+  });
+  document.body.appendChild(overlay);
+  oldPass.focus();
+}
 
 function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): void {
   // 幂等闸门：已有抽屉打开时忽略（连点 Add/Edit 不会叠出多层抽屉）
@@ -1754,7 +2391,7 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
       try {
         key.value = await invoke<string>("reveal_key", { id: existing.id });
       } catch (e) {
-        toast(String(e), false);
+        toast(syncUserError(String(e)), false);
         return;
       }
     }
@@ -1919,7 +2556,7 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
         try {
           keyVal = await invoke<string>("reveal_key", { id: existing.id });
         } catch (e) {
-          toast(String(e), false);
+          toast(syncUserError(String(e)), false);
           return;
         }
       }
@@ -1955,7 +2592,7 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
         pickWrap.classList.remove("hidden");
         renderPickList();
       } catch (e) {
-        toast(String(e), false);
+        toast(syncUserError(String(e)), false);
       }
     });
   fetchBtn.addEventListener("click", fetchBtnHandler);
@@ -2024,7 +2661,16 @@ function openDrawer(existing: RecordView | null, onSaved: () => Promise<void>): 
       overlay.remove();
       await onSaved();
     } catch (e) {
-      errBox.textContent = String(e);
+      if (isAuthError(String(e))) {
+          markAuthInvalid();
+        } else if (/\bHTTP 404\b|not installed/.test(String(e))) {
+          // 404(仓库不可见):合成「未安装」诊断,引导条立即渲染安装
+          // 引导,不等异步诊断(2026-11-04 卸载后同步实测)。**只有 404
+          // 进此分支**——旧写法 else 吞一切,绑定失效串曾落此处又被
+          // 真实诊断顶掉,引导条消失(2026-11-10 用户实测)
+          markAuthInvalid(true);
+        }
+      errBox.textContent = syncUserError(String(e));
       errBox.classList.remove("hidden");
     }
   }
@@ -2123,7 +2769,7 @@ async function renderSettings(
   try {
     s = await invoke<SettingsView>("get_settings");
   } catch (e) {
-    toast(String(e), false);
+    toast(syncUserError(String(e)), false);
     return;
   }
   // 语言/主题切换会整页重建设置页：先快照未保存的编辑（2026-10-26
@@ -2132,7 +2778,7 @@ async function renderSettings(
   // 刚清空的地址又填回输入框，看起来像解绑没生效（2026-10-31 修复）
   const keep = keepEdits ? snapshotFields() : {};
   $app.replaceChildren();
-  const shell = el("div", "shell");
+  const shell = el("div", "shell settings-shell");
   const top = el("div", "topbar");
   const back = el("button", "btn btn-small", t("back"));
   back.prepend(icon("back"));
@@ -2143,86 +2789,183 @@ async function renderSettings(
 
   const body = el("div", "settings");
   const h2Sync = el("h2", "", t("syncSection"));
-  const remote = el("input", "input");
-  remote.type = "url";
-  remote.placeholder = t("remotePlaceholder");
-  remote.dataset.tip = t("remoteHint"); // 细则走 hover 提示
-  remote.value = s.remote ?? "";
-  remote.dataset.field = "remote";
-  // 同步区块单按钮（2026-10-31 拍板：语义从绑定状态派生，D27）——
-  // 已绑定 → 「解绑 GitHub」（清令牌 + 解绑，危险动作红字 + 确认框）；
-  // 未绑定 → 「重新授权 GitHub」（设备流授权，绑定保持空）。
-  // 两个后端命令原样复用，前端只按 s.remote 选择渲染哪个动作。
-  // 尺寸对齐「检查更新」的小按钮（btn-small，2026-10-31 反馈：大按钮
-  // 与设置页行式布局不协调）
+  // ---- 远端绑定(2026-11-10 重设计):状态与操作分离,不再有
+  // 「空 = 单机」的魔法输入框——空值有歧义(没填?故意清空?),且解绑
+  // 这种敏感操作不该用清空文本承载。已绑定:只读展示仓库 + 「解绑」
+  // (清授权+解绑,回单机);未绑定:「绑定仓库」按钮 → 展开输入表单。
+  // 两步(解绑→绑定)与旧一步改绑等价:下次同步走保险合并,数据无损。
+  // 重新授权的入口仍只有主界面失效引导条(2026-11-09 定调)。
+  const repoRow = el("div", "setting-row");
+  // 绑定失效折叠为未绑定(2026-11-10 用户拍板:用户只感知绑定与未绑定
+  // 两态,不拿气泡批注失效):bindingBroken 时整页按未绑定渲染——地址
+  // 显示「未绑定」、按钮显示「绑定仓库」;重绑走同一授权流程
+  const remoteUi = bindingBroken() ? null : s.remote;
+  // 显示完整 GitHub 路径(与 CLI `mak remote show` 一致)——用户应清晰
+  // 感知 Makara 依赖 GitHub;存储形态保持归一化 owner/name(D27)不变。
+  // URL 可单击:经系统浏览器打开仓库页(2026-11-10 用户需求)
+  const repoValue = remoteUi
+    ? (() => {
+        const url = `https://github.com/${s.remote}`;
+        const link = el("a", "repo-link", url);
+        link.href = url;
+        link.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          // 外链一律系统浏览器(WebView 内导航会离开应用)
+          void invoke("open_external", { url }).catch(() => {});
+        });
+        return link;
+      })()
+    : el("span", "", t("repoUnbound"));
+  if (remoteUi) repoValue.classList.add("repo-value");
+  repoRow.append(el("label", "", t("repoLabel")), repoValue);
+
+
+  const doReauthorize = (btn: HTMLButtonElement): void => {
+    void withBusy(btn, t("reauthorizing"), async () => {
+      try {
+        const stage = await invoke<InitStage>("github_reauthorize");
+        if (stage.stage === "device_code") {
+          // 来源是设置页:返回设置页;完成后接管分支自动建仓+绑定。
+          // 先刷新诊断再重开——失效标注/按钮按新状态渲染,否则旧诊断
+          // (authorized:false)会让页面继续呈现失效态
+          showDeviceCode(stage.user_code, stage.verification_uri, () => {
+            void refreshAuthDiag().then(() => void renderSettings(onBack));
+          });
+        }
+      } catch (e) {
+        toast(syncUserError(String(e)), false);
+      }
+    });
+  };
   const syncBtn2 = el(
     "button",
-    s.remote ? "btn btn-small btn-danger" : "btn btn-small",
-    s.remote ? t("unbindGithub") : t("reauthorizeGithub"),
+    remoteUi ? "btn btn-small btn-danger" : "btn btn-small",
+    remoteUi ? t("unbindGithub") : t("bindRepo"),
   );
   syncBtn2.addEventListener("click", () => {
-    if (!s.remote) {
-      // 未绑定：重新授权（设备流，完成后本页不动，令牌已入库）
-      void withBusy(syncBtn2, t("reauthorizing"), async () => {
-        try {
-          const stage = await invoke<InitStage>("github_reauthorize");
-          if (stage.stage === "device_code") {
-            showDeviceCode(stage.user_code, stage.verification_uri);
-          }
-        } catch (e) {
-          toast(String(e), false);
-        }
-      });
+    if (!remoteUi) {
+      // 未绑定：走授权(device flow)——完成后接管分支自动建仓/复用
+      // 默认仓库(用户名/myapikey-vault)并写绑定,全程零输入
+      // (2026-11-10 用户纠正:绑定不该让用户手动填地址,MakaraApp
+      // 透明化 GitHub 层正是产品的承诺)
+      doReauthorize(syncBtn2);
       return;
     }
     // 已绑定：解绑（清令牌 + 解绑，一次写清）——确认后执行；
     // 数据层一次写清后重开设置页，从 get_settings 重新派生
-    // （远端框清空、按钮自动变回「重新授权」），主界面 chips 由
-    // 返回时的 renderMain 重读
+    // （状态行变回「未绑定」），主界面 chips 由返回时的 renderMain 重读
     void (async () => {
       if (!(await confirmBox(t("unbindGithubConfirm"), t("unbindGithub")))) return;
       await withBusy(syncBtn2, t("creating"), async () => {
         try {
           await invoke("forget_github_token");
           toast(t("unboundGithub"));
+          // 解绑即离开失效态:清标记与旧诊断,否则残留的失效判定会让
+          // 未绑定状态继续显示失效标注与重新绑定按钮(2026-11-10)
+          authInvalid = false;
+          authDiag = null;
           // keepEdits=false：数据层刚清掉绑定，不能把旧地址回填回输入框
           await renderSettings(onBack, false);
         } catch (e) {
-          toast(String(e), false);
+          toast(syncUserError(String(e)), false);
         }
       });
     })();
   });
 
+  const h2Backup = el("h2", "", t("backupSection"));
+  // ---- 备份与迁移（D47）：与 CLI export/import 同语义同格式。导出 =
+  // 两道确认（明文泄露警示，对齐 CLI 双确认）→ Downloads 时间戳文件名；
+  // 导入 = WebView 原生文件选择器（零依赖，不用 dialog 插件）→ 确认 →
+  // 后端按 id LWW 合并（core import_records），零变化直接提示
+  const exportRow = el("div", "setting-row");
+  const exportBtn = el("button", "btn btn-small", t("exportBtn"));
+  exportBtn.type = "button";
+  exportBtn.addEventListener("click", () => {
+    void (async () => {
+      if (!(await confirmBox(t("exportConfirm"), t("exportBtn")))) return;
+      await withBusy(exportBtn, t("saving"), async () => {
+        // 另存为对话框（D49）：取消 = 放弃本次导出；默认名 makara-export-<时间戳>
+        const d = new Date();
+        const pad = (n: number): string => String(n).padStart(2, "0");
+        const ts = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+        const target = await saveDialog({
+          title: t("exportBtn"),
+          defaultPath: `makara-export-${ts}.json`,
+          filters: [{ name: "JSON", extensions: ["json"] }],
+        });
+        if (!target) return;
+        try {
+          const v = await invoke<{ path: string; count: number }>("export_records", {
+            path: target,
+          });
+          toast(t("exportedPath", v.path));
+        } catch (e) {
+          toast(syncUserError(String(e)), false);
+        }
+      });
+    })();
+  });
+  exportRow.append(el("label", "", t("exportLabel")), exportBtn);
+
+  const importRow = el("div", "setting-row");
+  const importBtn = el("button", "btn btn-small", t("importBtn"));
+  importBtn.type = "button";
+  importBtn.addEventListener("click", () => {
+    // WebView 原生文件选择器：选中后读文本直接交给后端合并（导入是
+    // 无损操作——按 id 只增改不删除，无需确认，与 CLI import 一致）
+    const inp = document.createElement("input");
+    inp.type = "file";
+    inp.accept = ".json,application/json";
+    inp.addEventListener("change", () => {
+      void (async () => {
+        const f = inp.files?.[0];
+        if (!f) return;
+        const json = await f.text();
+        await withBusy(importBtn, t("saving"), async () => {
+          try {
+            const v = await invoke<{ added: number; updated: number; backup_path: string | null }>(
+              "import_records",
+              { json },
+            );
+            if (v.added + v.updated === 0) {
+              toast(t("importedNone"));
+            } else {
+              toast(t("importedSummary", String(v.added), String(v.updated)));
+              if (v.backup_path) {
+                toast(t("importedBackup", v.backup_path));
+              }
+            }
+          } catch (e) {
+            toast(syncUserError(String(e)), false);
+          }
+        });
+      })();
+    });
+    inp.click();
+  });
+  importRow.append(el("label", "", t("importLabel")), importBtn);
+
   const h2Behavior = el("h2", "", t("behaviorSection"));
-  const mkNum = (
-    field: string,
-    label: string,
-    val: number,
-    suffix: string,
-    hint?: string,
-  ): [HTMLInputElement, HTMLElement] => {
-    const row = el("div", "setting-row");
-    const num = el("input", "input num");
-    num.type = "number";
-    num.min = "0";
-    num.dataset.field = field;
-    num.value = String(val);
-    if (hint) num.dataset.tip = hint; // 细则走 hover 提示，文案本体保持简洁
-    row.append(el("label", "", label), num, el("span", "muted", suffix));
-    return [num, row];
-  };
-  // 墓碑保留期已从设置页移除（2026-10-25 主人决议）：它是同步引擎的
-  // 内部正确性参数，默认 30 天对所有人足够，暴露只会制造困惑；
-  // 原值原样回传，进阶用户仍可改 config.toml 的 tombstone_days。
-  const [remember, rememberRow] = mkNum("rememberDays", t("rememberFor"), s.remember_days, t("daysUnit"), t("daysNeverHint"));
-  const [lockMin, lockRow] = mkNum("lockMinutes", t("autoLock"), s.auto_lock_minutes, t("minutesUnit"), t("minutesOffHint"));
+  // ---- 安全（2026-11-03 补齐 GUI 改解锁密码入口）：行式小按钮，点击开
+  // 抽屉表单（验旧密码 + 新密码强度条）；区块紧跟同步——改密码会以新
+  // 密文覆盖远端，语义上与同步强相关
+  const h2Security = el("h2", "", t("securitySection"));
+  const passRow = el("div", "setting-row");
+  const passBtn = el("button", "btn btn-small", t("changePassphrase"));
+  passBtn.type = "button";
+  passBtn.addEventListener("click", () => openPassDrawer(!!remoteUi));
+  passRow.append(passBtn);
 
   const autoPushRow = el("div", "setting-row");
   const autoPush = el("input");
   autoPush.type = "checkbox";
   autoPush.checked = s.auto_push;
   autoPushRow.append(el("label", "", t("autoPush")), autoPush);
+  autoPush.addEventListener("change", () => {
+    const msg = autoPush.checked ? t("savedAutoPushOn") : t("savedAutoPushOff");
+    void persistSettings(msg);
+  });
 
   // 外观区（D14）：主题与语言均为本机偏好（localStorage），切换即时生效，
   // 不走"Save settings"——它们与 config.toml 无关，立即重渲染本页以新外观呈现
@@ -2244,6 +2987,30 @@ async function renderSettings(
     row.append(el("label", "", label), dd.root);
     return row;
   };
+  // 空闲自动锁定:D32 统一后用预设档位下拉(2026-11-04,连续数字输入
+  // +「填 0」提示已废)。永不 = 记住副本不过期;存量手改 config 的值
+  // 显示时就近归档,保存后即精确落档。
+  const LOCK_PRESETS = [5, 10, 15, 30, 60, 240, 480, 0];
+  const lockLabel = (m: number): string =>
+    m === 0 ? t("lockNever") : m >= 60 ? t("lockHours", m / 60) : t("lockMinutesOpt", m);
+  const nearestPreset = (m: number): number => {
+    let best = LOCK_PRESETS[0]!;
+    for (const p of LOCK_PRESETS) {
+      if (Math.abs(p - m) < Math.abs(best - m)) best = p;
+    }
+    return best;
+  };
+  let lockMinutes = nearestPreset(s.auto_lock_minutes);
+  const lockRow = mkSelect(
+    t("autoLock"),
+    LOCK_PRESETS.map((p) => [String(p), lockLabel(p)] as [string, string]),
+    String(lockMinutes),
+    (v) => {
+      lockMinutes = Number(v);
+      void persistSettings(t("savedLock", lockLabel(lockMinutes)));
+    },
+  );
+
   const themeRow = mkSelect(
     t("themeLabel"),
     [
@@ -2256,6 +3023,11 @@ async function renderSettings(
       prefs.theme = v as ThemePref;
       savePrefs();
       applyTheme();
+      // 提示带新值:值文案按选项表回查(明亮/暗黑/跟随系统)
+      const themeText = { light: t("themeLight"), dark: t("themeDark"), system: t("themeSystem") }[
+        v as ThemePref
+      ];
+      toast(t("savedTheme", themeText));
       void renderSettings(onBack);
     },
   );
@@ -2270,40 +3042,54 @@ async function renderSettings(
       prefs.lang = v as Lang;
       savePrefs();
       applyLang();
-      void renderSettings(onBack); // 立即以新语言重渲染本页
+      toast(t("savedLang", v === "en" ? "English" : "中文"));
+      void renderSettings(onBack); // 立即以新语言重渲染本页(提示随重建后 toast 显示)
     },
   );
 
-  const errBox = el("p", "warn hidden");
-  const save = el("button", "btn btn-primary", t("saveSettings"));
-  // 数字输入清洗：空串/非数字 → NaN → 0；负数截为 0（后端 u32 不接受负值）
-  const numOf = (v: string): number => Math.max(0, Math.floor(Number(v) || 0));
-  save.addEventListener("click", () =>
-    void withBusy(save, t("saving"), async () => {
-      // remote 前置校验（后端 set_remote 仍兜底）：非法时留在本页提示
-      const remoteVal = remote.value.trim();
-      if (remoteVal && !isValidRemoteUrl(remoteVal)) {
-        fieldError(remote, t("invalidRemote"));
-        return;
-      }
-      try {
-        await invoke("set_settings", {
-          settings: {
-            remote: remoteVal || null,
-            tombstone_days: s.tombstone_days,
-            auto_push: autoPush.checked,
-            remember_days: numOf(remember.value),
-            auto_lock_minutes: numOf(lockMin.value),
-          },
-        });
-        toast(t("settingsSaved"));
-        await onBack();
-      } catch (e) {
-        errBox.textContent = String(e);
-        errBox.classList.remove("hidden");
-      }
-    }),
+  // ---- 日志（2026-11-05 用户需求）：错误详情落文件不进界面,级别可控;
+  // 「打开日志文件夹」直达排查现场
+  let logLevel = s.log_level || "info"; // 旧 mock 种子/异常数据兜底
+  const LOG_PRESETS: [string, string][] = [
+    ["off", t("logOff")],
+    ["error", t("logError")],
+    ["info", t("logInfo")],
+    ["debug", t("logDebug")],
+  ];
+  const logLevelRow = mkSelect(
+    t("logLevel"),
+    LOG_PRESETS,
+    logLevel,
+    (v) => {
+      logLevel = v;
+      const label = LOG_PRESETS.find(([k]) => k === v)?.[1] ?? v;
+      void persistSettings(t("savedLogLevel", label));
+    },
   );
+
+  // ---- 日志区（2026-11-05 用户需求）：级别可控 + 文件夹直达;
+  // 错误详情在日志文件里,界面只保留简短现象
+  const h2Logs = el("h2", "", t("logSection"));
+
+
+  // ---- 即时保存（D33）：设置页无「保存设置」按钮，每项配置改完即生效 ----
+  // 远端绑定改由独立的绑定表单保存(见上),不在此函数
+  async function persistSettings(savedToast: string): Promise<void> {
+    try {
+      await invoke("set_settings", {
+        settings: {
+          remote: s.remote,
+          tombstone_days: s.tombstone_days,
+          auto_push: autoPush.checked,
+          auto_lock_minutes: lockMinutes,
+          log_level: logLevel,
+        },
+      });
+      toast(savedToast);
+    } catch (e) {
+      toast(syncUserError(String(e)), false);
+    }
+  }
 
   // ---- 更新（D16）：当前版本 + 检查 + 破坏性守卫 ----
   const h2Update = el("h2", "", t("updateSection"));
@@ -2345,13 +3131,13 @@ async function renderSettings(
               // 成功路径在安装完成后由应用重启接管，不会走到这里
               await invoke("apply_update");
             } catch (e) {
-              toast(String(e), false);
+              toast(syncUserError(String(e)), false);
             }
           }),
         );
         updateRow.append(upgradeBtn);
       } catch (e) {
-        toast(String(e), false);
+        toast(syncUserError(String(e)), false);
       }
     }),
   );
@@ -2360,7 +3146,30 @@ async function renderSettings(
     .then((v) => (versionLabel.textContent = t("currentVersion", v)))
     .catch(() => {});
   updateRow.append(versionLabel, checkBtn);
-  body.append(h2Sync, remote, syncBtn2, h2Behavior, rememberRow, lockRow, autoPushRow, h2Appearance, themeRow, langRow, h2Update, updateRow, updateResult, errBox, save);
+  const syncActions = el("div", "field-row");
+  syncActions.append(syncBtn2);
+
+  body.append(
+    h2Sync,
+    repoRow,
+    syncActions,
+    h2Security,
+    passRow,
+    h2Backup,
+    exportRow,
+    importRow,
+    h2Behavior,
+    lockRow,
+    autoPushRow,
+    h2Logs,
+    logLevelRow,
+    h2Appearance,
+    themeRow,
+    langRow,
+    h2Update,
+    updateRow,
+    updateResult,
+  );
   shell.append(top, body);
   $app.append(shell);
   // 回填必须在挂载到 document 之后：restoreFields 走 document 查询，

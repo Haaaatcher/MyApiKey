@@ -42,8 +42,9 @@ interface MockStore {
     remote: string | null;
     tombstone_days: number;
     auto_push: boolean;
-    remember_days: number;
     auto_lock_minutes: number;
+    /** 文件日志级别——mock 不写文件,仅字段保真供设置页交互。 */
+    log_level: string;
     /** 最近一次对账时刻（对齐真实 config.last_sync_at，sync 成功时刷新）。 */
     last_sync: string | null;
   };
@@ -60,8 +61,8 @@ function load(): MockStore {
       remote: null,
       tombstone_days: 30,
       auto_push: true,
-      remember_days: 7,
       auto_lock_minutes: 10,
+      log_level: "info",
       last_sync: null,
     },
   };
@@ -151,13 +152,17 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
     }
     case "init_finish": {
       // 与真实 init_finish 对齐：接入模式以密码解密远端（不匹配即拒绝），
-      // 新设模式直接以该密码加密空 vault（真实后端不做长度校验）。
+      // 新设模式直接以该密码加密空 vault；长度硬性限制同真实后端。
       const pass = String(args?.passphrase ?? "");
       if (localStorage.getItem("mak-mock-remote-has-data")) {
         const expected = localStorage.getItem("mak-mock-remote-pass") ?? "remote";
         if (pass !== expected) {
           return err("cannot decrypt the remote vault with the given passphrase. All devices must use the same master passphrase");
         }
+      } else if ([...pass].length < 8) {
+        return err("passphrase must be at least 8 characters");
+      } else if ([...pass].length > 128) {
+        return err("passphrase must be at most 128 characters");
       }
       s.initialized = true;
       s.unlocked = true;
@@ -185,7 +190,7 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
       return ok(true as T);
     case "unlock": {
       const expected = s.pass ?? "mock"; // 旧 mock 状态未存密码时退回历史固定值
-      if (String(args?.passphrase) !== expected) return err("wrong master passphrase, or the vault data is corrupted");
+      if (String(args?.passphrase) !== expected) return err("wrong passphrase, or the vault data is corrupted");
       s.unlocked = true;
       save(s);
       return ok(undefined as T);
@@ -200,6 +205,20 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
       s.unlocked = false;
       save(s);
       return ok(undefined as T);
+    case "change_passphrase": {
+      if (!s.unlocked) return err("locked — unlock first");
+      const expected = s.pass ?? "mock"; // 与 unlock 同源：旧状态退回历史固定值
+      if (String(args?.old_passphrase) !== expected) {
+        return err("the current passphrase is incorrect");
+      }
+      const next = String(args?.new_passphrase ?? "");
+      // 长度硬性限制同真实后端(8–128 字符)
+      if ([...next].length < 8) return err("passphrase must be at least 8 characters");
+      if ([...next].length > 128) return err("passphrase must be at most 128 characters");
+      s.pass = next;
+      save(s);
+      return ok(undefined as T);
+    }
     case "list_records": {
       if (!s.unlocked) return err("locked — unlock first");
       return ok(
@@ -252,6 +271,41 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
       save(s);
       return ok(undefined as T);
     }
+    case "export_records": {
+      if (!s.unlocked) return err("locked — unlock first");
+      // mock：浏览器无法真实写盘，返回一个示意路径（UI 流程验证用）
+      return ok({
+        path: "C:\\Users\\mock\\Downloads\\makara-export-mock.json",
+        count: s.records.length,
+      } as T);
+    }
+    case "import_records": {
+      if (!s.unlocked) return err("locked — unlock first");
+      // mock：解析数组形状，全部按新增合并进 mock 状态（UI 流程验证用）
+      let arr: Array<Record<string, unknown>>;
+      const raw = String(args?.json ?? "");
+      try {
+        const parsed = JSON.parse(raw);
+        arr = Array.isArray(parsed) ? parsed : (parsed.records ?? []);
+      } catch {
+        return err("import file is not a valid record array");
+      }
+      let added = 0;
+      for (const item of arr) {
+        const r = item as { id?: string; name?: string };
+        if (!r.id || !r.name) continue;
+        if (s.records.some((x) => x.id === r.id)) continue;
+        s.records.push({
+          id: r.id, name: r.name, protocol: "openai",
+          base_url: "", api_key: "", models: [], notes: null,
+          created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+          deleted: false,
+        } as unknown as typeof s.records[number]);
+        added += 1;
+      }
+      save(s);
+      return ok({ added, updated: 0, backup_path: null } as T);
+    }
     case "reveal_key": {
       if (!s.unlocked) return err("locked — unlock first");
       const r = s.records.find((x) => x.id === args?.id);
@@ -288,6 +342,19 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
       if (!s.settings.remote) {
         return err("standalone mode: no remote is bound to sync with. Bind one on the settings page");
       }
+      // 调试开关：置 mak-mock-sync-401 可预览授权失效路径（引导条 + chip）
+      if (localStorage.getItem("mak-mock-sync-401")) {
+        return err(
+          'GitHub rejected the request (HTTP 401): { "message": "Bad credentials" } ; automatic token refresh failed too: no refresh token stored — re-authorize GitHub from the settings page',
+        );
+      }
+      // 调试开关：置 mak-mock-sync-404 可预览「仓库不可见」路径——引导条
+      // 应显示**安装引导**而非「授权已失效」（2026-11-04 状态错显回归）
+      if (localStorage.getItem("mak-mock-sync-404")) {
+        return err(
+          'repository not found or not accessible by this token (HTTP 404): { "message": "Not Found" }. If you use a GitHub App, check that it is installed and includes this repo.',
+        );
+      }
       s.settings.last_sync = new Date().toISOString();
       save(s);
       return ok({ pulled: false, merged: false, pushed: false, push_error: null, alive: s.records.length } as T);
@@ -297,6 +364,26 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
         pending: localStorage.getItem("mak-mock-pending") === "1",
         last_sync: s.settings.last_sync,
         alive: s.records.length,
+      } as T);
+    case "github_install_url":
+      // 与 core 的 APP_SLUG_DEFAULT 同源(浏览器 mock 无后端,这里镜像)
+      return ok("https://github.com/apps/makaraapp/installations/new" as T);
+    case "diagnose_github":
+      // 调试开关:置 mak-mock-app-not-installed 可模拟「App 未安装」
+      // (引导安装);置 mak-mock-app-scope-excluded 可模拟「已安装但
+      // 范围不含同步仓库」(引导调整仓库范围);置 mak-mock-token-expired
+      // 可模拟「令牌失效」(引导重新授权)——2026-11-04 引导条三态验证
+      const scopeExcluded = localStorage.getItem("mak-mock-app-scope-excluded") === "1";
+      const notInstalled =
+        !scopeExcluded && localStorage.getItem("mak-mock-app-not-installed") === "1";
+      const tokenExpired = localStorage.getItem("mak-mock-token-expired") === "1";
+      return ok({
+        authorized: s.initialized,
+        tokenValid: !tokenExpired,
+        installed: !notInstalled,
+        installUrl: "https://github.com/apps/makaraapp/installations/new",
+        remoteBound: !!s.settings.remote,
+        repoAccessible: s.settings.remote ? !notInstalled && !scopeExcluded : null,
       } as T);
     case "get_settings":
       return ok(s.settings as T);

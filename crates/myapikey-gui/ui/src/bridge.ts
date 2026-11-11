@@ -16,6 +16,13 @@ interface TauriGlobal {
       Channel?: new () => unknown;
     };
     event: { listen: (name: string, cb: (e: { payload: unknown }) => void) => Promise<() => void> };
+    dialog?: {
+      save: (opts: {
+        title?: string;
+        defaultPath?: string;
+        filters?: Array<{ name: string; extensions: string[] }>;
+      }) => Promise<string | null>;
+    };
   };
 }
 
@@ -29,12 +36,38 @@ export function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<
   return mockInvoke<T>(cmd, args);
 }
 
+/**
+ * 另存为对话框（dialog 插件，D49）：返回用户选定的路径；取消返回
+ * `null`。浏览器 mock 模式无 Tauri 环境——返回 `defaultPath` 本身，
+ * 让导出流程在 mock 验证中继续走通（路径即 mock 示意值）。
+ */
+export async function saveDialog(opts: {
+  title?: string;
+  defaultPath?: string;
+  filters?: Array<{ name: string; extensions: string[] }>;
+}): Promise<string | null> {
+  const dlg = tauri?.dialog;
+  if (!dlg) return opts.defaultPath ?? null;
+  return dlg.save(opts) as Promise<string | null>;
+}
+
 /** 监听自动锁事件（浏览器 mock 模式下不触发）。 */
 export async function onLocked(cb: () => void): Promise<void> {
   if (tauri) {
     await tauri.event.listen("locked", cb);
   } else {
     await mockListen(cb);
+  }
+}
+
+/**
+ * 监听启动期授权失效事件（2026-11-03）：后端启动线程主动续期失败
+ * （刷新令牌同样失效等）时发出，前端据此显示「授权已失效」引导条。
+ * 浏览器 mock 模式无真实令牌，不会触发。
+ */
+export async function onAuthInvalid(cb: (reason: string) => void): Promise<void> {
+  if (tauri) {
+    await tauri.event.listen("auth-invalid", (e) => cb(String(e.payload ?? "")));
   }
 }
 

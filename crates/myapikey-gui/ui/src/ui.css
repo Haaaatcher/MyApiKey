@@ -180,7 +180,7 @@ body {
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
 .mono { font-family: Consolas, "Cascadia Mono", monospace; }
-.hidden { display: none; }
+.hidden { display: none !important; }
 .warn { color: var(--warn); font-size: 12.5px; }
 .link { color: var(--accent); }
 
@@ -258,7 +258,7 @@ body {
   font-size: 12px;
 }
 .lang-toggle svg { width: 13px; height: 13px; }
-.steps { padding-left: 20px; display: grid; gap: 6px; }
+.steps { padding-left: 20px; display: grid; gap: 6px; counter-reset: gaf; }
 
 /* ---------------------------------------------------------------------------
  * 主界面骨架
@@ -530,7 +530,7 @@ body {
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
 .mono { font-family: Consolas, "Cascadia Mono", monospace; }
-.hidden { display: none; }
+.hidden { display: none !important; }
 .warn { color: var(--warn); font-size: 12.5px; }
 .link { color: var(--accent); }
 
@@ -608,7 +608,7 @@ body {
   font-size: 12px;
 }
 .lang-toggle svg { width: 13px; height: 13px; }
-.steps { padding-left: 20px; display: grid; gap: 6px; }
+.steps { padding-left: 20px; display: grid; gap: 6px; counter-reset: gaf; }
 
 /* ---------------------------------------------------------------------------
  * 主界面骨架
@@ -808,6 +808,34 @@ body {
 /* 密码行：输入框 + 眼睛按钮，按钮相对较高的输入框垂直居中 */
 .pass-row { align-items: center; }
 
+/* 密码强度条（软提示，初始化页设置新密码时）：4 段色块 + 档位文字，
+ * 空输入整块隐藏（.hidden）；段色按当前档位统一（弱红/中橙/强绿），
+ * 未亮起段保持灰底 */
+.strength-meter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 2px;
+  /* 只占半行宽(2026-11-04 用户反馈:全宽色条喧宾夺主),轻量提示即可 */
+  max-width: 220px;
+}
+.strength-meter.hidden { display: none !important; }
+.strength-bars { display: flex; gap: 3px; flex: 1; }
+.strength-seg {
+  height: 2px;
+  flex: 1;
+  border-radius: 1px;
+  background: var(--line);
+  transition: background var(--t-fast);
+}
+.strength-label { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.strength-s0 { color: var(--err); }
+.strength-seg.strength-s0 { background: var(--err); }
+.strength-s1 { color: var(--warn); }
+.strength-seg.strength-s1 { background: var(--warn); }
+.strength-s2, .strength-s3 { color: var(--ok); }
+.strength-seg.strength-s2, .strength-seg.strength-s3 { background: var(--ok); }
+
 /* WebView2（Edge 内核）给 type=password 渲染原生"眼睛"按钮（::-ms-reveal）：
  * 只在悬停时出现、点击一次即消失，行为不受页面控制（2026-10-25 实测）。
  * 全局隐藏，密码可见性统一由应用自己的眼睛按钮切换。 */
@@ -888,14 +916,23 @@ input[type="password"]::-ms-clear {
  * 设置
  * ------------------------------------------------------------------------- */
 
-.settings { display: grid; gap: 10px; }
+.settings { display: grid; gap: 12px; max-width: 720px; margin: 0 auto; }
 /* grid 会把直接子按钮拉伸满宽——操作按钮一律按内容宽度靠左；
    保存按钮（.btn-primary）由下方更高特异性规则保持右对齐 */
 .settings > button { justify-self: start; }
 /* 设置页保存按钮右对齐（表单操作区的常规位置） */
 .settings .btn-primary { justify-self: end; }
-.setting-row { display: flex; align-items: center; gap: 10px; }
+.setting-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
 .setting-row label { flex: 1; }
+/* 远端仓库链接:品牌色提示可点,悬停下划线 */
+.repo-link { color: var(--accent); text-decoration: none; }
+.repo-link:hover { text-decoration: underline; }
+/* 分组标题:加大上间距形成区块呼吸感,首组贴顶(2026-11-09 排版统一:
+   宽窗口下 1400px 容器把 label 与控件拉到两端,观感杂乱) */
+.settings h2 { margin: 24px 0 6px; font-size: 15px; }
+.settings > h2:first-child { margin-top: 2px; }
+/* 设置页整体限宽居中(标题栏与内容一致) */
+.settings-shell { max-width: 760px; margin: 0 auto; }
 .num { width: 90px; }
 /* 设置行的下拉框（主题/语言）：显式高特异性宽度，绝不回退到 .input 的 100%。
  * 200px 容纳"跟随系统 / Follow system" + 下拉箭头；flex:none 保证不被压缩。 */
@@ -920,13 +957,16 @@ input[type="password"]::-ms-clear {
   z-index: 100;
   pointer-events: none;
 }
+/* 圆角 10px(与 --radius 一致):999px 胶囊形在长文本下两端弧面
+ * 占比失衡,视觉突兀(2026-11-04 用户反馈) */
 .toast {
   background: rgba(30, 39, 54, 0.92);
   backdrop-filter: blur(6px);
   border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 9px 18px;
+  border-radius: 10px;
+  padding: 9px 16px;
   font-size: 13px;
+  line-height: 1.5;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   animation: toast-in 0.18s ease-out;
 }
@@ -991,7 +1031,7 @@ html[data-theme="light"] .toast-err {
   background: var(--bg-soft);
   padding: 8px;
 }
-.model-pick.hidden { display: none; }
+.model-pick.hidden { display: none !important; }
 .pick-list {
   max-height: 200px;
   overflow-y: auto;
@@ -1101,13 +1141,34 @@ html[data-theme="light"] .mc-3 code { color: #7d54c0; }
 html[data-theme="light"] .mc-4 code { color: #1a97a6; }
 html[data-theme="light"] .mc-5 code { color: #c03d76; }
 
-/* 卡片上的模型胶囊行：独立一行，胶囊可换行不挤压 */
+/* 授权失效引导条（2026-11-03）：同步/写路径撞认证错误后常驻主界面，
+ * 用户不必从转瞬即逝的错误 toast 里猜原因；按钮直接发起重新授权 */
+.auth-banner-slot:empty { display: none; }
+.auth-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  background: rgba(216, 160, 49, 0.12);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  color: var(--warn);
+  font-size: 13px;
+}
+html[data-theme="light"] .auth-banner { background: rgba(191, 137, 22, 0.10); }
+
+/* 卡片上的模型胶囊行：独立一行，胶囊可换行不挤压；
+ * 胶囊可右键复制模型名（contextmenu），指针形态给出轻提示 */
 .record-models {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   margin-top: 8px;
 }
+/* 模型胶囊：单击复制模型名（2026-11-11 由右键菜单简化而来） */
+.record-models .model-chip { cursor: pointer; }
 
 /* 备注：引用块样式（左 accent 竖线 + muted），与模型胶囊明确区分 */
 .record-notes {
@@ -1150,7 +1211,7 @@ html[data-theme="light"] .mc-5 code { color: #c03d76; }
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
   pointer-events: none;
 }
-.tooltip.hidden { display: none; }
+.tooltip.hidden { display: none !important; }
 
 /* 卡片瀑布流（2026-10-31 反馈：grid 行对齐时矮卡片下方出现大空隙）：
  * 贪心分列，列内纵向间隔固定；卡片占满所在列宽 */
@@ -1171,3 +1232,49 @@ html[data-theme="light"] .mc-5 code { color: #c03d76; }
 /* 瀑布流宿主：切掉 grid 轨道模板——列容器按 flex 铺满整行
  * （grid 模式下会被压进单条 420px 轨道，卡片窄到文字竖排） */
 .record-list.cols-host { display: block; }
+
+/* 授权链接独立行（2026-11-04）：步骤 1「打开下方链接」的承接位，
+ * 与步骤 2「下方代码」的授权码框形成同构 */
+.device-link-row { margin: 2px 0 4px; }
+.device-link-row .link {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(79, 140, 255, 0.12);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+/* 授权页步骤自定义编号:链接行插在步骤 1/2 之间,不占序号 */
+.steps .step-line { counter-increment: gaf; }
+.steps .step-line::before { content: counter(gaf) ". "; }
+
+/* 工具栏行内同高(2026-11-04):表单控件不继承页面字体,input 与按钮
+ * 自然高度差 4px——统一钉高,flex 内容居中不受影响 */
+.toolbar .input,
+.toolbar .btn { height: 38px; }
+.toolbar .btn { padding-top: 0; padding-bottom: 0; }
+
+/* 引导条副行:失效具体原因(后端续期/校验错误原文,2026-11-04 加——
+ * 用户截图给我即可对症,不必转述) */
+.auth-banner-text-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.auth-banner-sub {
+  font-size: 11.5px;
+  opacity: 0.85;
+  overflow-wrap: anywhere;
+}
+
+/* 授权页返回按钮:钉在页面最左上角(2026-11-04 用户指定位置),
+ * 独立于居中卡片布局 */
+.device-back {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 10;
+}

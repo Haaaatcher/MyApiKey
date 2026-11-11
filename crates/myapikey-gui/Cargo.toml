@@ -13,7 +13,7 @@ name = "myapikey_gui"
 path = "src/lib.rs"
 
 [[bin]]
-name = "myapikey-gui"
+name = "makara-gui"
 path = "src/main.rs"
 
 [build-dependencies]
@@ -22,6 +22,7 @@ tauri-build.workspace = true
 [dependencies]
 myapikey-core.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
 tauri-plugin-single-instance.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -34,3 +35,7 @@ tauri-plugin-updater = "2.14.0"
 default = ["secret-service"]
 # GUI 只发布 Windows（keyring 走 windows-native），此开关仅为与 CLI 行为对齐。
 secret-service = ["myapikey-core/secret-service"]
+
+# 审查规范 lints(见根 Cargo.toml [workspace.lints])
+[lints]
+workspace = true

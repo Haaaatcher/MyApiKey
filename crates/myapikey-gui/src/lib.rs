@@ -7,7 +7,7 @@
 //! 安全约束（与 CLI 一致，见 AGENTS.md）：
 //! - `api_key` 明文只存在于：内存中的会话、`reveal_key`（用户显式点击）
 //!   与剪贴板（`copy_key`，30 秒后尽力清除）；发给前端的列表数据一律掩码；
-//! - 主密码只在内存（会话）与凭据库（TTL 记忆）；
+//! - 解锁密码只在内存（会话）与凭据库（TTL 记忆）；
 //! - 错误信息一律英文且不包含任何凭据。
 
 use myapikey_core::check_cache::CheckCache;
@@ -55,11 +55,11 @@ pub struct Inner {
     /// 进行中的 GitHub 设备授权（init 阶段短暂存在，仅内存）。
     pub pending_device: Option<PendingDevice>,
     /// 进行中的初始化探测（D25 交互对齐：授权/绑定后、密码表单前的
-    /// 中间态——远端已探明，等前端收主密码完成接入/建基线）。
+    /// 中间态——远端已探明，等前端收解锁密码完成接入/建基线）。
     pub pending_init: Option<PendingInit>,
 }
 
-/// 初始化探测中间态：token 已就绪、远端已探明，等主密码完成收尾。
+/// 初始化探测中间态：token 已就绪、远端已探明，等解锁密码完成收尾。
 #[derive(Clone)]
 pub struct PendingInit {
     /// 解析后的仓库（owner/name）。
@@ -71,9 +71,9 @@ pub struct PendingInit {
     pub head: Option<(String, Vec<u8>)>,
 }
 
-/// 解锁会话：明文主密码与解密后的数据。
+/// 解锁会话：明文解锁密码与解密后的数据。
 pub struct Session {
-    /// 主密码（保存/同步时重加密用）。
+    /// 解锁密码（保存/同步时重加密用）。
     pub passphrase: String,
     /// 当前数据（写操作后即时更新）。
     pub data: VaultData,
@@ -127,14 +127,14 @@ impl Shared {
 /// # Errors
 /// remote 地址不是 GitHub 形态。
 fn remote_of(sh: &Shared) -> Result<Option<Box<dyn myapikey_core::remote::SyncStore>>> {
-    let Some(url) = sh.config().remote_repo.clone() else {
+    let Some(url) = sh.config().remote_repo else {
         return Ok(None);
     };
+    // 绑定失效折叠为未绑定(2026-11-10 用户拍板:用户只感知绑定与未绑定
+    // 两态):凭据条目不在即按单机处理,写操作跳过推送(本地照常保存,
+    // 重绑后 sync 一次带上去,数据无损)
     let Some(token) = myapikey_core::github::keychain_token()? else {
-        return Err(Error::Usage(
-            "a remote is bound but no GitHub authorization exists on this machine.              Re-run the GitHub setup from the settings page"
-                .into(),
-        ));
+        return Ok(None);
     };
     Ok(Some(sync::open_remote(&url, &token)?))
 }
@@ -149,15 +149,15 @@ pub fn open_external(url: &str) -> Result<()> {
 }
 
 /// 写路径认证失败时的自动续期：keychain 有刷新令牌 → 静默换新 access
-/// token（+ 轮换后的刷新令牌）。返回是否续期成功（成功后调用方重试
-/// 一次写操作——重试会现读新凭据；失败维持原错误与重授权指引）。
-fn try_refresh_and_retry_setup(_sh: &Shared) -> bool {
+/// token（+ 轮换后的刷新令牌）。`Ok(())` = 已续期，调用方重试一次写
+/// 操作（重试会现读新凭据）；`Err` = 续期失败，调用方必须把原因并入
+/// 错误展示——用户只看到 401 而不知道续期为何没救场，等于诊断线索
+/// 被吞（2026-11-03 修复：原布尔封装吞掉了失败原因）。
+fn try_refresh_and_retry_setup(_sh: &Shared) -> Result<()> {
     // client_id 取环境变量覆盖（2026-10-31 审查采纳：原硬编码会让覆盖
-    // 部署下的刷新必败）；取失败视为不可刷新，维持原错误
-    let Ok(client_id) = github::effective_client_id() else {
-        return false;
-    };
-    myapikey_core::github::try_refresh_and_store(&client_id)
+    // 部署下的刷新必败）
+    let client_id = github::effective_client_id()?;
+    myapikey_core::github::refresh_access_token(&client_id).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -196,11 +196,11 @@ pub struct CheckView {
 pub struct GuiState {
     pub initialized: bool,
     pub unlocked: bool,
-    /// 记忆中的主密码是否可用（决定“一键解锁”按钮）。
+    /// 记忆中的解锁密码是否可用（决定“一键解锁”按钮）。
     pub has_remembered: bool,
 }
 
-/// `mak sync` 的前端回显。
+/// `makara sync` 的前端回显。
 #[derive(Debug, Serialize, Default)]
 pub struct SyncView {
     pub pulled: bool,
@@ -226,8 +226,9 @@ pub struct SettingsView {
     pub remote: Option<String>,
     pub tombstone_days: u32,
     pub auto_push: bool,
-    pub remember_days: u32,
     pub auto_lock_minutes: u32,
+    /// 文件日志级别(off/error/info/debug)——设置页可控,即时生效。
+    pub log_level: String,
 }
 
 /// 初始化的第一步返回：直接完成，或需要浏览器授权。
@@ -249,8 +250,8 @@ pub enum InitStage {
         verification_uri: String,
     },
     /// 探测完成（授权/绑定后）：远端状态已明确，前端据此显示密码表单
-    /// —— `has_data = true` 显示"输入主密码接入"；false 显示"设置新的
-    /// 主密码"。用户提交后调 `init_finish` 收尾。
+    /// —— `has_data = true` 显示"输入解锁密码接入"；false 显示"设置新的
+    /// 解锁密码"。用户提交后调 `init_finish` 收尾。
     ProbeDone { has_data: bool, repo: String },
 }
 
@@ -273,7 +274,9 @@ pub struct RecordInput {
 
 /// 刷新活动时间并拿锁内可变引用的统一入口。
 fn enter(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
-    let mut g = inner.lock().unwrap_or_else(|p| p.into_inner());
+    let mut g = inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     g.last_activity = Instant::now();
     g
 }
@@ -309,7 +312,7 @@ pub fn state_view(sh: &Shared) -> Result<GuiState> {
     })
 }
 
-/// 手动输入主密码解锁；成功后按 TTL 记忆。
+/// 手动输入解锁密码解锁；成功后按 TTL 记忆。
 ///
 /// # Errors
 /// - [`Error::NotInitialized`] / [`Error::Decrypt`]：与 CLI 相同语义。
@@ -318,21 +321,23 @@ pub fn unlock_with(sh: &Shared, passphrase: &str) -> Result<()> {
         return Err(Error::NotInitialized);
     }
     let bytes = std::fs::read(&sh.dirs.vault_path)?;
-    let data = vault::decrypt(&bytes, passphrase)?;
-    let cfg = sh.config();
-    if cfg.remember_days > 0 {
-        // 记不住（无头环境等）不阻塞解锁，前端可提示
-        let _ = keychain::set_ttl(&sh.dirs, passphrase, cfg.remember_days);
-    }
+    let data = vault::decrypt(&bytes, passphrase).map_err(|e| {
+        myapikey_core::log::error("gui", &format!("unlock failed: {e}"));
+        e
+    })?;
+    // 记住副本 TTL = 自动锁定时长（D32 统一）：锁定时长内重启免输；
+    // 记不住（无头环境等）不阻塞解锁，前端可提示
+    let _ = keychain::set_ttl(&sh.dirs, passphrase, sh.config().auto_lock_minutes);
     let mut g = enter(&sh.inner);
     g.session = Some(Session {
         passphrase: passphrase.to_string(),
         data,
     });
+    myapikey_core::log::info("gui", "unlocked (manual passphrase)");
     Ok(())
 }
 
-/// 一键解锁：尝试记忆中的主密码。
+/// 一键解锁：尝试记忆中的解锁密码。
 ///
 /// # Returns
 /// `Ok(true)` 解锁成功；`Ok(false)` 无可用记忆（前端回退到手动输入）。
@@ -347,31 +352,31 @@ pub fn unlock_remembered(sh: &Shared) -> Result<bool> {
         return Err(Error::NotInitialized);
     }
     let bytes = std::fs::read(&sh.dirs.vault_path)?;
-    match vault::decrypt(&bytes, &p) {
-        Ok(data) => {
-            let mut g = enter(&sh.inner);
-            g.session = Some(Session {
-                passphrase: p,
-                data,
-            });
-            Ok(true)
-        }
-        Err(_) => {
-            // 记忆已失效（他机改密）：清理后要求手动输入
-            let _ = keychain::delete(&sh.dirs);
-            Ok(false)
-        }
+    if let Ok(data) = vault::decrypt(&bytes, &p) {
+        let mut g = enter(&sh.inner);
+        g.session = Some(Session {
+            passphrase: p,
+            data,
+        });
+        myapikey_core::log::info("gui", "unlocked (remembered passphrase)");
+        Ok(true)
+    } else {
+        // 记忆已失效（他机改密）：清理后要求手动输入
+        myapikey_core::log::info("gui", "remembered passphrase stale; cleared");
+        let _ = keychain::delete(&sh.dirs);
+        Ok(false)
     }
 }
 
 /// 手动锁定（Lock 按钮）。
 ///
-/// 2026-10-24 决议（主人）：**锁定 = 必须重新输入主密码**。除销毁会话外
-/// 还要清除"记住的密码"（等价 `mak forget`）——否则一键解锁会让锁定
+/// 2026-10-24 决议（主人）：**锁定 = 必须重新输入解锁密码**。除销毁会话外
+/// 还要清除"记住的密码"（等价 `makara forget`）——否则一键解锁会让锁定
 /// 形同虚设：任何能碰到键盘的人点一下就能重新进入。
 /// 仅当本机确实记过密码（`remember.json` 存在）才动凭据库——既避免无谓
 /// 写操作，也保证从不记忆的测试环境不触碰凭据库。
 pub fn lock(sh: &Shared) {
+    myapikey_core::log::info("gui", "locked manually (session + remembered copy cleared)");
     clear_remembered_if_any(sh);
     let mut g = enter(&sh.inner);
     g.session = None;
@@ -381,7 +386,7 @@ pub fn lock(sh: &Shared) {
     g.pending_init = None;
 }
 
-/// 清除记住的主密码（remember.json + 凭据库条目）。
+/// 清除记住的解锁密码（remember.json + 凭据库条目）。
 fn clear_remembered_if_any(sh: &Shared) {
     if sh.dirs.config_dir.join("remember.json").exists() {
         let _ = keychain::delete(&sh.dirs);
@@ -395,7 +400,10 @@ fn clear_remembered_if_any(sh: &Shared) {
 /// 代价是每次自动锁定后需要重输一次密码（成功输入后按 TTL 重新记住）。
 pub fn lock_if_idle(sh: &Shared, idle_limit: Duration) -> bool {
     let should_lock = {
-        let g = sh.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let g = sh
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.session.is_some() && g.last_activity.elapsed() >= idle_limit
     };
     if !should_lock {
@@ -403,7 +411,10 @@ pub fn lock_if_idle(sh: &Shared, idle_limit: Duration) -> bool {
     }
     // 凭据库清理在互斥锁外做（可能涉及系统调用），锁内只动内存
     clear_remembered_if_any(sh);
-    let mut g = sh.inner.lock().unwrap_or_else(|p| p.into_inner());
+    let mut g = sh
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     g.session = None;
     true
 }
@@ -479,6 +490,10 @@ fn to_view(r: &Record, cache: &CheckCache) -> RecordView {
 ///
 /// # Errors
 /// 未解锁 / 字段为空 / 保存失败。
+#[expect(
+    clippy::too_many_lines,
+    reason = "保存+认证重试编排是线性流程,拆子函数反而让凭据传递碎片化"
+)]
 pub fn save_record(
     sh: &Shared,
     input: RecordInput,
@@ -487,6 +502,14 @@ pub fn save_record(
     let name = input.name.trim().to_string();
     let base_url = input.base_url.trim().to_string();
     let api_key = input.api_key.trim().to_string();
+    myapikey_core::log::info(
+        "gui",
+        &format!(
+            "save record ({}): \"{}\"",
+            if editing_id.is_some() { "edit" } else { "add" },
+            name
+        ),
+    );
     if name.is_empty() {
         return Err(Error::Usage("name must not be empty".into()));
     }
@@ -518,7 +541,10 @@ pub fn save_record(
     });
 
     // 写命令串行闸门：全函数持有，防并发保存互相覆盖会话
-    let _write_guard = sh.write.lock().unwrap_or_else(|p| p.into_inner());
+    let _write_guard = sh
+        .write
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // 在会话数据的**克隆**上应用修改（2026-10-26 审查修复：此前直接改
     // session.data，落盘失败后 UI 显示新值而磁盘是旧值，且下次保存会把
     // 未确认的数据静默写出）。落盘成功才回写会话，失败则会话保持旧值
@@ -526,40 +552,37 @@ pub fn save_record(
         let mut g = enter(&sh.inner);
         let session = session_of(&mut g)?;
         let mut data = session.data.clone();
-        let updated = match editing_id {
-            Some(id_str) => {
-                let id = uuid::Uuid::parse_str(id_str)
-                    .map_err(|_| Error::Usage("invalid record id".into()))?;
-                let r = data
-                    .records
-                    .iter_mut()
-                    .find(|r| r.id == id)
-                    .ok_or_else(|| Error::NotFound(id_str.to_string()))?;
-                r.name = name;
-                r.protocol = protocol;
-                r.base_url = base_url;
-                // 空 key = 前端 key 字段保持掩码占位未动（2026-10-25 优化：
-                // 改备注/名称等不再强制点 Reveal）——保留原 key，只更新其他字段
-                if !api_key.is_empty() {
-                    r.api_key = api_key;
-                }
-                if let Some(ms) = models {
-                    r.models = ms;
-                }
-                r.notes = notes;
-                r.updated_at = chrono::Utc::now();
-                r.id
+        let updated = if let Some(id_str) = editing_id {
+            let id = uuid::Uuid::parse_str(id_str)
+                .map_err(|_| Error::Usage("invalid record id".into()))?;
+            let r = data
+                .records
+                .iter_mut()
+                .find(|r| r.id == id)
+                .ok_or_else(|| Error::NotFound(id_str.to_string()))?;
+            r.name = name;
+            r.protocol = protocol;
+            r.base_url = base_url;
+            // 空 key = 前端 key 字段保持掩码占位未动（2026-10-25 优化：
+            // 改备注/名称等不再强制点 Reveal）——保留原 key，只更新其他字段
+            if !api_key.is_empty() {
+                r.api_key = api_key;
             }
-            None => {
-                let mut r = Record::new(name, protocol, base_url, api_key);
-                // Record::new 不接收备注——新建时显式补上（曾在此整个丢弃
-                // notes，新建记录的备注保存后消失，2026-10-25 反馈）
-                r.notes = notes;
-                r.models = models.unwrap_or_default();
-                let id = r.id;
-                data.records.push(r);
-                id
+            if let Some(ms) = models {
+                r.models = ms;
             }
+            r.notes = notes;
+            r.updated_at = chrono::Utc::now();
+            r.id
+        } else {
+            let mut r = Record::new(name, protocol, base_url, api_key);
+            // Record::new 不接收备注——新建时显式补上（曾在此整个丢弃
+            // notes，新建记录的备注保存后消失，2026-10-25 反馈）
+            r.notes = notes;
+            r.models = models.unwrap_or_default();
+            let id = r.id;
+            data.records.push(r);
+            id
         };
         (session.passphrase.clone(), data, updated)
     };
@@ -581,23 +604,30 @@ pub fn save_record(
             cfg.auto_push,
             &mut cfg,
         ) {
-            Err(e)
-                if myapikey_core::sync::is_auth_error(&e.to_string())
-                    && try_refresh_and_retry_setup(sh) =>
-            {
-                let mut cfg = sh.config();
-                let remote = remote_of(sh)?;
-                let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
-                    .as_ref()
-                    .map(|r| r as &dyn myapikey_core::remote::SyncStore);
-                sync::save(
-                    &sh.dirs,
-                    &passphrase,
-                    &data,
-                    remote_dyn,
-                    cfg.auto_push,
-                    &mut cfg,
-                )?;
+            Err(e) if myapikey_core::sync::is_auth_error(&e.to_string()) => {
+                match try_refresh_and_retry_setup(sh) {
+                    Ok(()) => {
+                        let mut cfg = sh.config();
+                        let remote = remote_of(sh)?;
+                        let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
+                            .as_ref()
+                            .map(|r| r as &dyn myapikey_core::remote::SyncStore);
+                        sync::save(
+                            &sh.dirs,
+                            &passphrase,
+                            &data,
+                            remote_dyn,
+                            cfg.auto_push,
+                            &mut cfg,
+                        )?;
+                    }
+                    Err(re) => {
+                        myapikey_core::log::error("gui", &format!("token refresh failed: {re}"));
+                        return Err(Error::Usage(format!(
+                            "{e} — re-bind from the banner on the main page"
+                        )));
+                    }
+                }
             }
             other => {
                 other?;
@@ -624,9 +654,13 @@ pub fn save_record(
 /// # Errors
 /// 未解锁 / id 无效。
 pub fn delete_record(sh: &Shared, id_str: &str) -> Result<()> {
+    myapikey_core::log::info("gui", &format!("delete record: {id_str}"));
     // 写闸门 + 克隆改 + 实例锁内落盘（与 save_record 同模式，防并发
     // 覆盖与跨进程写冲突）
-    let _write_guard = sh.write.lock().unwrap_or_else(|p| p.into_inner());
+    let _write_guard = sh
+        .write
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (passphrase, mut data) = {
         let mut g = enter(&sh.inner);
         let session = session_of(&mut g)?;
@@ -655,23 +689,30 @@ pub fn delete_record(sh: &Shared, id_str: &str) -> Result<()> {
             cfg.auto_push,
             &mut cfg,
         ) {
-            Err(e)
-                if myapikey_core::sync::is_auth_error(&e.to_string())
-                    && try_refresh_and_retry_setup(sh) =>
-            {
-                let mut cfg = sh.config();
-                let remote = remote_of(sh)?;
-                let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
-                    .as_ref()
-                    .map(|r| r as &dyn myapikey_core::remote::SyncStore);
-                sync::save(
-                    &sh.dirs,
-                    &passphrase,
-                    &data,
-                    remote_dyn,
-                    cfg.auto_push,
-                    &mut cfg,
-                )?;
+            Err(e) if myapikey_core::sync::is_auth_error(&e.to_string()) => {
+                match try_refresh_and_retry_setup(sh) {
+                    Ok(()) => {
+                        let mut cfg = sh.config();
+                        let remote = remote_of(sh)?;
+                        let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
+                            .as_ref()
+                            .map(|r| r as &dyn myapikey_core::remote::SyncStore);
+                        sync::save(
+                            &sh.dirs,
+                            &passphrase,
+                            &data,
+                            remote_dyn,
+                            cfg.auto_push,
+                            &mut cfg,
+                        )?;
+                    }
+                    Err(re) => {
+                        myapikey_core::log::error("gui", &format!("token refresh failed: {re}"));
+                        return Err(Error::Usage(format!(
+                            "{e} — re-bind from the banner on the main page"
+                        )));
+                    }
+                }
             }
             other => {
                 other?;
@@ -683,7 +724,187 @@ pub fn delete_record(sh: &Shared, id_str: &str) -> Result<()> {
     Ok(())
 }
 
-/// 显式查看完整 key（编辑抽屉的 reveal 按钮；用户主动行为）。
+// ---------------------------------------------------------------------------
+// 备份与迁移：明文导出 / JSON 导入（D47，与 CLI export/import 同语义）
+// ---------------------------------------------------------------------------
+
+/// 导出结果：落盘完整路径与记录数（前端 toast 呈现路径；明文泄露警示
+/// 由确认流程先行给出）。
+#[derive(Serialize)]
+pub struct ExportedView {
+    pub path: String,
+    pub count: usize,
+}
+
+/// 导入结果：合并计数 + 导入前快照路径（被覆盖的本地旧版本写
+/// Downloads，误导入时数据有保底；均为 0 = 幂等导入，未落盘未推送）。
+#[derive(Serialize)]
+pub struct ImportedView {
+    pub added: usize,
+    pub updated: usize,
+    pub backup_path: Option<String>,
+}
+
+/// 导出文件权限收紧（unix 0600；Windows 无此语义）——GUI 适配 macOS
+/// （D26）时导出文件同样不应对其他用户可读。
+fn restrict_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// 明文导出：会话存活记录序列化为裸数组（与 CLI `makara export` 同
+/// 格式，可互相导入），写到用户经另存为对话框选定的路径（D49），
+/// 权限收紧后返回完整路径。需解锁会话（导出的是解密后的数据）。
+///
+/// # Errors
+/// 会话未解锁 / 序列化或写盘失败。
+pub fn export_records(sh: &Shared, path: &str) -> Result<ExportedView> {
+    let data = {
+        let mut g = enter(&sh.inner);
+        session_of(&mut g)?.data.clone()
+    };
+    let alive: Vec<&Record> = data.alive_records().collect();
+    let json = serde_json::to_string_pretty(&alive)
+        .map_err(|e| Error::Usage(format!("cannot serialize records: {e}")))?;
+    let path = std::path::PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, json)?;
+    restrict_permissions(&path);
+    let path = path.display().to_string();
+    myapikey_core::log::info(
+        "gui",
+        &format!("exported {} records -> {path}", alive.len()),
+    );
+    Ok(ExportedView {
+        path,
+        count: alive.len(),
+    })
+}
+
+/// JSON 导入：按 id LWW 合并（core `import_records`，与 CLI `makara
+/// import` 同语义）。零变化（幂等导入）不落盘不推送；有变化走与
+/// delete_record 同一编排（实例锁 + `sync::save` + 认证失败静默续期
+/// 重试）并回写会话。
+///
+/// # Errors
+/// 会话未解锁 / JSON 解析失败 / 落盘或推送失败。
+pub fn import_records_cmd(sh: &Shared, json: &str) -> Result<ImportedView> {
+    // 两种形状：[{...}] 裸数组（CLI export 格式）或 {"records":[...]}
+    let imported: Vec<Record> = if json.trim_start().starts_with('[') {
+        serde_json::from_str(json)
+            .map_err(|e| Error::Usage(format!("import file is not a valid record array: {e}")))?
+    } else {
+        serde_json::from_str::<VaultData>(json)
+            .map_err(|e| Error::Usage(format!("unrecognized import file format: {e}")))?
+            .records
+    };
+
+    let _write_guard = sh
+        .write
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (passphrase, mut data) = {
+        let mut g = enter(&sh.inner);
+        let session = session_of(&mut g)?;
+        (session.passphrase.clone(), session.data.clone())
+    };
+    let report = myapikey_core::merge::import_records(&mut data, imported, chrono::Utc::now());
+    if report.added + report.updated == 0 {
+        // 幂等导入（D46 语义同 CLI）：零变化不落盘不推送
+        return Ok(ImportedView {
+            added: 0,
+            updated: 0,
+            backup_path: None,
+        });
+    }
+    // 导入前快照（D52）：被覆盖的本地旧版本写 Downloads——误导入时
+    // 数据有保底（快照的 updated_at 早于现数据，直接再导入会被 LWW
+    // 跳过——它是数据保底而非一键回滚）
+    let backup_path = if report.overwritten.is_empty() {
+        None
+    } else {
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default();
+        let mut dir = std::path::PathBuf::from(home);
+        dir.push("Downloads");
+        std::fs::create_dir_all(&dir)?;
+        let snap = dir.join(format!("makara-import-backup-{ts}.json"));
+        let json = serde_json::to_string_pretty(&report.overwritten)
+            .map_err(|e| Error::Usage(format!("cannot serialize the backup: {e}")))?;
+        std::fs::write(&snap, json)?;
+        restrict_permissions(&snap);
+        let shown = snap.display().to_string();
+        myapikey_core::log::info(
+            "gui",
+            &format!(
+                "import backup: {} overwritten record(s) -> {shown}",
+                report.overwritten.len()
+            ),
+        );
+        Some(shown)
+    };
+    let _instance = myapikey_core::lock::acquire(&sh.dirs)?;
+    let mut cfg = sh.config();
+    let remote = remote_of(sh)?;
+    let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
+        .as_ref()
+        .map(|r| r as &dyn myapikey_core::remote::SyncStore);
+    match sync::save(
+        &sh.dirs,
+        &passphrase,
+        &data,
+        remote_dyn,
+        cfg.auto_push,
+        &mut cfg,
+    ) {
+        Err(e) if myapikey_core::sync::is_auth_error(&e.to_string()) => {
+            match try_refresh_and_retry_setup(sh) {
+                Ok(()) => {
+                    let mut cfg = sh.config();
+                    let remote = remote_of(sh)?;
+                    let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
+                        .as_ref()
+                        .map(|r| r as &dyn myapikey_core::remote::SyncStore);
+                    sync::save(
+                        &sh.dirs,
+                        &passphrase,
+                        &data,
+                        remote_dyn,
+                        cfg.auto_push,
+                        &mut cfg,
+                    )?;
+                }
+                Err(re) => {
+                    myapikey_core::log::error("gui", &format!("token refresh failed: {re}"));
+                    return Err(Error::Usage(format!(
+                        "{e} — re-bind from the banner on the main page"
+                    )));
+                }
+            }
+        }
+        other => {
+            other?;
+        }
+    }
+    let mut g = enter(&sh.inner);
+    session_of(&mut g)?.data = data;
+    Ok(ImportedView {
+        added: report.added,
+        updated: report.updated,
+        backup_path,
+    })
+}
 ///
 /// # Errors
 /// 未解锁 / 未找到。
@@ -875,8 +1096,11 @@ pub fn check_all_keys(
 /// 未解锁 / git 失败 / 远端密码不一致。
 pub fn sync_now(sh: &Shared) -> Result<SyncView> {
     // 写闸门：sync 会重写 vault 并回写会话，与其他写命令互斥
-    let _write_guard = sh.write.lock().unwrap_or_else(|p| p.into_inner());
-    let (passphrase, _) = {
+    let _write_guard = sh
+        .write
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (passphrase, ()) = {
         let mut g = enter(&sh.inner);
         let session = session_of(&mut g)?;
         (session.passphrase.clone(), ())
@@ -897,7 +1121,36 @@ pub fn sync_now(sh: &Shared) -> Result<SyncView> {
                     .into(),
             ));
         };
-        sync::sync(&sh.dirs, &passphrase, &remote, cfg.tombstone_days, &mut cfg)?
+        // 认证失败 → 刷新令牌静默续期 → 重建远端重试一次（与写路径
+        // save、CLI sync 同策略）。重建不可省：GitHubStore 构造时把
+        // token 缓存进结构体，续期后旧对象里还是过期凭据。缺这套包装
+        // 时 access token 过期（约 8 小时）后 GUI 手动同步必然 401，
+        // 而 CLI 同操作却能静默恢复（2026-11-03 用户实测反馈）
+        match sync::sync(&sh.dirs, &passphrase, &remote, cfg.tombstone_days, &mut cfg) {
+            Err(e) if myapikey_core::sync::is_auth_error(&e.to_string()) => {
+                match try_refresh_and_retry_setup(sh) {
+                    Ok(()) => {
+                        let mut cfg = sh.config();
+                        let remote = remote_of(sh)?;
+                        let Some(remote) = remote else {
+                            return Err(Error::Usage(
+                                "standalone mode: no remote is bound to sync with. \
+                                 Bind one on the settings page"
+                                    .into(),
+                            ));
+                        };
+                        sync::sync(&sh.dirs, &passphrase, &remote, cfg.tombstone_days, &mut cfg)?
+                    }
+                    Err(re) => {
+                        myapikey_core::log::error("gui", &format!("token refresh failed: {re}"));
+                        return Err(Error::Usage(format!(
+                            "{e} — re-bind from the banner on the main page"
+                        )));
+                    }
+                }
+            }
+            other => other?,
+        }
     };
 
     // 同步状态（含 last_sync_at）一律由 core 的 mark_synced 在"达成
@@ -921,6 +1174,171 @@ pub fn sync_now(sh: &Shared) -> Result<SyncView> {
     })
 }
 
+/// 修改解锁密码：验旧密码 → 新密码重加密落盘 → 绑定远端时以新密文覆盖
+/// 远端 → 更新会话与记住的密码副本。
+///
+/// 语义与 CLI `makara passwd set` 一致（2026-11-03 GUI 补齐入口）：远端
+/// vault 会被新密码密文覆盖，其他设备下次同步必须输入新密码（旧密码
+/// 解远端会失败，core 给出"所有设备必须同密码"的指引）。强度提示在
+/// 前端展示，后端不做硬性强度要求（2026-11-03 决议），只兜底非空。
+///
+/// # Errors
+/// 未解锁 / 旧密码不正确（本地 vault 解密失败）/ 新密码长度越界 /
+/// 落盘或推送失败（推送 401 时静默续期重试一次，与写路径同策略）。
+pub fn change_passphrase(sh: &Shared, old_passphrase: &str, new_passphrase: &str) -> Result<()> {
+    // 长度硬性限制(8–128 字符;2026-11-04 用户要求)
+    vault::validate_passphrase(new_passphrase)?;
+    // 写闸门：改密码 = 重写 vault + 回写会话，与写命令互斥
+    let _write_guard = sh
+        .write
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 旧密码验证 = 用它解密本地 vault，成功顺带拿到待重加密的数据；
+    // 先校验会话已解锁（未解锁先报未解锁，而非暴露"密码错误"）
+    let data = {
+        let mut g = enter(&sh.inner);
+        session_of(&mut g)?;
+        let bytes = std::fs::read(&sh.dirs.vault_path)?;
+        // 加密学上无法区分"密码错"与"vault 损坏"，密码错占绝对多数
+        // （vault 落盘走原子写，损坏概率极低），文案按密码错误给出
+        vault::decrypt(&bytes, old_passphrase)
+            .map_err(|_| Error::Usage("the current passphrase is incorrect".into()))?
+    };
+    // 记住副本随新密码按统一锁定时长重写（0 = 永不锁定 = 副本不过期）：
+    // 改密码后"锁定时长内重启免输"的体验得以延续
+    let remember_minutes = sh.config().auto_lock_minutes;
+
+    // 实例锁（与 CLI 互斥）内落盘 + 推送；认证失败 → 刷新令牌静默
+    // 续期 → 重建远端（旧对象缓存着过期 token）重试一次——与
+    // sync_now / save 同策略
+    {
+        let _instance = myapikey_core::lock::acquire(&sh.dirs)?;
+        let mut cfg = sh.config();
+        let remote = remote_of(sh)?;
+        let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
+            .as_ref()
+            .map(|r| r as &dyn myapikey_core::remote::SyncStore);
+        match sync::save(
+            &sh.dirs,
+            new_passphrase,
+            &data,
+            remote_dyn,
+            cfg.auto_push,
+            &mut cfg,
+        ) {
+            Err(e) if myapikey_core::sync::is_auth_error(&e.to_string()) => {
+                match try_refresh_and_retry_setup(sh) {
+                    Ok(()) => {
+                        let mut cfg = sh.config();
+                        let remote = remote_of(sh)?;
+                        let remote_dyn: Option<&dyn myapikey_core::remote::SyncStore> = remote
+                            .as_ref()
+                            .map(|r| r as &dyn myapikey_core::remote::SyncStore);
+                        sync::save(
+                            &sh.dirs,
+                            new_passphrase,
+                            &data,
+                            remote_dyn,
+                            cfg.auto_push,
+                            &mut cfg,
+                        )?;
+                    }
+                    Err(re) => {
+                        myapikey_core::log::error("gui", &format!("token refresh failed: {re}"));
+                        return Err(Error::Usage(format!(
+                            "{e} — re-bind from the banner on the main page"
+                        )));
+                    }
+                }
+            }
+            other => {
+                other?;
+            }
+        }
+    }
+
+    // 会话密码替换：后续写命令直接以新密码工作，无需重新解锁
+    {
+        let mut g = enter(&sh.inner);
+        if let Some(s) = &mut g.session {
+            s.passphrase = new_passphrase.to_string();
+        }
+    }
+    // 记住的密码副本同步：按统一锁定时长重写新密码副本（0 = 永不过期），
+    // 保持改密码后「锁定时长内重启免输」的行为不变
+    let _ = keychain::set_ttl(&sh.dirs, new_passphrase, remember_minutes);
+    myapikey_core::log::info(
+        "gui",
+        "passphrase changed (vault re-encrypted, remote updated)",
+    );
+    Ok(())
+}
+
+/// GitHub 授权/安装诊断视图（2026-11-04 分步引导）。
+#[derive(Debug, Clone, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "诊断视图天然是逐项布尔状态集合,前端按布尔渲染引导分支"
+)]
+pub struct GhDiagView {
+    /// 凭据库有 GitHub 令牌（device flow 授权完成过）。
+    pub authorized: bool,
+    /// 令牌对 GET /user 有效（未过期/未被撤销）。
+    pub token_valid: bool,
+    /// GitHub App 已安装到用户账号（未安装 = 令牌对仓库无权）。
+    pub installed: bool,
+    /// 未安装时的安装页 URL（引导直达）。
+    pub install_url: Option<String>,
+    /// 已绑定远端仓库（单机模式无同步，不引导）。
+    pub remote_bound: bool,
+    /// 绑定仓库可访问（安装范围含它且 Contents 可写）。
+    /// `None` = 未绑定或未安装，无从判断。
+    pub repo_accessible: Option<bool>,
+}
+
+/// GitHub 授权/安装诊断（网络探测 GET /user、/user/installations、
+/// /repos/{owner}/{name}，放线程池；**无会话要求**——凭据库与配置
+/// 独立于解锁状态，锁屏时引导条也能给出正确指引）。
+///
+/// # Errors
+/// 网络请求失败（诊断失败不等于授权失效，前端保留现状引导）。
+pub fn github_diagnose(sh: &Shared) -> Result<GhDiagView> {
+    let Some(token) = github::keychain_token()? else {
+        // 绑定失效折叠为未绑定(2026-11-10 用户拍板:用户只感知绑定与
+        // 未绑定两态):凭据条目不在即 remote_bound=false,前端按未绑定
+        // 渲染——不出现"绑定已失效"字样与失效引导条
+        return Ok(GhDiagView {
+            authorized: false,
+            token_valid: false,
+            installed: false,
+            install_url: None,
+            remote_bound: false,
+            repo_accessible: None,
+        });
+    };
+    let cfg = sh.config();
+    let repo: Option<(String, String)> = cfg
+        .remote_repo
+        .as_deref()
+        .and_then(|r| myapikey_core::remote::parse_github_repo(r).ok())
+        .map(|id| {
+            id.split_once('/').map_or_else(
+                || (id.clone(), String::new()),
+                |(o, n)| (o.to_string(), n.to_string()),
+            )
+        });
+    let repo_ref = repo.as_ref().map(|(o, n)| (o.as_str(), n.as_str()));
+    let diag = github::diagnose_github_auth(&token, repo_ref)?;
+    Ok(GhDiagView {
+        authorized: true,
+        token_valid: diag.token_valid,
+        installed: diag.installed,
+        install_url: diag.install_url,
+        remote_bound: cfg.remote_repo.is_some(),
+        repo_accessible: diag.repo_accessible,
+    })
+}
+
 /// 状态页。
 ///
 /// # Errors
@@ -930,10 +1348,14 @@ pub fn status_view(sh: &Shared) -> Result<StatusView> {
     let alive = enter(&sh.inner)
         .session
         .as_ref()
-        .map(|s| s.data.alive_records().count())
-        .unwrap_or(0);
+        .map_or(0, |s| s.data.alive_records().count());
+    // 绑定失效折叠为未绑定:凭据条目不在,remote 显示 none——主界面
+    // chip 显示「单机模式」,设置页按未绑定渲染(2026-11-10 用户拍板)
+    let remote = info
+        .remote
+        .filter(|_| myapikey_core::github::keychain_token().is_ok());
     Ok(StatusView {
-        remote: info.remote,
+        remote,
         pending: info.pending,
         last_sync: sh.config().last_sync_at,
         alive,
@@ -967,21 +1389,23 @@ pub fn settings_view(sh: &Shared) -> Result<SettingsView> {
         remote: cfg.remote_repo.clone(),
         tombstone_days: cfg.tombstone_days,
         auto_push: cfg.auto_push,
-        remember_days: cfg.remember_days,
         auto_lock_minutes: cfg.auto_lock_minutes,
+        log_level: cfg.log_level,
     })
 }
 
-/// 保存设置（remote 变化时同步更新 git remote）。
+/// 保存设置。
 ///
 /// # Errors
-/// 配置写盘 / git remote 设置失败。
-pub fn set_settings(sh: &Shared, s: SettingsView) -> Result<()> {
+/// 配置写盘失败。
+pub fn set_settings(sh: &Shared, s: &SettingsView) -> Result<()> {
     let mut cfg = sh.config();
     cfg.tombstone_days = s.tombstone_days;
     cfg.auto_push = s.auto_push;
-    cfg.remember_days = s.remember_days;
     cfg.auto_lock_minutes = s.auto_lock_minutes;
+    // 日志级别即时生效(文件日志器是全局原子量,2026-11-05 用户需求)
+    cfg.log_level.clone_from(&s.log_level);
+    myapikey_core::log::set_level(&cfg.log_level);
     // 远端统一存 GitHub 形态（owner/name）；清空 = 解绑（2026-10-26 修复：
     // 此前静默保留旧远端，设置页显示为空但同步仍在跑，UI 与实际背离）。
     // 解析成功后才统一落盘——解析失败时其他设置一并回滚，不留半保存态
@@ -991,6 +1415,19 @@ pub fn set_settings(sh: &Shared, s: SettingsView) -> Result<()> {
         _ => None,
     };
     cfg.save(&sh.dirs)?;
+    // 解锁会话中按新时长立即重写记住副本（2026-11-04 用户真机命中）：
+    // 只改配置不动副本的话，改「永不」后旧副本（如默认 10 分钟 TTL）仍
+    // 在倒计时，重启即撞密码要求——设置形同虚设。未解锁时无副本可写，
+    // 下次解锁自然按新时长写入
+    {
+        let g = sh
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sess) = &g.session {
+            let _ = keychain::set_ttl(&sh.dirs, &sess.passphrase, s.auto_lock_minutes);
+        }
+    }
     Ok(())
 }
 
@@ -998,7 +1435,7 @@ pub fn set_settings(sh: &Shared, s: SettingsView) -> Result<()> {
 // 初始化（首次使用）
 // ---------------------------------------------------------------------------
 
-/// 初始化第一步：设主密码，可选远端/GitHub 一键。
+/// 初始化第一步：设解锁密码，可选远端/GitHub 一键。
 ///
 /// 返回 [`InitStage::Done`]（无 GitHub，或 token 已存在直接完成）或
 /// [`InitStage::DeviceCode`]（前端展示码，用户授权后调
@@ -1006,7 +1443,7 @@ pub fn set_settings(sh: &Shared, s: SettingsView) -> Result<()> {
 ///
 /// # Errors
 /// 已初始化 / GitHub API 失败 / 保存失败。
-/// 初始化第一步：选择模式并探测远端（**不收主密码**——密码语义由
+/// 初始化第一步：选择模式并探测远端（**不收解锁密码**——密码语义由
 /// 远端状态决定，探测完成返回 [`InitStage::ProbeDone`] 后前端才显示
 /// 对应的密码表单）。
 ///
@@ -1059,7 +1496,7 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
         let g = enter(&sh.inner);
         g.pending_device
             .clone()
-            .ok_or_else(|| Error::Usage("no GitHub authorization in progress".into()))?
+            .ok_or_else(|| Error::Usage("no binding in progress".into()))?
     };
     let tokens = github::poll_device_token(&pending.dc, &pending.client_id)?;
     // refresh token 在 poll 内部已入 keychain（有才写）；这里只存 access
@@ -1073,7 +1510,8 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
     // 刷新分支同语义，2026-10-26 补齐 GUI 侧闭环）
     if sh.dirs.is_initialized() {
         let owner = github::api_login(&tokens.access_token)?;
-        let url = github::api_ensure_repo(&tokens.access_token, &owner, github::DEFAULT_REPO_NAME)?;
+        let repo_name = sh.config().default_repo_name;
+        let url = github::api_ensure_repo(&tokens.access_token, &owner, &repo_name)?;
         // remote_repo 存储形态恒为归一化 owner/name（api_ensure_repo 返回
         // 完整 URL，直接存会让同一字段出现两种形态——设置页预填与
         // status 显示随之不一致，2026-10-31 修复）
@@ -1084,23 +1522,23 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
         let records = enter(&sh.inner)
             .session
             .as_ref()
-            .map(|s| s.data.alive_records().count())
-            .unwrap_or(0);
+            .map_or(0, |s| s.data.alive_records().count());
         return Ok(InitStage::Done {
             joined: false,
             records,
             refresh: true,
         });
     }
-    // 新初始化路径：令牌已入库 → 探测远端（有数据则前端要求输入主密码
+    // 新初始化路径：令牌已入库 → 探测远端（有数据则前端要求输入解锁密码
     // 接入；空仓库则前端要求设置新密码），密码表单由前端按 has_data 显示
-    init_probe(sh, None, Some(github::DEFAULT_REPO_NAME))
+    let repo_name = sh.config().default_repo_name;
+    init_probe(sh, None, Some(&repo_name))
 }
 
 /// 忘记 GitHub 授权：数据层一次写清——清除本机令牌（access/refresh）
 /// **并解绑远端**（`unbind_remote`：remote_repo 与同步记账三件套一并
 /// 归零，与 `mark_synced` 对称）。vault 与 GitHub 上的仓库都不受影响。
-/// 与 CLI `mak remote unset` 同语义。
+/// 与 CLI `makara remote unset` 同语义。
 ///
 /// 返回是否清到了令牌（false = 本来就没有令牌，解绑仍会执行）。
 ///
@@ -1108,6 +1546,10 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
 /// 凭据库 / config 写盘失败。
 pub fn forget_github(sh: &Shared) -> Result<bool> {
     let had_token = myapikey_core::github::keychain_delete_token()?;
+    myapikey_core::log::info(
+        "gui",
+        &format!("github authorization forgotten (had token = {had_token})"),
+    );
     let mut cfg = sh.config();
     myapikey_core::sync::unbind_remote(&sh.dirs, &mut cfg);
     // 进行中的授权/绑定中间态一并作废（2026-10-31 审查可选采纳）
@@ -1126,6 +1568,7 @@ pub fn forget_github(sh: &Shared) -> Result<bool> {
 /// # Errors
 /// 无凭据库 / 设备流发起失败。
 pub fn github_reauthorize(sh: &Shared) -> Result<InitStage> {
+    myapikey_core::log::info("gui", "re-authorize requested (device flow starting)");
     let client_id = github::effective_client_id()?;
     let dc = github::start_device_flow(&client_id)?;
     let mut g = enter(&sh.inner);
@@ -1160,7 +1603,7 @@ fn init_probe(sh: &Shared, remote: Option<&str>, github_repo: Option<&str>) -> R
         });
     }
     let token = github::keychain_token()?
-        .ok_or_else(|| Error::Usage("GitHub authorization is missing; redo the setup".into()))?;
+        .ok_or_else(|| Error::Usage("Binding is missing; redo the setup".into()))?;
     let login = github::api_login(&token)?;
 
     // owner 恒等于授权账号（归属校验 fail fast）
@@ -1173,14 +1616,11 @@ fn init_probe(sh: &Shared, remote: Option<&str>, github_repo: Option<&str>) -> R
             _ => (login.clone(), url.to_string()),
         },
         (_, Some(name)) => (login.clone(), name.to_string()),
-        _ => (
-            login.clone(),
-            myapikey_core::github::DEFAULT_REPO_NAME.to_string(),
-        ),
+        _ => (login.clone(), sh.config().default_repo_name),
     };
     if owner != login {
         return Err(Error::Usage(format!(
-            "repo owner `{owner}` does not match the authorized account `{login}`."
+            "repo owner `{owner}` does not match your GitHub account (`{login}`)."
         )));
     }
     let repo_id = format!("{owner}/{name}");
@@ -1208,12 +1648,12 @@ fn init_probe(sh: &Shared, remote: Option<&str>, github_repo: Option<&str>) -> R
 }
 
 /// 初始化收尾（前端密码表单提交）：按探测结果二选一——
-/// - 远端有数据 → 主密码解密接入（错误即报错，前端可重试）；
+/// - 远端有数据 → 解锁密码解密接入（错误即报错，前端可重试）；
 /// - 远端空 → 以该密码加密空 vault 上传基线；
 /// - 单机（无探测）→ 只建本地 vault。
 ///
 /// # Errors
-/// 无进行中的初始化 / 主密码不匹配远端数据 / 保存失败。
+/// 无进行中的初始化 / 解锁密码不匹配远端数据 / 保存失败。
 pub fn init_finish(sh: &Shared, passphrase: &str) -> Result<InitStage> {
     let pending = {
         let g = enter(&sh.inner);
@@ -1222,14 +1662,19 @@ pub fn init_finish(sh: &Shared, passphrase: &str) -> Result<InitStage> {
     let Some(p) = pending else {
         return Err(Error::Usage("no initialization in progress".into()));
     };
+    // 新设密码(远端空仓库/单机)硬性校验长度;接入分支的密码是既有
+    // 事实(旧密码解密远端),不做此校验
+    if p.head.is_none() {
+        vault::validate_passphrase(passphrase)?;
+    }
 
     match &p.head {
-        // 远端有数据 → 主密码解密接入（发现数据才要求解锁）
+        // 远端有数据 → 解锁密码解密接入（发现数据才要求解锁）
         Some((_sha, bytes)) => {
             let data = vault::decrypt(bytes, passphrase).map_err(|_| {
                 Error::Usage(
                     "cannot decrypt the remote vault with the given passphrase. All \
-                     devices must use the same master passphrase"
+                     devices must use the same passphrase"
                         .into(),
                 )
             })?;
@@ -1304,7 +1749,7 @@ pub fn init_finish(sh: &Shared, passphrase: &str) -> Result<InitStage> {
 
 #[cfg(test)]
 mod tests {
-    //! ops 层集成测试：MYAPIKEY_HOME 指向临时目录；remember_days=0、
+    //! ops 层集成测试：MYAPIKEY_HOME 指向临时目录；auto_lock_minutes=0、
     //! auto_push=false 避免触碰真实凭据库与网络。
     //! （keychain 的 TTL 行为已由 CLI 冒烟覆盖，这里不重复碰系统凭据库。）
 
@@ -1320,17 +1765,19 @@ mod tests {
     }
 
     fn shared(tag: &str) -> Shared {
-        let _guard = home_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let guard = home_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home =
             std::env::temp_dir().join(format!("mak-gui-{tag}-{}", uuid::Uuid::now_v7().simple()));
         std::fs::create_dir_all(&home).expect("创建临时目录失败");
         std::env::set_var("MYAPIKEY_HOME", &home);
         let sh = Shared::new().expect("Shared 构造失败");
         std::env::remove_var("MYAPIKEY_HOME");
-        drop(_guard);
+        drop(guard);
         // 禁用记忆与自动推送，测试不碰全局状态（凭据库/网络）
         AppConfig {
-            remember_days: 0,
+            auto_lock_minutes: 0,
             auto_push: false,
             ..AppConfig::default()
         }
@@ -1342,8 +1789,72 @@ mod tests {
     const PASS: &str = "gui-test-passphrase";
 
     #[test]
+    fn set_settings_rewrites_remember_ttl_immediately() {
+        // D32 修复回归(2026-11-04 用户真机命中):解锁中把锁定时长改为
+        // 「永不」,记住副本必须立即按新时长重写——否则旧 TTL(如 10 分钟)
+        // 仍在倒计时,重启撞密码要求,设置形同虚设
+        let sh = shared("settings-ttl");
+        // isolated keyring 只有一个条目名,并行测试互踩——全程持锁互斥
+        // (guard 有意持有到测试结束:_ 前缀表达"不显式 drop")
+        let _guard = home_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        match init_start(&sh, None, None).expect("init 失败") {
+            InitStage::ProbeDone { .. } => {
+                init_finish(&sh, PASS).expect("init_finish 失败");
+            }
+            InitStage::DeviceCode { .. } => {
+                panic!("无 GitHub 时不应出现设备码阶段")
+            }
+            InitStage::Done { .. } => {
+                panic!("无既有令牌时不应直接完成初始化")
+            }
+        }
+        // 先解锁(按旧时长 10 分钟写入副本),再改设置为「永不」
+        unlock_with(&sh, PASS).expect("解锁失败");
+        let mut view = settings_view(&sh).expect("读设置失败");
+        view.auto_lock_minutes = 0;
+        set_settings(&sh, &view).expect("保存设置失败");
+
+        // 会话解锁中:副本必须立即变为不过期
+        let remembered = keychain::get_with_expiry(&sh.dirs).expect("读副本失败");
+        assert!(
+            remembered.as_deref() == Some(PASS),
+            "改「永不」后副本应立即不过期"
+        );
+
+        // 模拟长时间闲置后重启:副本仍未过期 → 免输恢复解锁
+        lock_if_idle(&sh, Duration::from_hours(24));
+        assert!(
+            unlock_remembered(&sh).expect("unlock_remembered 失败"),
+            "「永不」下重启应免输恢复解锁"
+        );
+
+        // 反向:改回 1 分钟后,模拟副本到期(remember.json 时刻改为过去)
+        // → get_with_expiry 应清理并返回 None(TTL 自然到期的路径;测试
+        // 无法真等 1 分钟,时钟不可注入)
+        let mut view = settings_view(&sh).expect("读设置失败");
+        view.auto_lock_minutes = 1;
+        set_settings(&sh, &view).expect("保存设置失败");
+        unlock_with(&sh, PASS).expect("解锁失败");
+        let expiry_path = sh.dirs.config_dir.join("remember.json");
+        let expired = r#"{"expires_at":"2000-01-01T00:00:00Z"}"#;
+        std::fs::write(&expiry_path, expired).expect("改写过期时刻失败");
+        assert!(
+            keychain::get_with_expiry(&sh.dirs)
+                .expect("读副本失败")
+                .is_none(),
+            "TTL 到期后副本应被清理"
+        );
+    }
+
+    #[test]
     fn init_unlock_crud_roundtrip() {
         let sh = shared("crud");
+        let _guard = home_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // 未初始化时解锁报错
         assert!(
@@ -1363,7 +1874,9 @@ mod tests {
                 assert!(!joined);
                 assert_eq!(records, 0);
             }
-            other => panic!("无 GitHub 时不应出现设备码阶段: {other:?}"),
+            InitStage::DeviceCode { .. } => {
+                panic!("无 GitHub 时不应出现设备码阶段")
+            }
         }
         assert!(sh.dirs.is_initialized(), "初始化后应可检测到");
 
@@ -1454,8 +1967,13 @@ mod tests {
         assert!(!lock_if_idle(&sh, Duration::from_secs(60)));
         // 把活动时间拨回过去再测
         {
-            let mut g = sh.inner.lock().unwrap_or_else(|p| p.into_inner());
-            g.last_activity = Instant::now() - Duration::from_secs(120);
+            let mut g = sh
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.last_activity = Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .unwrap();
         }
         assert!(
             lock_if_idle(&sh, Duration::from_secs(60)),
@@ -1469,9 +1987,12 @@ mod tests {
     #[test]
     fn lock_clears_remembered_passphrase() {
         let sh = shared("lockrm");
+        let _guard = home_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         init_start(&sh, None, None).expect("init 失败");
         init_finish(&sh, PASS).expect("init_finish 失败");
-        // 手动记忆一次（remember_days=7）；隔离 service 保证只写测试命名空间
+        // 手动记忆一次（auto_lock_minutes=7 分钟）；隔离 service 保证只写测试命名空间
         keychain::set_ttl(&sh.dirs, PASS, 7).expect("记忆密码失败");
         assert!(
             keychain::get_with_expiry(&sh.dirs).unwrap().is_some(),
@@ -1486,9 +2007,9 @@ mod tests {
         assert!(list_view(&sh).is_err(), "锁定后操作被拒");
 
         // 重输一次密码成功后按 TTL 重新记住（用户成本 = 每次锁定后输一次）；
-        // 这里把 remember_days 调成 7 模拟默认配置
+        // 这里把 auto_lock_minutes 调成 7 分钟模拟默认配置
         AppConfig {
-            remember_days: 7,
+            auto_lock_minutes: 7,
             auto_push: false,
             ..AppConfig::default()
         }
@@ -1502,8 +2023,13 @@ mod tests {
 
         // 空闲自动锁同样清除
         {
-            let mut g = sh.inner.lock().unwrap_or_else(|p| p.into_inner());
-            g.last_activity = Instant::now() - Duration::from_secs(3600);
+            let mut g = sh
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.last_activity = Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap();
         }
         assert!(lock_if_idle(&sh, Duration::from_secs(60)));
         assert!(
