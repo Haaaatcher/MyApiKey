@@ -55,38 +55,53 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Inject GitHub App client secret (embedded)
+        shell: bash
+        env:
+          MYAPIKEY_CLIENT_SECRET: ${{ secrets.MYAPIKEY_CLIENT_SECRET }}
+        run: printf '%s' "$MYAPIKEY_CLIENT_SECRET" > client-secret.txt
+
       - name: Build (release)
         run: cargo build --release -p myapikey-cli --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          name="myapikey-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}"
+          name="makara-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}"
           mkdir -p "pkg/$name"
-          cp "target/${{ matrix.target }}/release/mak" "pkg/$name/"
-          cp "target/${{ matrix.target }}/release/myapikey" "pkg/$name/"
-          tar -czf "pkg/$name.tar.gz" -C pkg "$name"
+          cp "target/${{ matrix.target }}/release/makara" "pkg/$name/"
+          # 平铺打包（包内根直接是二进制）：makara update 自更新按包根
+          # 取二进制，不做目录层展开（D40）
+          tar -czf "pkg/$name.tar.gz" -C "pkg/$name" makara
+          # 完整性校验附件（D52）：makara update 下载后逐一比对
+          sha256sum "pkg/$name.tar.gz" | sed "s|pkg/||" > "pkg/$name.tar.gz.sha256"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         run: |
-          $name = "myapikey-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $name = "makara-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "pkg/$name" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/mak.exe" "pkg/$name/"
-          Copy-Item "target/${{ matrix.target }}/release/myapikey.exe" "pkg/$name/"
-          Compress-Archive -Path "pkg/$name" -DestinationPath "pkg/$name.zip"
+          Copy-Item "target/${{ matrix.target }}/release/makara.exe" "pkg/$name/"
+          Compress-Archive -Path "pkg/$name/makara.exe" -DestinationPath "pkg/$name.zip"
+          # 完整性校验附件（D52）
+          $hash = (Get-FileHash -Algorithm SHA256 "pkg/$name.zip").Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "pkg/$name.zip.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: myapikey-${{ matrix.target }}
-          path: pkg/*.tar.gz
+          name: makara-${{ matrix.target }}
+          path: |
+            pkg/*.tar.gz
+            pkg/*.sha256
           if-no-files-found: ignore
       - name: Upload artifact (zip)
         uses: actions/upload-artifact@v4
         with:
-          name: myapikey-${{ matrix.target }}-zip
-          path: pkg/*.zip
+          name: makara-${{ matrix.target }}-zip
+          path: |
+            pkg/*.zip
+            pkg/*.sha256
           if-no-files-found: ignore
 
   # Windows GUI 安装包（NSIS）。CLI 与 GUI 分开出 job：
@@ -121,6 +136,14 @@ jobs:
       # 与本地 dev 一致的调用方式：从 crate 根调用 ui 内的 tauri CLI，
       # beforeBuildCommand（npm run build）由 CLI 以 ui/ 为工作目录执行。
       # workspace 根在仓库根目录，NSIS 产物落在 <repo>/target/release/bundle/nsis/。
+      - name: Inject GitHub App client secret (embedded, GUI)
+        shell: bash
+        env:
+          MYAPIKEY_CLIENT_SECRET: ${{ secrets.MYAPIKEY_CLIENT_SECRET }}
+        run: |
+          printf '%s' "$MYAPIKEY_CLIENT_SECRET" > client-secret.txt
+          printf '%s' "$MYAPIKEY_CLIENT_SECRET" > crates/myapikey-core/client-secret.txt
+
       - name: Build GUI installer
         working-directory: crates/myapikey-gui
         shell: bash
@@ -161,7 +184,9 @@ jobs:
           import json, glob, os, datetime
           tag = os.environ['GITHUB_REF_NAME']
           version = tag.lstrip('v')
-          sig = glob.glob(f'dist/**/MyApiKey_{version}_*.sig', recursive=True)[0]
+          # 品牌更名（2026-11-09）后产物名 Makara_<version>_*：glob 必须跟上，
+          # 找不到签名文件会让 release job 崩溃（D52 修复的第二个发版定时炸弹）
+          sig = glob.glob(f'dist/**/Makara_{version}_*.sig', recursive=True)[0]
           exe = sig[:-len('.sig')]
           name = os.path.basename(exe)
           doc = {
@@ -188,6 +213,7 @@ jobs:
           files: |
             dist/**/*.tar.gz
             dist/**/*.zip
+            dist/**/*.sha256
             dist/**/*.exe
             dist/**/*.sig
             latest.json

@@ -40,7 +40,7 @@ def main() -> int:
         )
         return 1
 
-    exe = BUNDLE_DIR / f"MyApiKey_{args.version}_x64-setup.exe"
+    exe = BUNDLE_DIR / f"Makara_{args.version}_x64-setup.exe"
     sig = pathlib.Path(f"{exe}.sig")
     if not exe.is_file():
         print(f"未找到安装包: {exe}", file=sys.stderr)
