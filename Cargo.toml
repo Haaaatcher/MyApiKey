@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/myapikey-core", "crates/myapikey-cli", "crates/myapikey-gui"]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 authors = ["Hang Luo (Haaaatcher)"]

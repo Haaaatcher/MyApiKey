@@ -11,7 +11,7 @@ cargo clippy -- -D warnings    # lint，要求零警告
 cargo fmt                      # 格式化（提交前运行）
 ```
 
-环境：Windows + MSVC 工具链（Git Bash）；crates.io 依赖走 rsproxy.cn 镜像（`~/.cargo/config.toml` 已配置，勿重复配置或移除）。
+环境：开发机 macOS（Apple Silicon，`aarch64-apple-darwin`），仓库驻内置盘 APFS（2026-11-12 自 NTFS 外置盘迁入——NTFS 经第三方驱动挂载对 cargo 重活确定性故障：无硬链接、产物写入 ENOENT，**仓库勿放回外置盘**；不得已时设 `CARGO_TARGET_DIR` 指向内置盘）。crates.io 依赖走本地代理 `localhost:7897`（旧 Windows 环境的 rsproxy 镜像不适用，勿搬）。Windows 真机验证与签名构建走 `ssh makara-win`（密钥免密已配；靶机默认 shell 为 PowerShell 5.1，命令用 `;` 不用 `&&`）；发布构建由 CI 完成，本地 Windows 步骤保留于下方开发循环。
 
 ## 项目速览
 
@@ -37,7 +37,7 @@ cargo fmt                      # 格式化（提交前运行）
   - **允许且推荐**：用括号**呈现选项与伴随信息**——输入提示的 Enter 语义 `(Enter keeps current)`、示例 `(e.g. OpenAI primary)`、伴随状态 `(HTTP 401)`、默认值/约束标注 `(private)`、`(optional)` 等，这类括号让主信息与伴随信息层次分明，起更好的提示作用
   - 界限：括号内是**同一信息的组成部分**（选项、状态、示例、约束）→ 可用；括号内是**岔开的解释**（原因、后果、指引）→ 改短句或独立行
 - **提示词简约六则**（2026-10-31 定调"简约是设计风格"，CLI 与 GUI 一致执行）：一句一事（现象一句话，出路/细节缩进下一行）；删可推断的（"successfully""可随时重新绑定"这类用户自己能推断的话不写）；动词开头（指令句动词打头，状态句"名词+状态"）；错误 = 现象 + 出路（第一句短现象，紧跟缩进的出路，不铺原因链）；术语统一（bind/unbind、vault、record 全产品一词）；双语各自成文（中文按中文习惯写，不逐字翻译英文）
-- **GUI 文案遵循 Apple HIG Writing/Labels**（2026-11-11 采纳）：英文一律 **sentence case**（禁 ALL CAPS 强调，专有名词除外）；按钮与动作标签**动词开头**、1–3 词、无句末标点（完整句说明可用句号）；**避免行话与实现细节**（tombstone/purge 等内部术语不进用户界面）；术语全产品一致（passphrase、record、bind——D32 语义的延伸执行）。中文侧不受英文大小写规则约束，仍按「双语各自成文」。出处：https://developer.apple.com/design/human-interface-guidelines/writing
+- **GUI 文案遵循 Apple HIG Writing/Labels**（2026-11-11 采纳）：英文一律 **sentence case**（禁 ALL CAPS 强调，专有名词除外）；按钮与动作标签**动词开头**、1–3 词、无句末标点（完整句说明可用句号）；**toast 提示一律无句末标点**（2026-11-13 拍板：中英文皆然，短句气泡形态加句号视觉突兀；正文段落不受此限）；**避免行话与实现细节**（tombstone/purge 等内部术语不进用户界面）；术语全产品一致（passphrase、record、bind——D32 语义的延伸执行）。中文侧不受英文大小写规则约束，仍按「双语各自成文」。出处：https://developer.apple.com/design/human-interface-guidelines/writing
 - **注释尽可能详细**（我的明确要求，优先于"少注释"的社区习惯）：
   - 所有公开项（pub 函数/类型/常量）必须有 `///` 文档注释，写清用途、参数、返回值，并按惯例补 `# Errors`、`# Panics`、`# Safety` 章节
   - 每个模块/文件以 `//!` 开头说明该模块的职责与边界
@@ -72,16 +72,25 @@ cargo fmt                      # 格式化（提交前运行）
 2. **改中**：core 新行为必须配测试（roundtrip/边界用例）；Rust 改完只跑受影响 crate 的测试，不做无谓全量
 3. **本地验证**：
    - `cargo test`（受影响 crate）+ `cargo clippy --workspace -- -D warnings` 零警告 + `cargo fmt`
-   - 前端改动先在浏览器 mock 验证（vite dev `localhost:5300`——5173/5188 落 Windows 保留端口段不可用 + 浏览器自动化），通过后再 `npm run build`
+   - 前端改动先在浏览器 mock 验证（vite dev `localhost:5300`——5173/5188 在 Windows 落保留端口段不可用，macOS 无此限制，沿用 5300 保持两端一致 + 浏览器自动化），通过后再 `npm run build`
+   - **Windows 靶机验证（2026-11-13 起，双端同步工作流）**：改动涉及 cfg 分叉、Windows 专属路径或发版前，跑 `scripts/sync-windows.sh` 同步源码到靶机（一条命令；保留靶机 `target/` 编译缓存，增量编译），再统一执行：
+     `ssh makara-win "cd C:\Users\luohang\Projects\MyApiKey; cargo test --workspace -- --skip lock_clears_remembered --skip set_settings_rewrites; cargo clippy --workspace -- -D warnings"`
+     ——凭据库 2 测试（lock_clears / set_settings_rewrites）依赖交互式登录会话，SSH 非交互会话必失败（`ERROR_NO_SUCH_LOGON_SESSION`），属环境限制非缺陷，桌面会话或 CI 可跑；Mac/Windows 的 clippy lint 集有版本差（靶机 1.99.0 更严），**cfg 分叉改动双端都要跑**；删除/重命名源文件需手动清靶机残留；改 `ui/package.json` / `package-lock.json` 后靶机重跑 `npm ci`；Windows 签名构建用靶机 `C:\Users\luohang\build-signed.ps1`（签名口令经 stdin 管道传入，README 口令行解析在 PowerShell GBK 环境不可靠）
 4. **交付（涉及 GUI）**：
    - 先 `taskkill //IM myapikey-gui.exe //F`——旧进程占用 exe，不杀会导致构建 os error 5
    - 在 `crates/myapikey-gui` 下执行 `node ui/node_modules/@tauri-apps/cli/tauri.js build`（crate 根有 `tauri.conf.json`，npm scripts 在 ui/ 下）
    - **交付我验证前，再杀一次旧进程**（同上命令）——应用单实例 + 托盘常驻：双击 exe / 点图标只是唤起旧进程窗口（加载的是旧前端），新版改动会「看起来没生效」；杀干净后我打开的才是新构建
    - 产物以链接交付给我：`target/release/myapikey-gui.exe`（免安装）与 `target/release/bundle/nsis/*-setup.exe`（安装包）；提醒我**托盘退出后重开**——点 × 只是隐藏到托盘，直接双击 exe 会由单实例唤起旧进程，跑的还是旧代码
+   - **macOS（M5 起）**：
+     - 在 `crates/myapikey-gui` 下执行 `ui/node_modules/.bin/tauri build`；本地无 `TAURI_SIGNING_PRIVATE_KEY` 时在 updater 签名步报错退出（dmg / .app / 机制件已产出，仅缺 .sig）——快速验证用 `--bundles dmg` 跳过 updater 链；正式签名构建见发布流程
+     - **签名密钥已就位本机 `~/.tauri/`**（2026-11-12 scp 自 Windows 靶机，三件套：`.pem` 私钥 + `.pub` + README）：构建前注入 `TAURI_SIGNING_PRIVATE_KEY=$HOME/.tauri/myapikey-updater.pem` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（口令在 README 的 `口令:` 行，提取后进环境变量、勿回显），本地即可出完整签名构建（2026-11-12 端到端验证：.sig 经 minisign-verify 权威验证通过）
+     - dmg 打包的窗口装饰走 osascript 控制 Finder——首次构建会弹 macOS 自动化授权，点「好」放行（授权持久，仅首次）
+     - 产物（仓库 `target/` 下）：`release/bundle/dmg/Makara_<版本>_aarch64.dmg`（人装）、`release/bundle/macos/Makara.app`（免安装）、`release/bundle/macos/Makara.app.tar.gz`（updater 机制件，签名后进 latest.json 的 `darwin-aarch64` 键）
+     - 交付提醒：无开发者签名/公证，首次打开**右键 → 打开**或 `xattr -d com.apple.quarantine <app>`；托盘常驻语义同 Windows，macOS 上 Cmd+Q / 菜单退出才结束进程
 5. **交付（涉及 CLI）**：
    - `cargo build --release -p myapikey-cli` 后 `cargo install --path crates/myapikey-cli --force`，即时更新我的 `makara`
    - 交互类改动用管道喂输入冒烟（顺带覆盖非 TTY 降级路径）
-6. **测试数据纪律**：一律用 `MYAPIKEY_HOME` 指向临时目录隔离，**绝不碰我的真实 `%APPDATA%\myapikey`**；需要清我的本地状态时先整目录备份（`myapikey.bak-<日期>`）再动，删完报告清单
+6. **测试数据纪律**：一律用 `MYAPIKEY_HOME` 指向临时目录隔离，**绝不碰我的真实数据目录**（Windows `%APPDATA%\myapikey`、macOS `~/Library/Application Support/myapikey`）；需要清我的本地状态时先整目录备份（`myapikey.bak-<日期>`）再动，删完报告清单
 7. **文档同步**：行为/架构变更记入 `docs/design.md`（ADR 表或对应章节），规则变更同步本文件；全程不做 `git commit` / `git push`（等我批准）
 
 ### 发布流程（tag / GitHub Release）

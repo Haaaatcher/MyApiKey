@@ -1278,3 +1278,36 @@ html[data-theme="light"] .auth-banner { background: rgba(191, 137, 22, 0.10); }
   left: 16px;
   z-index: 10;
 }
+
+/* 解锁页钥匙串授权引导面板（D57，2026-11-13 图文形态）：示意 macOS
+ * 授权弹窗 + 说明。浅底色块与卡片主体区分，居中排版 */
+.kc-guide {
+  background: #f4f6fd;
+  border: 1px solid #e2e6f5;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 6px 0 14px;
+}
+.kc-guide-title {
+  font-weight: 600;
+  font-size: 13px;
+  margin: 0 0 10px;
+  color: #26262b;
+}
+.kc-guide-svg {
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 8%);
+  margin-bottom: 10px;
+}
+.kc-guide-svg svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.kc-guide-body {
+  font-size: 12.5px;
+  line-height: 1.55;
+  margin: 0;
+  color: #3c3c45;
+}

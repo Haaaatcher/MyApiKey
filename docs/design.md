@@ -80,6 +80,11 @@ MyApiKey 是一个跨平台（Windows / macOS / Linux）的 AI API 凭证记录�
 | D50 | **错误与警告走 stderr**（2026-11-11 用户拍板采纳 clig.dev 流分离）：数据与结果走 stdout，错误（主出口 `eprintln!` + exit 1，此前已实现）与警告（`prompt::warn` 改 `eprintln!`，check 缓存失败/剪贴板失败两个手写点归一 `warn()`）走 stderr——管道重定向时日志不被警告污染；AGENTS 输出排版规则同步固化 | clig.dev 流分离条目；终端合流显示下用户无感知差异，仅脚本重定向场景受益 |
 | D51 | **GUI 文案规范采纳 Apple HIG Writing/Labels**（2026-11-11 用户拍板，首次引入外部文案规范）：英文词条一律 sentence case（禁 ALL CAPS 强调，专有名词除外）、按钮与动作标签动词开头 1–3 词、片段无句末标点、避免行话（tombstone/purge 等内部术语不进用户界面）、术语全产品一致（passphrase/record/bind，D32 语义的延伸执行）；中文侧不受英文大小写规则约束，仍按「双语各自成文」。首轮全量审查（约 200 词条）已修 4 处：exportConfirm PLAINTEXT→plaintext、master passphrase×3 统一为 passphrase、repoUnbound 同义重复删除 | Apple HIG 是桌面应用文案的成熟业界标准，与「简约六则」高度互补（错误=现象+出路、术语一致逐字对应）；sentence case 与术语一致直接消除用户困惑源（「Client secret 是什么」类困惑的预防性治理）；规则已固化进 AGENTS.md 代码风格区 |
 | D52 | **中低风险全修**（2026-11-11 用户令「中低风险全修」，覆盖审查报告 6 项）：①`makara update` 非交互（管道/脚本）不再自动替换二进制——降级打印直链（交互终端仍直接更新不询问，拍板语义不变）；②AGENTS 发布流程步骤 3 固化「Release notes 必须提及用户可见行为变化」（stderr 分流等）；③⑤导入恢复快照——core `import_records` 改返回 `ImportReport { added, updated, overwritten }`（overwritten=被覆盖的本地旧版本）+ HashMap 索引替代 O(n²) find；CLI 覆盖发生时写当前目录 `makara-import-backup-<ts>.json`（0600），GUI 写 Downloads 并经 `ImportedView.backup_path` toast 提示；快照是数据保底而非一键回滚（其 updated_at 早于现数据，再导入会被 LWW 跳过）；④自更新临时目录成败都清理（do_upgrade 拆 inner）；⑥Release 附件配 .sha256（unix sha256sum / Windows Get-FileHash）+ `makara update` 下载后用系统工具（certutil/sha256sum）比对——D40 的 checksum 缺口落地；连带修复 release.yml latest.json 的旧品牌 glob `MyApiKey_\<v\>_*.sig`（找签名必落空，发版必崩的第二个定时炸弹）；sha256 解析按行精确提取（certutil 输出的 SHA256 标题含数字，字符级过滤会混入） | 修复方式尊重既有拍板语义（①不加询问只降级非交互；③不做一键回滚做数据保底快照）；零新依赖（哈希用系统工具，与 tar 同哲学） |
+| D53 | **v1.2.0 发布**（2026-11-11 用户指令，发布红线获批）：版本 bump 1.2.0、五批逻辑提交、tag v1.2.0。发版过程中实战暴露并修复**两个 CI 层问题**：①runner 对 *.ubuntu.com 域名 DNS 持续故障（ubuntu-latest(26) 与 24.04 均中招，apt 装依赖必败三连）——Linux runner 固定 ubuntu-24.04 + apt 换 mirrors.kernel.org + 最终 libdbus vendored 化使 apt 步骤整步删除（D52 的 vendored 落地）；②latest.json 生成的旧品牌 glob `MyApiKey_\<v\>_*.sig` 找不到新版 `Makara_*.sig`（release job 必崩）——改 `Makara_`。发布附件 12 项齐全（四平台压缩包+各 .sha256+GUI exe/.sig/latest.json）；Release body 写入双语行为变化清单（D52 固化规则首执）；附件机制层验证（下载+sha256 逐字匹配+System32 bsdtar 解 zip 实证 makara.exe）。extract_archive 的 Windows tar 改绝对路径 System32（PATH 里的 Git Bash GNU tar 不支持 zip——本机实测抓到的 PATH 歧义风险）。`makara update` 端到端留待下一个小版本自然验证（本机已 1.2.0，检测分支显示 Up to date ✓） | 红线获批的发布全流程；发版是最佳集成测试——两个 CI 定时炸弹与一个 PATH 歧义风险全部实战暴露并修复 |
+| D54 | **M5 macOS GUI 适配方案定稿**（2026-11-12 用户拍板四项）：①**分发形态单一 dmg**（人装 = dmg；updater 机制件 `.app.tar.gz` + `.sig` 由 `createUpdaterArtifacts` 产出，**仅对 updater 启用目标生效——bundle targets 必须含 `app`**，`dmg` 本身不触发，纯 dmg 构建不产机制件且 release job 找不到签名会崩，本机实测抓到后修正）；②**应用内更新纳入**——`latest.json` 增 `darwin-aarch64` 平台键（Windows updater 只读自己的键，纯增量无感知；复用既有 Ed25519 签名密钥，无需 Apple 开发者账号）；③**窗口行为：与 Windows 一致优先 + 兼容 macOS 习惯**——关闭按钮收菜单栏托盘（D15 语义平移）、托盘左键显示主窗口、单实例聚焦已有窗口（三者与 Windows 完全一致）；**最小化走系统默认进 Dock**（唯一实质差异，「兼容 macOS 习惯」的直接推论）；**Dock 图标点击恢复窗口**（`RunEvent::Reopen`，原实现缺失）；**Cmd+Q 退出**（tauri 2 macOS 未设菜单时自动挂默认菜单，自带 Quit——2.12.5 源码核实）；④**Windows 保障条款**（结构性 + 证据性双层）：结构性 = macOS 特化一律 `#[cfg(target_os = "macos")]` 门控（Windows 编译时不存在）、`release.yml` 既有 Windows job 一行不改只新增 macOS job、`tauri.conf.json` 的 dmg target 与 icns 均平台键控（Windows 构建忽略）；证据性 = 新增 `ci.yml` 三平台推送矩阵（2026-11-12 用户拍板：每次 push/PR 自动跑 test + clippy + fmt；Linux 仅 core/CLI——GUI 需 webkit2gtk 系统头文件，会重引 D53 拔掉的 apt 依赖，GUI 证据由 macOS/Windows job 原生覆盖）：Windows 编译与行为问题在改动当时暴露，取代本地 MSVC 交叉检查（Mac 上 ring 的 C build script 需 MSVC 头文件，实测不可行）、共享逻辑测试网锁定双平台同源行为、M5 交付前 workflow_dispatch 手动构建产出 Windows 安装包真机冒烟（init → add → sync → 托盘 → 检查更新）、打 tag 前 Windows 冒烟红线不变 | dmg 单形态不造双份产物；Mac 用户只能手动重装的更新缺口必须补上；行为矩阵以「一致优先」守住双端心智一致，最小化差异是平台习惯的合理让步；Windows 保障 = 让影响不可能发生（门控/纯增量）+ 拿出不变的证据（CI 矩阵/测试网/冒烟） |
+| D55 | **接管绑定即对账 + 仓名分叉按历史遗留**（2026-11-12 用户拍板，M5 冒烟真实事件驱动）：事件——Mac GUI 走设置页绑定时的接管分支（`init_device_authorized` 已初始化 arm）**裸绑定**（只 ensure 默认仓名仓库 + 写绑定，不探测不合并），绑定后首次同步走「本地 dirty + 远端无文件」基线分支，把本机 10-23 的冒烟残留推进了**新建的** `makara-vault`；真仓库 `myapikey-vault`（D38 改名前默认名，Windows 绑定、按 D38 设计不迁移）经 GitHub API 核实**零损失**。修复：①接管分支绑定后立即 `reconcile_after_bind`（完整 sync 状态机 + 会话重载，新增私有函数，MemRemote 测试双打覆盖）；无会话（锁定态防御分支，正常入口到不了设置页）或对账失败都不回滚绑定——前者留待解锁后同步，后者下次同步如实暴露（如远端主密码不一致）；②绑定新建默认仓时**不询问**「绑新还是绑旧」——仓名分叉按历史遗留处理，用户 `makara remote set <owner/repo>` 手动修正（README 常见问题已记录，含钥匙串首次授权说明）；③**core `sync` 本地解密延迟化**——干净本地走下载替换/幂等对账分支不再要求本地密码可解（事件第二层根因：sync 曾要求一个密码同时解两端，换绑到主密码不同的远端时，拉取路径被本地旧 vault 堵死，用户实测撞上）；dirty 分支照常解密，本地为主的基线上传分支按需解密取计数（复现测试 `adopt_remote_with_different_passphrase_on_clean_local`）；**CLI 侧配套**——sync 密码解析改 `passphrase_for_sync`（同三级来源、全程不做本地 vault 预校验，事件第三层根因：提示循环拿本地 vault 预校验，Windows 主密码被本地旧 vault 判错、永远到不了远端），TTL 续期移到 sync 成功后（失败时续期等于把错误密码再留一个周期） |
+| D56 | **GitHub 凭据改文件存储，主密码副本留钥匙串**（2026-11-12 用户拍板，钥匙串弹窗治理）：macOS 上 GitHub access/refresh token 与过期时间戳从钥匙串（3 条目）改为应用数据目录 `github-credentials.json`（unix 0600 + 临时文件原子替换），**Windows/Linux 保持 keyring 不变**（D54 保障条款：非 macOS 行为零改动，cfg 门控分叉）；主密码记住副本**留钥匙串**（「明文密码不落盘」铁律不破）。动因：钥匙串 ACL 逐条目授权 × ad-hoc 签名（每次构建新身份）= 新二进制首次触碰每条条目弹一次授权窗（用户实测 4 连弹）；gh/aws/docker/ssh 的 0600 文件实践是业界对「无稳定签名身份下的凭据存储」的成熟答案。每二进制弹窗 4 → 1（仅主密码条目）。兼容：读路径文件优先、钥匙串遗留回退（access token 命中即顺手写文件完成迁移）；**遗留钥匙串条目不主动删除**（删除同样触发弹窗，违背治理目标）——残留由用户在「钥匙串访问」手动清理或随 GitHub 侧过期；`client_secret` 遗留读取路径不动（近乎死代码）。凭据文件不参与同步（同步只上传 vault.mkv） | 钥匙串弹窗的根因是 ACL 授权模型叠加无稳定签名身份，无法在免费前提下根治「更新后重弹」；文件存储把 GitHub 凭据的弹窗面清零，主密码副本维持既有安全语义；平台分叉以 cfg 门控守住 Windows 保障条款 | 裸绑定让「绑定成立」与「数据一致」脱钩——绑定后 UI 报告的还是本地旧记录数，用户对远端落了什么毫无感知；逐仓询问打破「绑定不该让用户手动填地址」（2026-11-10 拍板）的零输入承诺；分叉属低频历史遗留且手动修法只有一条命令 |
+| D57 | **凭据库条目改名 makara + 回退迁移 + GUI 钥匙串引导**（2026-11-12 用户拍板）：凭据库 service 名 `myapikey` → **`makara`**（产品统一命名；授权弹窗里用户看到的是条目名，旧名 `myapikey` 与产品名割裂造成困惑）。范围：主密码记住副本条目（`makara/default`，全平台）+ 非 macOS 的 GitHub 令牌条目（`makara/github` 等三条；macOS 上 D56 已改文件存储、遗留条目只读回退，回退目标同步改指旧名）。迁移语义（读路径统一）：新名 miss → 旧名 `myapikey` 回退读取 → 命中即迁入新名（写回）+ 日志留痕；**旧条目一律不主动删除**（macOS 删除触发弹窗，D56 治理同款；`forget`/`remote unset` 的清理路径对旧名条目尽力删除、失败静默——读路径授权过则删除自然免弹）。隔离 service 名 `myapikey-isolated` 不变（测试/便携条目无跨版本迁移语义）。配套：①GUI 解锁页**钥匙串引导提示条**（系统授权弹窗文案不可自定义，应用内预告补位）——后端以「当前二进制哈希 vs `build-id.txt` 记录」检测新构建，新构建首次打开时提示「点『始终允许』」，确认一次后不再显示（双语，简约六则）；②D56 缺口修复——`keychain_token_expires` 急切求值改为惰性（文件命中即不碰钥匙串，2026-11-12 弹窗排查中抓到）。证据：迁移路径 macOS 专属测试（自建条目，不碰真实凭据）、build-id 纯逻辑测试 | 新条目一旦创建即获创建者隐式授权（macOS 钥匙串机制），**迁移完成后主密码副本读路径永久免弹**——比旧名条目（历史条目，每个新构建都要重新授权）治理效果更彻底；弹窗显示条目名与产品名一致，减少「myapikey 是什么」的困惑 | 改名让既有用户的旧条目回退读取可能多弹一次（一次性，迁移读完成即终结）；Windows/Linux 令牌条目随改名静默迁移（凭据库无 ACL 弹窗成本）；`myapikey` 旧条目残留由用户手动清理（同 D56 约定） |
 
 ---
 
@@ -291,6 +296,7 @@ makara import <file>             # 导入（按 updated_at 新者胜）
 - **设置页**：远端仓库（绑定态只读展示完整 GitHub URL + 「解绑」；未绑定或失效折叠态显示「未绑定」+ 「绑定仓库」按钮，D36）、自动锁定档位（D32）、修改后自动推送、日志级别、主题与语言（本机偏好，即时生效）。锁定/推送变更即写（D33）。
 - **应用内更新（D16）**：设置页检查更新，非破坏性一键升级，破坏性引导手动。
 - **自动锁（硬锁）**：空闲 N 分钟（默认 10）销毁解密状态并清除记住的密码；初始化中间态（授权/绑定意图）一并作废。
+- **跨平台窗口行为（M5，D54）**：关闭收托盘、托盘左键唤起、单实例聚焦与 Windows 完全一致；macOS 分支——最小化走系统默认进 Dock（不藏窗）、Dock 图标点击恢复窗口（`RunEvent::Reopen`）、Cmd+Q 走系统默认菜单退出。
 - **提示词简约**：全部用户可见文案遵循简约六则（D30），GUI 中英双语各自成文。
 - 前端只做展示与输入，**一切读写通过 Tauri command 走 core**；前端代码里不出现任何密钥处理逻辑。
 
@@ -304,6 +310,7 @@ makara import <file>             # 导入（按 updated_at 新者胜）
 | 解锁密码 | 明文不写入任何文件；"记住"仅存于 OS 凭据库（§9.1），`makara lock` / GUI 锁定随时清除；内存中 zeroize |
 | 内存 | 派生密钥、密码用 `zeroizing` 包裹；承认 JSON 反序列化产生的明文 String 无法完全避免——文档如实声明此限制 |
 | 剪贴板 | CLI 复制后 30s 尽力清除；GUI 同（提示自动清除） |
+| GitHub 令牌 | macOS 存应用数据目录 `github-credentials.json`（unix 0600、原子写，D56）；Windows/Linux 存系统凭据库；不参与同步，同步只上传 vault.mkv |
 | 并发 | 文件锁防双实例写坏 vault；写命令持写闸门互斥 |
 | 导出 | 明文导出需二次确认，文件 0600，界面警示 |
 | 找回 | 无。首次设置密码时界面显著提示"忘记=丢失全部数据" |
@@ -322,10 +329,10 @@ makara import <file>             # 导入（按 updated_at 新者胜）
 
 ## 10. 分发
 
-- CI（GitHub Actions）三平台矩阵：`cargo test` + `clippy` + `fmt`；GUI 构建带 Rust/npm 缓存。
-- Release 产物：三平台 CLI 单二进制（各含 `myapikey` + `makara`）；**GUI 安装包仅 Windows**（nsis）+ `.sig` 签名 + `latest.json`。
-- 更新器产物链（D16）：CI secrets 注入签名密钥；`scripts/make-latest-json.py` 生成清单（带版本一致性断言）。
-- macOS：M5 前暂无 GUI；CLI 触发 Gatekeeper 隔离，文档提示 `xattr -d com.apple.quarantine`。
+- CI（GitHub Actions）三平台矩阵：`ci.yml` 每次 push/PR 跑三平台 `cargo test` + `clippy` + `fmt`（2026-11-12 落地，D54；Linux 仅 core/CLI——GUI 需 webkit2gtk 系统头文件，见 D12）；`release.yml` 发版构建带 Rust/npm 缓存。
+- Release 产物：三平台 CLI 单二进制（各含 `myapikey` + `makara`）；GUI 安装包 **Windows（nsis）+ macOS（dmg，仅 Apple Silicon，D26/D54）**，各带 `.sig` 签名 + `latest.json`（`windows-x86_64` 与 `darwin-aarch64` 双平台键）。
+- 更新器产物链（D16）：CI secrets 注入签名密钥；`scripts/make-latest-json.py` 生成清单（带版本一致性断言）；macOS updater 机制件 `.app.tar.gz` 由 `createUpdaterArtifacts` 自动产出（D54）。
+- macOS：无 Apple 开发者账号，产物未签名/公证——CLI 与 GUI 首次运行均需 `xattr -d com.apple.quarantine <文件>`（curl 下载无此问题，README 指引）；应用内更新链路（验签）不受影响。
 - 渠道：GitHub Releases（更新通道只认正式 Release）；`cargo install`、scoop/winget/homebrew 后续按需。
 
 ---
@@ -339,7 +346,7 @@ makara import <file>             # 导入（按 updated_at 新者胜）
 | M2 | Tauri GUI（解锁/列表/编辑/搜索/设置/同步状态、空闲自动锁、剪贴板清除），仅发布 Windows | ✅ |
 | M3 | 导入导出、应用内更新（D16）、两端模糊搜索、dialoguer 交互菜单、三批代码审查 | ✅ v1.0.0 发布（2026-10-26） |
 | M4 | 零外部依赖（D25，2026-10-29）：移除系统 git，GitHub Contents API 直连 | ✅ 2026-10-31 完成 |
-| M5 | macOS GUI 适配（D26）：仅 Apple Silicon | 🚧 待启动 |
+| M5 | macOS GUI 适配（D26/D54）：仅 Apple Silicon | 🚧 进行中（2026-11-12 开工） |
 
 ---
 

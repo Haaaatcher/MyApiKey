@@ -67,7 +67,7 @@ mod imp {
 mod imp {
     /// 非 Windows 平台的空实现（终端均为 UTF-8）。
     pub struct ConsoleGuard;
-    pub fn enter_utf8() -> ConsoleGuard {
+    pub(super) fn enter_utf8() -> ConsoleGuard {
         ConsoleGuard
     }
 }

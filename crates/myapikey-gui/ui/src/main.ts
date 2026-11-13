@@ -78,7 +78,6 @@ interface RecordView {
 interface GuiState {
   initialized: boolean;
   unlocked: boolean;
-  has_remembered: boolean;
 }
 
 interface SyncView {
@@ -334,6 +333,14 @@ const STRINGS: Record<string, [string, string]> = {
   unlocking: ["Unlocking…", "正在解锁…"],
   unlockPlaceholder: ["Passphrase", "解锁密码"],
   lockedHint: ["Locked. Enter the passphrase to continue.", "已锁定，输入解锁密码继续。"],
+  keychainGuideTitle: ["Keychain access requested", "即将请求钥匙串授权"],
+  keychainGuideBody: [
+    'Click "Always Allow" in the system dialog.',
+    "系统弹窗中点「始终允许」。",
+  ],
+  keychainGuideDeny: ["Deny", "拒绝"],
+  keychainGuideAllow: ["Allow", "允许"],
+  keychainGuideAlways: ["Always Allow", "始终允许"],
   cancel: ["Cancel", "取消"],
   save: ["Save", "保存"],
   backupSection: ["Backup & migration", "备份与迁移"],
@@ -521,7 +528,8 @@ const STRINGS: Record<string, [string, string]> = {
   relHoursAgo: ["{0} h ago", "{0} 小时前"],
   relDaysAgo: ["{0} d ago", "{0} 天前"],
   reauthorizing: ["Finishing binding in the browser…", "正在浏览器中完成绑定…"],
-  reAuthorized: ["Binding restored.", "绑定已恢复。"],
+  reAuthorized: ["Binding restored", "绑定已恢复"],
+  joinedVault: ["Joined the vault · {0} records", "已接入保险库 · {0} 条记录"],
   daysUnit: ["days", "天"],
   autoLock: ["Auto-lock after idle", "空闲自动锁定"],
   lockNever: ["Never", "永不"],
@@ -945,6 +953,10 @@ function fmtSyncResult(v: SyncView): string {
 // 启动路由
 // ---------------------------------------------------------------------------
 
+/** 钥匙串授权引导是否显示（D57）：新构建首次 `gui_state` 为 true，后端
+ * 已随检测写回指纹——本次会话内解锁页提示一次即可，之后不再打扰。 */
+let keychainHintVisible = false;
+
 async function boot(): Promise<void> {
   await onLocked(() => {
     clearDrawerDraft();
@@ -955,15 +967,22 @@ async function boot(): Promise<void> {
   // 引导条 + chip 立即可见,不必等用户点同步撞 401(2026-11-03 需求 2)
   void onAuthInvalid(() => markAuthInvalid());
   const st = await invoke<GuiState>("gui_state");
+  keychainHintVisible = await invoke<boolean>("keychain_hint");
   if (!st.initialized) renderInit();
   else if (st.unlocked) renderMain();
-  else if (st.has_remembered) {
+  else {
+    // 先渲染锁定页——remembered_status / unlock_remembered 的钥匙串
+    // 读取可能触发系统授权弹窗并阻塞命令返回，绝不能挡住首帧
+    // （2026-11-13 修复：曾因 gui_state 内同步读钥匙串导致弹窗期间
+    // 窗口完全空白）。
+    renderUnlock(false);
+    const remembered = await invoke<boolean>("remembered_status");
     // 上次以解锁状态退出（锁定会清除记住的密码，走不到这里）——
     // 记住的密码仍在有效期内：静默恢复解锁，直接进主界面。
-    // 2026-10-25 决议：启动状态跟随用户上次的状态。
-    if (await invoke<boolean>("unlock_remembered")) renderMain();
-    else renderUnlock(false);
-  } else renderUnlock(false);
+    // 2026-10-25 决议：启动状态跟随用户上次的状态。失败留在已渲染
+    // 的解锁页（此时 keychainHintVisible 已就绪，引导面板可见）。
+    if (remembered && (await invoke<boolean>("unlock_remembered"))) renderMain();
+  }
   // 启动诊断(2026-11-04 分步引导):令牌失效/App 未安装时引导条立即
   // 呈现,不必等用户点同步撞错。单机(未绑定远端)时诊断返回不引导
   void refreshAuthDiag();
@@ -1703,6 +1722,76 @@ function showDeviceCode(code: string, uri: string, onBack?: () => void): void {
  *
  * @param afterLock 是否因锁定（而非启动）进入解锁页，影响提示文案
  */
+/**
+ * 钥匙串授权引导面板（D57，2026-11-13 升级为图文形态）：模拟 macOS
+ * 授权弹窗的内联 SVG 示意图 + 说明文字——告诉用户系统会弹什么、点哪个
+ * 按钮（「始终允许」高亮 + 虚线圈强调）。按钮文字随界面语言渲染。
+ */
+function keychainGuide(): HTMLElement {
+  const wrap = el("div", "kc-guide");
+  const title = el("p", "kc-guide-title", t("keychainGuideTitle"));
+  const body = el("p", "kc-guide-body", t("keychainGuideBody"));
+  const svgWrap = el("div", "kc-guide-svg");
+  svgWrap.innerHTML = keychainGuideSvg();
+  wrap.append(title, svgWrap, body);
+  return wrap;
+}
+
+/** 按钮行（对齐 macOS 真实 ACL 弹窗的排布，2026-11-13 实拍修正）：
+ * 「始终允许」在左侧独立位（? 帮助钮之后），「拒绝/允许」右对齐成组。
+ * 宽度按实际渲染估算：CJK 全角 ~11px、ASCII ~6.5px，内边距 20——保证
+ * 文字不撑满按钮（原公式按 7px/字估算，中文按钮被撑爆）。 */
+function keychainGuideBtnRow(): Array<{ x: number; w: number; label: string; hot?: boolean }> {
+  const w = (s: string) => {
+    let text = 0;
+    for (const ch of s) text += ch.charCodeAt(0) > 0xff ? 11 : 6.5;
+    return Math.ceil(text) + 20;
+  };
+  const deny = t("keychainGuideDeny");
+  const allow = t("keychainGuideAllow");
+  const always = t("keychainGuideAlways");
+  const wA = w(deny);
+  const wB = w(allow);
+  const wC = w(always);
+  return [
+    { x: 86, w: wC, label: always, hot: true },
+    { x: 280 - wA - wB - 10, w: wA, label: deny },
+    { x: 280 - wB, w: wB, label: allow },
+  ];
+}
+
+/** 授权弹窗示意图 SVG（对齐 macOS 真实 ACL 弹窗布局，2026-11-13 按
+ * Sequoia/Tahoe 形态修正）：应用图标左侧垂直居中（32px 圆角方块）、
+ * 标题+正文在图标右侧、全宽分隔线下按钮行右对齐贴边。「始终允许」
+ * 蓝底高亮 + 外围虚线圈为教学标注。 */
+function keychainGuideSvg(): string {
+  const buttons = keychainGuideBtnRow()
+    .map(
+      (b) => `
+    <rect x="${b.x}" y="80" width="${b.w}" height="24" rx="6" fill="${b.hot ? "#2f5fe0" : "#ffffff"}"${b.hot ? "" : ' stroke="#c8c8ce"'}/>
+    <text x="${b.x + b.w / 2}" y="96.5" text-anchor="middle" font-size="10.5" font-family="-apple-system,sans-serif" font-weight="${b.hot ? 600 : 400}" fill="${b.hot ? "#ffffff" : "#3c3c40"}">${b.label}</text>
+    ${
+      b.hot
+        ? `<rect x="${b.x - 5}" y="75" width="${b.w + 10}" height="34" rx="9" fill="none" stroke="#2f5fe0" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.75"/>`
+        : ""
+    }`,
+    )
+    .join("");
+  return `
+<svg viewBox="0 0 300 118" xmlns="http://www.w3.org/2000/svg" role="img">
+  <rect x="8" y="4" width="284" height="110" rx="12" fill="#ffffff" stroke="#d9d9de"/>
+  <rect x="22" y="20" width="34" height="34" rx="8" fill="#2f5fe0"/>
+  <path d="M47.5 31.5l-2 2m-6.8 5.5a4.8 4.8 0 1 1-6.78-6.78 4.8 4.8 0 0 1 6.78 6.78zm0 0L44 32.5" stroke="#fff" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+  <rect x="68" y="24" width="158" height="8" rx="4" fill="#48484e"/>
+  <rect x="68" y="38" width="198" height="6" rx="3" fill="#c9c9cf"/>
+  <rect x="68" y="49" width="176" height="6" rx="3" fill="#c9c9cf"/>
+  <line x1="8" y1="70" x2="292" y2="70" stroke="#ececf0"/>
+  <circle cx="34" cy="92" r="9" fill="#ececf0"/>
+  <text x="34" y="96.5" text-anchor="middle" font-size="11" font-family="-apple-system,sans-serif" font-weight="600" fill="#6c6c72">?</text>
+  ${buttons}
+</svg>`;
+}
+
 function renderUnlock(afterLock: boolean): void {
   // 进入解锁页必然意味着会话已销毁：先关掉可能残留的编辑抽屉
   closeOverlays();
@@ -1714,6 +1803,12 @@ function renderUnlock(afterLock: boolean): void {
   const brandH = el("h1", "brand-row");
   brandH.append(icon("key"), el("span", "brand", "Makara"), langToggle(() => renderUnlock(afterLock)));
   card.append(brandH);
+  // 钥匙串授权引导（D57）：系统弹窗文案不可自定义，应用内预告补位——
+  // 新构建首次打开时以「示意图 + 说明」面板呈现一次，让用户带着预期
+  // 去点「始终允许」（2026-11-13 升级：一行提示条 → 图文面板）
+  if (keychainHintVisible) {
+    card.append(keychainGuide());
+  }
   if (afterLock) {
     card.append(el("p", "muted", t("lockedHint")));
   }

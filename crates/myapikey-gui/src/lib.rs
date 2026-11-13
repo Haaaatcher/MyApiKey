@@ -10,6 +10,7 @@
 //! - 解锁密码只在内存（会话）与凭据库（TTL 记忆）；
 //! - 错误信息一律英文且不包含任何凭据。
 
+use myapikey_core::build_id;
 use myapikey_core::check_cache::CheckCache;
 use myapikey_core::config::AppConfig;
 use myapikey_core::github;
@@ -133,7 +134,7 @@ fn remote_of(sh: &Shared) -> Result<Option<Box<dyn myapikey_core::remote::SyncSt
     // 绑定失效折叠为未绑定(2026-11-10 用户拍板:用户只感知绑定与未绑定
     // 两态):凭据条目不在即按单机处理,写操作跳过推送(本地照常保存,
     // 重绑后 sync 一次带上去,数据无损)
-    let Some(token) = myapikey_core::github::keychain_token()? else {
+    let Some(token) = myapikey_core::github::keychain_token(&sh.dirs)? else {
         return Ok(None);
     };
     Ok(Some(sync::open_remote(&url, &token)?))
@@ -153,11 +154,11 @@ pub fn open_external(url: &str) -> Result<()> {
 /// 操作（重试会现读新凭据）；`Err` = 续期失败，调用方必须把原因并入
 /// 错误展示——用户只看到 401 而不知道续期为何没救场，等于诊断线索
 /// 被吞（2026-11-03 修复：原布尔封装吞掉了失败原因）。
-fn try_refresh_and_retry_setup(_sh: &Shared) -> Result<()> {
+fn try_refresh_and_retry_setup(sh: &Shared) -> Result<()> {
     // client_id 取环境变量覆盖（2026-10-31 审查采纳：原硬编码会让覆盖
     // 部署下的刷新必败）
     let client_id = github::effective_client_id()?;
-    myapikey_core::github::refresh_access_token(&client_id).map(|_| ())
+    myapikey_core::github::refresh_access_token(&sh.dirs, &client_id).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -192,12 +193,14 @@ pub struct CheckView {
 }
 
 /// 应用启动时前端需要的一次性状态。
+///
+/// 不含「记住密码可用性」（原 `has_remembered`，2026-11-13 拆到
+/// [`remembered_status`]）——钥匙串读取可能触发系统授权弹窗，留在
+/// 启动状态里会阻塞前端首帧渲染（窗口空白）。
 #[derive(Debug, Serialize)]
 pub struct GuiState {
     pub initialized: bool,
     pub unlocked: bool,
-    /// 记忆中的解锁密码是否可用（决定“一键解锁”按钮）。
-    pub has_remembered: bool,
 }
 
 /// `makara sync` 的前端回显。
@@ -303,13 +306,36 @@ pub fn state_view(sh: &Shared) -> Result<GuiState> {
         let mut cfg = sh.config();
         myapikey_core::sync::migrate_legacy_git(&sh.dirs, &mut cfg);
     }
-    let has_remembered = keychain::get_with_expiry(&sh.dirs).ok().flatten().is_some();
     let unlocked = enter(&sh.inner).session.is_some();
     Ok(GuiState {
         initialized: sh.dirs.is_initialized(),
         unlocked,
-        has_remembered,
     })
+}
+
+/// 「一键解锁」按钮的可用性（凭据库是否有未过期的记住副本）。
+///
+/// 2026-11-13 从 [`state_view`] 拆出：钥匙串读取可能触发系统授权弹窗
+/// （新构建身份首次访问条目），阻塞在弹窗上会让 `gui_state` 迟迟不
+/// 返回、前端 boot 挂起、**窗口空白**（实测）。拆为独立命令后前端先
+/// 渲染锁定页、再异步补齐此状态——弹窗叠加在已渲染的 UI 上，不再
+/// 出现空白窗口。
+///
+/// # Errors
+/// 不失败：凭据库不可用/条目缺失一律降级为 `false`。保留 `Result`
+/// 与命令层错误通道一致。
+pub fn remembered_status(sh: &Shared) -> Result<bool> {
+    Ok(keychain::get_with_expiry(&sh.dirs).ok().flatten().is_some())
+}
+
+/// 解锁页是否应显示钥匙串授权引导（D57）：仅新构建后的首次调用为
+/// true——检测内部会写回构建指纹，确认一次后不再提示。一次性事件
+/// 故独立于 [`GuiState`] 状态快照。
+pub fn keychain_hint(sh: &Shared) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    build_id::is_new_build(&sh.dirs.config_dir, &exe)
 }
 
 /// 手动输入解锁密码解锁；成功后按 TTL 记忆。
@@ -1303,7 +1329,7 @@ pub struct GhDiagView {
 /// # Errors
 /// 网络请求失败（诊断失败不等于授权失效，前端保留现状引导）。
 pub fn github_diagnose(sh: &Shared) -> Result<GhDiagView> {
-    let Some(token) = github::keychain_token()? else {
+    let Some(token) = github::keychain_token(&sh.dirs)? else {
         // 绑定失效折叠为未绑定(2026-11-10 用户拍板:用户只感知绑定与
         // 未绑定两态):凭据条目不在即 remote_bound=false,前端按未绑定
         // 渲染——不出现"绑定已失效"字样与失效引导条
@@ -1349,11 +1375,17 @@ pub fn status_view(sh: &Shared) -> Result<StatusView> {
         .session
         .as_ref()
         .map_or(0, |s| s.data.alive_records().count());
-    // 绑定失效折叠为未绑定:凭据条目不在,remote 显示 none——主界面
-    // chip 显示「单机模式」,设置页按未绑定渲染(2026-11-10 用户拍板)
-    let remote = info
-        .remote
-        .filter(|_| myapikey_core::github::keychain_token().is_ok());
+    // 绑定失效折叠为未绑定:凭据条目读不到令牌,remote 显示 none——主界面
+    // chip 显示「单机模式」,设置页按未绑定渲染(2026-11-10 用户拍板)。
+    // 判断必须与 remote_of 同语义(令牌**读得到**才算绑定):曾写成
+    // `is_ok()`(只表示后端没坏,条目不存在也 ok),导致 chip 显示已绑定
+    // 而 sync 按 standalone 拒绝——两处矛盾(2026-11-13 Windows 实测)。
+    let remote = info.remote.filter(|_| {
+        myapikey_core::github::keychain_token(&sh.dirs)
+            .ok()
+            .flatten()
+            .is_some()
+    });
     Ok(StatusView {
         remote,
         pending: info.pending,
@@ -1466,7 +1498,7 @@ pub fn init_start(
     }
     // token 已存在（例如本机装过 CLI）且**确认仍有效**（失效条目会被清除）→
     // 直接探测（无需浏览器）；GitHub 模式无令牌 → 走设备授权
-    if github_repo.is_some() && github::valid_keychain_token()?.is_some() {
+    if github_repo.is_some() && github::valid_keychain_token(&sh.dirs)?.is_some() {
         return init_probe(sh, remote, github_repo);
     }
     if let Some(_name) = github_repo {
@@ -1487,6 +1519,46 @@ pub fn init_start(
     init_probe(sh, remote, github_repo)
 }
 
+/// 绑定后的立即对账（D55）：以会话主密码跑完整 sync 状态机（拉取/
+/// 合并/推送/记账），并把合并结果重载进会话，返回同步后的活跃记录数。
+///
+/// 仅在绑定已成立后调用；对账失败不回滚绑定，错误原样上抛，由调用
+/// 方落日志、由下一次手动同步以同样语义再次暴露（如远端主密码不一致）。
+///
+/// # Errors
+/// - 无会话（锁定态）：正常入口到不了这里，防御性拒绝；
+/// - sync 状态机错误（网络 / 远端主密码不一致等）；
+/// - 同步后 vault 重读/解密失败（理论上不可能：文件由本函数刚写）。
+fn reconcile_after_bind(
+    sh: &Shared,
+    remote: &dyn myapikey_core::remote::SyncStore,
+) -> Result<usize> {
+    let passphrase = {
+        let g = enter(&sh.inner);
+        g.session
+            .as_ref()
+            .map(|s| s.passphrase.clone())
+            .ok_or_else(|| Error::Usage("vault is locked".into()))?
+    };
+    let mut cfg = sh.config();
+    let out =
+        myapikey_core::sync::sync(&sh.dirs, &passphrase, remote, cfg.tombstone_days, &mut cfg)?;
+    if let Some(pe) = out.push_error {
+        return Err(Error::Usage(pe));
+    }
+    // 与 sync_now 同法：vault 文件已是合并后的最新，重载进会话
+    let bytes = std::fs::read(&sh.dirs.vault_path)?;
+    let data = vault::decrypt(&bytes, &passphrase)?;
+    let alive = data.alive_records().count();
+    {
+        let mut g = enter(&sh.inner);
+        if let Some(s) = &mut g.session {
+            s.data = data;
+        }
+    }
+    Ok(alive)
+}
+
 /// 用户完成浏览器授权后调用：轮询 token → 建仓 → 完成初始化。
 ///
 /// # Errors
@@ -1498,9 +1570,9 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
             .clone()
             .ok_or_else(|| Error::Usage("no binding in progress".into()))?
     };
-    let tokens = github::poll_device_token(&pending.dc, &pending.client_id)?;
-    // refresh token 在 poll 内部已入 keychain（有才写）；这里只存 access
-    github::keychain_set_token(&tokens.access_token)?;
+    let tokens = github::poll_device_token(&sh.dirs, &pending.dc, &pending.client_id)?;
+    // refresh token 在 poll 内部已入存储（有才写）；这里只存 access
+    github::keychain_set_token(&sh.dirs, &tokens.access_token)?;
     {
         let mut g = enter(&sh.inner);
         g.pending_device = None;
@@ -1519,10 +1591,22 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
         let mut cfg = sh.config();
         cfg.remote_repo = Some(repo);
         cfg.save(&sh.dirs)?;
-        let records = enter(&sh.inner)
+        // 绑定即对账（D55）：接管分支不再裸绑定——历史上绑定后本地与
+        // 远端可能各自漂移，残留快照会在下次同步时以基线形态推上远端
+        // （2026-11-12 真实踩中：双端默认仓名分叉后，Mac 把 10-23 的
+        // 冒烟残留推进了新建仓库，用户误读为远端被覆盖）。无会话
+        // （锁定态，正常入口到不了设置页，防御分支）或对账失败都不
+        // 回滚绑定：前者留待解锁后同步，后者下一次同步如实暴露
+        let mut records = enter(&sh.inner)
             .session
             .as_ref()
             .map_or(0, |s| s.data.alive_records().count());
+        if let Ok(Some(remote)) = remote_of(sh) {
+            match reconcile_after_bind(sh, remote.as_ref()) {
+                Ok(alive) => records = alive,
+                Err(e) => myapikey_core::log::error("bind", &format!("post-bind sync failed: {e}")),
+            }
+        }
         return Ok(InitStage::Done {
             joined: false,
             records,
@@ -1545,7 +1629,7 @@ pub fn init_device_authorized(sh: &Shared) -> Result<InitStage> {
 /// # Errors
 /// 凭据库 / config 写盘失败。
 pub fn forget_github(sh: &Shared) -> Result<bool> {
-    let had_token = myapikey_core::github::keychain_delete_token()?;
+    let had_token = myapikey_core::github::keychain_delete_token(&sh.dirs)?;
     myapikey_core::log::info(
         "gui",
         &format!("github authorization forgotten (had token = {had_token})"),
@@ -1602,7 +1686,7 @@ fn init_probe(sh: &Shared, remote: Option<&str>, github_repo: Option<&str>) -> R
             repo: String::new(),
         });
     }
-    let token = github::keychain_token()?
+    let token = github::keychain_token(&sh.dirs)?
         .ok_or_else(|| Error::Usage("Binding is missing; redo the setup".into()))?;
     let login = github::api_login(&token)?;
 
@@ -1755,6 +1839,159 @@ mod tests {
 
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    /// 内存远端（D55 对账测试专用）：单文件 CAS 的最小 SyncStore 实现。
+    /// sha 按 push 次数确定性递增（初始 sha-1，首次推送产出 sha-2），
+    /// 断言不依赖随机值。
+    struct MemRemote {
+        head: Mutex<Option<myapikey_core::remote::RemoteHead>>,
+        pushes: Mutex<usize>,
+    }
+
+    impl MemRemote {
+        fn with_head(sha: &str, bytes: Vec<u8>) -> Self {
+            Self {
+                head: Mutex::new(Some(myapikey_core::remote::RemoteHead {
+                    sha: sha.into(),
+                    bytes,
+                })),
+                pushes: Mutex::new(1),
+            }
+        }
+    }
+
+    impl myapikey_core::remote::SyncStore for MemRemote {
+        fn fetch_head(&self) -> Result<Option<myapikey_core::remote::RemoteHead>> {
+            Ok(self
+                .head
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
+        }
+
+        fn put_blob(
+            &self,
+            _message: &str,
+            bytes: &[u8],
+            expect_sha: Option<&str>,
+        ) -> Result<String> {
+            let mut head = self
+                .head
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cas_ok = match (&*head, expect_sha) {
+                (Some(cur), Some(expect)) => cur.sha == expect,
+                (None, None) => true,
+                _ => false,
+            };
+            assert!(
+                cas_ok,
+                "CAS 前置不符: 远端 {:?} vs 期望 {expect_sha:?}",
+                head.as_ref().map(|h| &h.sha)
+            );
+            let n = {
+                let mut p = self
+                    .pushes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *p += 1;
+                *p
+            };
+            let sha = format!("sha-{n}");
+            *head = Some(myapikey_core::remote::RemoteHead {
+                sha: sha.clone(),
+                bytes: bytes.to_vec(),
+            });
+            Ok(sha)
+        }
+
+        fn download_ref(&self, ref_sha: &str) -> Result<Vec<u8>> {
+            let head = self
+                .head
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            head.as_ref()
+                .filter(|h| h.sha == ref_sha)
+                .map(|h| h.bytes.clone())
+                .ok_or_else(|| Error::Usage("ref not found".into()))
+        }
+    }
+
+    /// D55：绑定后的立即对账——拉取远端、LWW 合并、推送并把合并结果
+    /// 重载进会话（远端记录对界面立即可见），记账指向本次推送的 sha。
+    #[test]
+    fn reconcile_after_bind_pulls_merges_and_reloads_session() {
+        let sh = shared("bindrec");
+        let _guard = home_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // 单机初始化（空 vault + 会话解锁），本地放一条记录
+        init_start(&sh, None, None).expect("init 失败");
+        init_finish(&sh, PASS).expect("init_finish 失败");
+        save_record(
+            &sh,
+            RecordInput {
+                name: "Local".into(),
+                protocol: "openai".into(),
+                base_url: "https://local.example.com/v1".into(),
+                api_key: "sk-local-12345678".into(),
+                models: None,
+                notes: None,
+            },
+            None,
+        )
+        .expect("本地记录失败");
+
+        // 远端已有另一条记录（不同 id，合并应取并集）
+        let remote_rec = Record::new(
+            "Remote".into(),
+            Protocol::OpenAi,
+            "https://remote.example.com/v1".into(),
+            "sk-remote-12345678".into(),
+        );
+        let remote_bytes = vault::encrypt(
+            &VaultData {
+                records: vec![remote_rec],
+            },
+            PASS,
+        )
+        .expect("远端密文加密失败");
+        let mem = MemRemote::with_head("sha-1", remote_bytes);
+
+        let alive = reconcile_after_bind(&sh, &mem).expect("对账失败");
+        assert_eq!(alive, 2, "合并后 = 本地 1 条 + 远端 1 条");
+
+        // 会话已重载：远端记录对界面可见
+        let listed = list_view(&sh).expect("列表失败");
+        assert!(
+            listed.iter().any(|v| v.name == "Remote"),
+            "远端记录必须进入会话"
+        );
+
+        // vault 文件已重写为合并结果
+        let bytes = std::fs::read(&sh.dirs.vault_path).expect("读 vault 失败");
+        let merged = vault::decrypt(&bytes, PASS).expect("解密失败");
+        assert_eq!(
+            merged.alive_records().count(),
+            2,
+            "落盘 vault 应含合并后的两条记录"
+        );
+
+        // 记账指向本次推送产出的 sha（初始 sha-1 被消费）
+        assert_eq!(
+            sh.config().last_sync_sha.as_deref(),
+            Some("sha-2"),
+            "last_sync_sha 应指向本次推送产出的版本"
+        );
+        assert_eq!(
+            *mem.pushes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            2,
+            "对账应恰好推送一次（计数含初始 head 的 1）"
+        );
+    }
 
     /// 环境变量临界区互斥锁：`MYAPIKEY_HOME` 是进程级全局，并行测试的
     /// set/remove 会互相踩（一个测试刚 set，另一个恰好 remove，导致

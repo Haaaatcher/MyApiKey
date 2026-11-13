@@ -72,6 +72,35 @@ import   Import records from a JSON file
 
 </details>
 
+## ❓ 常见问题
+
+<details>
+<summary><b>macOS：首次打开弹出钥匙串授权？</b></summary>
+
+<br>
+
+主密码记住副本存在 macOS 钥匙串（条目名 `makara`，D57 起的正式条目——创建它的第一个应用自动获得授权）；GitHub 令牌存本地凭据文件（`github-credentials.json`，0600 权限，不弹窗）。每个新的应用二进制访问钥匙串条目都需要单独授权——应用会在解锁页提示这一点，请点「**始终允许**」（仅 1 个弹窗）。
+
+升级自旧版本（条目名 `myapikey`）：首次读取旧副本/旧令牌时自动迁入新条目，可能多弹一次授权窗，迁移完成后不再弹。未购买 Apple 开发者签名，应用更新后新版本可能需要重新授权一次，属已知限制；旧 `myapikey` 条目迁移后不再被读取，可在「钥匙串访问」中手动删除。
+
+</details>
+
+<details>
+<summary><b>换设备绑定后数据对不上 / 仓库里有旧数据？</b></summary>
+
+<br>
+
+默认仓库名历史上从 `myapikey-vault` 改为 `makara-vault`（2026-11-10，D38）：**已绑定的设备不受影响、不做迁移**，因此新老设备可能绑了不同的仓库。修正一条命令（数据按 `updated_at` 合并，不会丢）：
+
+```bash
+makara remote set <owner/正确的仓库名>
+makara sync
+```
+
+误建的多余仓库可在 GitHub 上删除。每次同步都在仓库产生提交历史，极端情况下可从历史版本找回数据。
+
+</details>
+
 ## 🏗️ 架构
 
 Rust workspace，核心逻辑与界面严格分离，CLI 与 GUI 共用同一个 core：
@@ -105,7 +134,7 @@ cargo fmt           # 格式化
 - [x] M3 打磨与发布（导入导出、自动锁、剪贴板清除、三平台 CI 产物 + Windows NSIS 安装包、Linux 无头安装 `--no-default-features`）
 - [x] 追加：体验打磨（应用内更新 D16、两端模糊搜索、CLI dialoguer 交互菜单、三批代码审查修复，2026-10-26）
 - [x] M4 零外部依赖（D25，2026-10-29）：移除系统 git，同步改 GitHub API 直连（嵌入式 git 因 gitoxide push 未实现不可行）；应用不再要求安装 git
-- [ ] M5 macOS GUI 适配（D26，2026-10-30）：窗口应用发布 macOS 版，仅支持 Apple Silicon（M 系列，aarch64）
+- [ ] M5 macOS GUI 适配（D26/D54，进行中）：窗口应用发布 macOS 版，仅支持 Apple Silicon（M 系列，aarch64）
 
 决策记录与完整设计见 [docs/design.md](docs/design.md)。
 

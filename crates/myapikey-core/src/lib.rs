@@ -26,6 +26,7 @@
 //! - `api_key` 明文只允许出现在：内存中的 [`Record`](model::Record)、解密后的 vault 数据、
 //!   剪贴板（`show --copy`）与用户双重确认的导出文件中——**任何终端输出一律掩码**。
 
+pub mod build_id;
 pub mod check_cache;
 pub mod config;
 pub mod error;

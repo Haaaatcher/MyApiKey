@@ -43,7 +43,7 @@ fn remote_of(c: &Ctx) -> Result<Option<Box<dyn myapikey_core::remote::SyncStore>
     // 绑定失效折叠为未绑定(2026-11-10 用户拍板:用户只感知绑定与未绑定
     // 两态,不感知失效):凭据条目不在即按单机处理——sync 给单机引导,
     // 写操作跳过推送(本地照常保存,重绑后 sync 一次带上去,数据无损)
-    let Some(token) = myapikey_core::github::keychain_token()? else {
+    let Some(token) = myapikey_core::github::keychain_token(&c.dirs)? else {
         return Ok(None);
     };
     Ok(Some(myapikey_core::sync::open_remote(&url, &token)?))
@@ -115,6 +115,7 @@ fn save_and_report(c: &mut Ctx, passphrase: &str, data: &VaultData) -> Result<()
     match run(c) {
         Err(e) if sync::is_auth_error(&e.to_string()) => {
             match myapikey_core::github::refresh_access_token(
+                &c.dirs,
                 &myapikey_core::github::effective_client_id()?,
             ) {
                 Ok(_) => {
@@ -210,7 +211,7 @@ pub fn init(repo: Option<&str>) -> Result<()> {
     }
 
     // ① 授权：凭据库有效令牌复用；没有/失效 → 浏览器 Device Flow
-    let token = ensure_github_token()?;
+    let token = ensure_github_token(&c.dirs)?;
 
     // ② 解析 owner/name：owner 恒等于授权账号（归属校验 fail fast——
     // 否则错配 owner 会产出"误建仓 + 绑定错位"的混乱状态）
@@ -830,7 +831,9 @@ pub fn sync() -> Result<()> {
     let mut c = ctx()?;
     require_init(&c)?;
     let _guard = lock::acquire(&c.dirs)?;
-    let (passphrase, _) = prompt::unlock(&c.dirs)?;
+    // D55：sync 用免预校验的密码解析——密码可能属于远端而非本地 vault
+    // （换绑场景），本地预校验会把正确的远端密码挡在门外
+    let (passphrase, pass_source) = prompt::passphrase_for_sync(&c.dirs)?;
 
     // 网络等待指示器（2026-10-27 用户反馈）：下载/上传可能数秒乃至更久，
     // 转轮让等待可感知。连接类失败已由请求通道自动重试（3 次退避）。
@@ -861,6 +864,7 @@ pub fn sync() -> Result<()> {
     let out = match run(&mut c) {
         Err(e) if sync::is_auth_error(&e.to_string()) => {
             match myapikey_core::github::refresh_access_token(
+                &c.dirs,
                 &myapikey_core::github::effective_client_id()?,
             ) {
                 Ok(_) => {
@@ -895,6 +899,16 @@ pub fn sync() -> Result<()> {
         (_, false, true) => prompt::ok("Pushed to remote"),
         (Some(_), false, false) => prompt::ok("Up to date"),
     }
+    // D55：密码「确实用成了」（发生拉取或推送）才滚动续期记住副本——
+    // sync 的密码可能属于远端而非本地 vault，失败时续期等于把错误
+    // 密码再留一个锁定周期
+    if (out.pulled || out.pushed) && pass_source != prompt::PassSource::Env {
+        if let Err(e) = keychain::set_ttl(&c.dirs, &passphrase, c.config.auto_lock_minutes) {
+            prompt::warn(&format!(
+                "Cannot remember the passphrase: {e}\n  It will be asked every time."
+            ));
+        }
+    }
     if let Some(err) = &out.push_error {
         prompt::warn(&format!("Push failed: {err}"));
     }
@@ -927,7 +941,7 @@ pub fn status() -> Result<()> {
     let remote_shown = info
         .remote
         .clone()
-        .filter(|_| myapikey_core::github::keychain_token().is_ok());
+        .filter(|_| myapikey_core::github::keychain_token(&c.dirs).is_ok());
     match &remote_shown {
         Some(u) => println!("Remote     : {u}"),
         None => println!("Remote     : none (standalone mode)"),
@@ -981,7 +995,7 @@ pub fn remote(action: RemoteAction) -> Result<()> {
             prompt::ok(&format!("Remote set: {repo}"));
             // 绑定后确保授权就绪（无有效令牌 → 现场走浏览器授权）：
             // 用户只感知仓库地址，令牌由 makara 自动打理——set 完 sync 必定可用
-            match ensure_github_token() {
+            match ensure_github_token(&c.dirs) {
                 Ok(_) => println!("  GitHub ready. Sync now with: makara sync"),
                 Err(e) => prompt::warn(&format!(
                     "{e}\n  Sync will fail until the binding is complete."
@@ -994,7 +1008,7 @@ pub fn remote(action: RemoteAction) -> Result<()> {
             let bound = c
                 .config
                 .remote_repo
-                .take_if(|_| myapikey_core::github::keychain_token().is_ok());
+                .take_if(|_| myapikey_core::github::keychain_token(&c.dirs).is_ok());
             match bound {
                 Some(repo) => println!("https://github.com/{repo}"),
                 None => println!("no remote bound"),
@@ -1008,7 +1022,7 @@ pub fn remote(action: RemoteAction) -> Result<()> {
             myapikey_core::log::info("cli", "remote unset (unbind + forget authorization)");
             let mut cfg = c.config.clone();
             myapikey_core::sync::unbind_remote(&c.dirs, &mut cfg);
-            let token_cleared = myapikey_core::github::keychain_delete_token()?;
+            let token_cleared = myapikey_core::github::keychain_delete_token(&c.dirs)?;
             prompt::ok("Unbound.");
             if token_cleared {
                 println!(
@@ -1084,11 +1098,11 @@ fn push_initialized(
 
 /// 确保存在可用的 GitHub 授权：凭据库里**确认仍有效**的令牌直接复用
 /// （失效条目会被顺手清除）；没有则走浏览器 Device Flow。
-fn ensure_github_token() -> Result<String> {
+fn ensure_github_token(dirs: &AppDirs) -> Result<String> {
     use myapikey_core::github;
     let client_id = github::effective_client_id()?;
 
-    if let Some(t) = github::valid_keychain_token()? {
+    if let Some(t) = github::valid_keychain_token(dirs)? {
         println!("Using the existing binding.");
         Ok(t)
     } else {
@@ -1100,7 +1114,7 @@ fn ensure_github_token() -> Result<String> {
             println!("  Could not open a browser automatically. Copy the link above.");
         }
         println!("Waiting for you to finish in the browser… this continues automatically.");
-        let t = github::poll_device_token(&dc, &client_id)?;
+        let t = github::poll_device_token(dirs, &dc, &client_id)?;
         // scope 可见化（2026-10-30 排查教训：零权限令牌是黑盒灾难）进
         // 日志而非终端——排查依据保留，用户不感知令牌细节
         myapikey_core::log::info(
@@ -1108,7 +1122,7 @@ fn ensure_github_token() -> Result<String> {
             &format!("token scopes: {}", t.scope.as_deref().unwrap_or("(none!)")),
         );
         // refresh token 在 poll 内部已入 keychain（有才写）；这里只存 access
-        github::keychain_set_token(&t.access_token)?;
+        github::keychain_set_token(dirs, &t.access_token)?;
         prompt::ok("Binding complete.\n  Unbind anytime: makara remote unset.");
         Ok(t.access_token)
     }
@@ -1288,9 +1302,10 @@ pub fn update() -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     println!("Current version: v{current}");
     // GitHub API 网络请求，给等待指示（失败不阻塞，见下）。
-    // 令牌从凭据库带上：匿名限额 60 次/小时/IP 对检查太紧，有授权升到
+    // 令牌从存储带上：匿名限额 60 次/小时/IP 对检查太紧，有授权升到
     // 5000/小时；未授权机器降级匿名调用，行为不变
-    let token = myapikey_core::github::keychain_token()?;
+    let c = ctx()?;
+    let token = myapikey_core::github::keychain_token(&c.dirs)?;
     let spin = prompt::wait_spinner("Checking for updates…");
     let release = myapikey_core::github::latest_release_tag(token.as_deref());
     drop(spin);
@@ -1304,7 +1319,7 @@ pub fn update() -> Result<()> {
                 // 降级为打印直链（安全侧）
                 println!("⚠ A newer version is available.");
                 if prompt::is_interactive() {
-                    do_upgrade(&tag)?;
+                    do_upgrade(&tag, &c.dirs)?;
                 } else {
                     let (url, _) = release_asset(&tag)?;
                     println!("  Download manually: {url}");
@@ -1355,9 +1370,9 @@ fn release_asset(tag: &str) -> Result<(String, &'static str)> {
 
 /// 下载附件，TTY 下行内百分比进度（`\r` 刷新），管道/脚本静默。
 /// 下载在 core 完成（复用其 HTTP 栈），这里只负责进度呈现。
-fn download_asset(url: &str, dest: &Path) -> Result<()> {
+fn download_asset(url: &str, dest: &Path, dirs: &AppDirs) -> Result<()> {
     use std::io::Write as _;
-    let token = myapikey_core::github::keychain_token()?;
+    let token = myapikey_core::github::keychain_token(dirs)?;
     let show = prompt::is_interactive();
     myapikey_core::github::download_asset(token.as_deref(), url, dest, &mut |done, total| {
         if show {
@@ -1375,15 +1390,20 @@ fn download_asset(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 解压更新包：Windows 与 POSIX 都用系统自带 tar（Windows 10 1803+
-/// 内置 bsdtar，支持 zip 读取）——零新依赖。
+/// 解压更新包：Windows 用 **绝对路径** 的 System32 tar（Win10 1803+
+/// 内置 bsdtar，支持 zip 读取）——PATH 里的 `tar` 可能解析到 Git Bash
+/// 的 GNU tar（不支持 zip，用户环境 PATH 顺序不可控，D52 实测）；
+/// POSIX 用系统 tar（tar.gz）。均零新依赖。
 fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
-    let mut cmd = std::process::Command::new("tar");
-    if cfg!(windows) {
-        cmd.arg("-xf");
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("C:\\Windows\\System32\\tar.exe");
+        c.arg("-xf");
+        c
     } else {
-        cmd.arg("-xzf");
-    }
+        let mut c = std::process::Command::new("tar");
+        c.arg("-xzf");
+        c
+    };
     let status = cmd
         .arg(archive)
         .arg("-C")
@@ -1426,24 +1446,24 @@ fn replace_self(new_bin: &Path) -> Result<()> {
 /// 检查通过后的升级动作：下载（行内进度 + sha256 校验）→ 解压 →
 /// 替换自身。每步一行状态；任一步失败即上抛（用户回到可手动下载的
 /// 出路）。临时目录成败都清理（④）。
-fn do_upgrade(tag: &str) -> Result<()> {
+fn do_upgrade(tag: &str, dirs: &AppDirs) -> Result<()> {
     let tmp = std::env::temp_dir().join(format!("makara-update-{tag}"));
     std::fs::create_dir_all(&tmp)
         .map_err(|e| Error::Usage(format!("cannot create a temp dir: {e}")))?;
-    let result = do_upgrade_in(tag, &tmp);
+    let result = do_upgrade_in(tag, &tmp, dirs);
     let _ = std::fs::remove_dir_all(&tmp);
     result
 }
 
-fn do_upgrade_in(tag: &str, tmp: &Path) -> Result<()> {
+fn do_upgrade_in(tag: &str, tmp: &Path, dirs: &AppDirs) -> Result<()> {
     let (url, ext) = release_asset(tag)?;
     let archive = tmp.join(format!("makara-{tag}.{ext}"));
     let hash_url = format!("{url}.sha256");
     let hash_file = tmp.join(format!("makara-{tag}.{ext}.sha256"));
-    download_asset(&url, &archive)?;
+    download_asset(&url, &archive, dirs)?;
     // 完整性校验（D40 后续加强落地）：Release 附件旁的 .sha256 与
     // 本地文件逐一比对（⑥）
-    download_asset(&hash_url, &hash_file)?;
+    download_asset(&hash_url, &hash_file, dirs)?;
     let expected = parse_sha256_file(&hash_file);
     let actual = sha256_of_file(&archive)?;
     if let Some(expected) = expected {

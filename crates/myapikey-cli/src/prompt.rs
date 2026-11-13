@@ -109,6 +109,39 @@ pub fn unlock(dirs: &myapikey_core::paths::AppDirs) -> Result<(String, PassSourc
     Err(Error::Decrypt)
 }
 
+/// sync 专用的密码解析（D55）：与 [`unlock`] 相同的三级来源（环境变量、
+/// 凭据库中未过期的记住密码、交互输入），但**全程不用本地 vault
+/// 预校验**——换绑到「主密码不同的远端」后，本地旧 vault 解不开远端
+/// 密码，预校验会把正确的远端密码挡在门外（2026-11-12 用户实测：
+/// Windows 主密码在提示循环里被本地旧 vault 判错，永远到不了远端）。
+/// 密码正确性由 `sync::sync` 状态机按分支如实报错：拉取路径报远端
+/// 不匹配，dirty 路径（合并/基线上传）报本地不匹配。
+///
+/// 记住副本与交互输入的 TTL 续期由调用方在 sync **成功后**执行——
+/// 失败时续期等于把错误密码再留一个锁定周期（旧实现在来源解析时
+/// 就续期，与「远端密码不同」场景冲突）。
+///
+/// # Errors
+/// - [`Error::NotInitialized`]：vault 文件不存在。
+pub fn passphrase_for_sync(dirs: &myapikey_core::paths::AppDirs) -> Result<(String, PassSource)> {
+    if !dirs.vault_path.is_file() {
+        return Err(Error::NotInitialized);
+    }
+    // 1) 环境变量：显式意图，原样采用（脚本/自动化场景，校验交给 sync）
+    if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
+        if !p.is_empty() {
+            return Ok((p, PassSource::Env));
+        }
+    }
+    // 2) 凭据库中未过期的记住密码（过期条目已被 get_with_expiry 顺手清理）
+    if let Ok(Some(p)) = keychain::get_with_expiry(dirs) {
+        return Ok((p, PassSource::Keychain));
+    }
+    // 3) 交互输入：单次采用，失败由 sync 的分支错误如实呈现
+    let p = prompt_hidden("Passphrase");
+    Ok((p, PassSource::Prompt))
+}
+
 /// 设置新解锁密码：隐藏输入 + 二次确认（dialoguer 内建比对重试）；
 /// 长度硬性限制（core `vault::validate_passphrase` 同规则：8–128 字符，
 /// 越界原地重问，2026-11-04 用户要求）；非 TTY 降级为两次行输入比对。

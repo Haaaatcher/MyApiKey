@@ -185,7 +185,11 @@ pub struct AuthTokens {
 ///
 /// # Errors
 /// - [`Error::Usage`]：用户拒绝授权、码过期或 GitHub 返回错误。
-pub fn poll_device_token(code: &DeviceCode, client_id: &str) -> Result<AuthTokens> {
+pub fn poll_device_token(
+    dirs: &crate::paths::AppDirs,
+    code: &DeviceCode,
+    client_id: &str,
+) -> Result<AuthTokens> {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(code.expires_in.max(60));
     let mut interval = code.interval.max(1);
@@ -217,7 +221,7 @@ pub fn poll_device_token(code: &DeviceCode, client_id: &str) -> Result<AuthToken
                 // 全靠它。写失败必须上抛——静默丢失会让续期在 8 小时后
                 // 永远报 "no refresh token stored"，用户只看得到 401
                 // （2026-11-03 修复：此前 let _ = 静默吞掉写失败）
-                keychain_set_refresh_token(rt)?;
+                keychain_set_refresh_token(dirs, rt)?;
             } else {
                 // 过期模式关闭（App 关掉 "Expire user authorization
                 // tokens"）时响应无 refresh_token——access 永久有效、刷新
@@ -225,9 +229,9 @@ pub fn poll_device_token(code: &DeviceCode, client_id: &str) -> Result<AuthToken
                 // 清掉此前授权残留的旧刷新令牌：它对当前 App 配置已无意义，
                 // 残留只会让续期在错误场景里拿一份注定失败的凭据发请求
                 // （2026-11-03 实机案例：刷新链断裂的根因即此配置变更）
-                let _ = keychain_delete_refresh_token();
+                let _ = keychain_delete_refresh_token(dirs);
             }
-            record_token_expiry(&ok)?;
+            record_token_expiry(dirs, &ok)?;
             return Ok(AuthTokens {
                 access_token: ok.access_token,
                 refresh_token: ok.refresh_token,
@@ -464,73 +468,265 @@ fn repo_readme_markdown() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 凭据库中的 GitHub token
+// GitHub token 存储（D56）：macOS 存凭据文件（0600 JSON，无钥匙串授权
+// 弹窗），其他平台存凭据库；主密码记住副本不受影响（keychain.rs）
 // ---------------------------------------------------------------------------
+
+/// GitHub 凭据文件内容（D56）：`github-credentials.json`，替代 macOS
+/// 钥匙串的三个条目（access/refresh/expires）。同步只上传 vault.mkv，
+/// 此文件永不外发。
+#[cfg(target_os = "macos")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct StoredGithubCredentials {
+    /// access token（无授权时缺失）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_token: Option<String>,
+    /// 刷新令牌（关闭过期的授权没有此字段）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    /// access 过期时刻（RFC3339；关闭过期的授权没有此字段）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn github_credentials_path(dirs: &crate::paths::AppDirs) -> std::path::PathBuf {
+    dirs.config_dir.join("github-credentials.json")
+}
+
+/// 读取凭据文件（不存在/损坏一律按空处理——字段缺失只会让对应能力
+/// 降级为未授权，由调用方的分支语义兜底）。
+#[cfg(target_os = "macos")]
+fn github_credentials_load(dirs: &crate::paths::AppDirs) -> StoredGithubCredentials {
+    std::fs::read(github_credentials_path(dirs))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// 写凭据文件：0600 + 临时文件原子替换（防撕裂；并发的刷新/授权写入
+/// 由既有 REFRESH_LOCK 与命令流程的实例锁串行化）。
+#[cfg(target_os = "macos")]
+fn github_credentials_save(
+    dirs: &crate::paths::AppDirs,
+    creds: &StoredGithubCredentials,
+) -> Result<()> {
+    use std::io::Write as _;
+    let path = github_credentials_path(dirs);
+    let body = serde_json::to_vec_pretty(creds)
+        .map_err(|e| Error::Usage(format!("failed to serialize github credentials: {e}")))?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&body)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// 清空凭据文件（macOS 的「清除令牌」：写成空结构，不留敏感残留）。
+#[cfg(target_os = "macos")]
+fn github_credentials_clear(dirs: &crate::paths::AppDirs) -> Result<()> {
+    github_credentials_save(dirs, &StoredGithubCredentials::default())
+}
+
+/// 凭据库读取 access token（**遗留条目**：旧 service 名 `myapikey` 下，
+/// D56 前的历史数据）。macOS 专属：仅作凭据文件缺失时的回退读取（见
+/// [`keychain_token`]）；非 macOS 平台的遗留语义由迁移式读取
+/// （[`keyring_token_migrated`]）承载。
+#[cfg(target_os = "macos")]
+fn keyring_legacy_token() -> Option<String> {
+    let Ok(entry) = keyring::Entry::new(crate::keychain::SERVICE_LEGACY, KEYCHAIN_ACCOUNT) else {
+        // 凭据库打不开 = 记不住,降级手动输入
+        return None;
+    };
+    // 没记住与后端异常同语义:一律 None,不因凭据库失败阻塞解锁路径
+    entry.get_password().ok()
+}
+
+/// 非 macOS 主路径的迁移式 access token 读取：新 service 名 miss → 旧名
+/// 回退 + 写回（D57 条目改名后，Windows/Linux 用户的既有令牌经此无缝
+/// 过渡；凭据库无授权弹窗，迁移零成本）。
+#[cfg(not(target_os = "macos"))]
+fn keyring_token_migrated(dirs: &crate::paths::AppDirs) -> Option<String> {
+    crate::keychain::get_with_migration(
+        crate::keychain::SERVICE,
+        Some(crate::keychain::SERVICE_LEGACY),
+        KEYCHAIN_ACCOUNT,
+        &dirs.config_dir,
+    )
+}
 
 /// 读取已存的 GitHub token（没有则 `None`）。
 ///
+/// macOS（D56）：凭据文件优先；文件缺失时回退读取**遗留凭据库条目**
+/// 并顺手写入文件完成迁移（遗留条目不删除——删除同样触发钥匙串授权
+/// 弹窗，违背 D56 治理目标，残留由用户手动清理或随 GitHub 侧过期）。
+///
 /// # Errors
-/// - [`Error::Keyring`]：凭据库本身异常（读不到条目不算异常，返回 `None`）。
-pub fn keychain_token() -> Result<Option<String>> {
-    let Ok(entry) = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_ACCOUNT) else {
-        // 凭据库打不开 = 记不住,降级手动输入
-        return Ok(None);
-    };
-    match entry.get_password() {
-        Ok(p) => Ok(Some(p)),
-        // 没记住与后端异常同语义:一律 None,不因凭据库失败阻塞解锁路径
-        Err(_) => Ok(None),
+/// - [`Error::Keyring`]：凭据库本身异常（非 macOS 路径；读不到条目不算
+///   异常，返回 `None`）。
+pub fn keychain_token(dirs: &crate::paths::AppDirs) -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let file = github_credentials_load(dirs);
+        if let Some(t) = file.access_token {
+            return Ok(Some(t));
+        }
+        // 遗留回退：旧版本把 token 存在凭据库——三件套一并迁入文件。
+        // 留痕：本次钥匙串访问（token + 迁移时读取的 refresh）可能触发授权
+        // 弹窗，且属一次性迁移事件，日志可据此核对弹窗是否与预期一致
+        if let Some(t) = keyring_legacy_token() {
+            crate::log::info(
+                "github",
+                "legacy keychain token hit (credentials file missing); migrating token trio to file",
+            );
+            let _ = github_credentials_save(
+                dirs,
+                &StoredGithubCredentials {
+                    access_token: Some(t.clone()),
+                    refresh_token: keyring_refresh_token(),
+                    expires_at: keyring_token_expires().map(|at| at.to_rfc3339()),
+                },
+            );
+            return Ok(Some(t));
+        }
+        Ok(None)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(keyring_token_migrated(dirs))
     }
 }
 
-/// 保存 GitHub token 到凭据库。
+/// 保存 GitHub token。
 ///
 /// # Errors
-/// - [`Error::Keyring`]：写入失败。
-pub fn keychain_set_token(token: &str) -> Result<()> {
-    let entry = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_ACCOUNT)
-        .map_err(|e| Error::Keyring(format!("failed to open the credential store entry: {e}")))?;
-    entry
-        .set_password(token)
-        .map_err(|e| Error::Keyring(format!("failed to write to the credential store: {e}")))
+/// - macOS：[`Error::Io`] / [`Error::Usage`]（凭据文件写入失败）；
+/// - 其他平台：[`Error::Keyring`]（凭据库写入失败）。
+pub fn keychain_set_token(dirs: &crate::paths::AppDirs, token: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut file = github_credentials_load(dirs);
+        file.access_token = Some(token.to_string());
+        github_credentials_save(dirs, &file)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dirs;
+        let entry =
+            keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| {
+                Error::Keyring(format!("failed to open the credential store entry: {e}"))
+            })?;
+        entry
+            .set_password(token)
+            .map_err(|e| Error::Keyring(format!("failed to write to the credential store: {e}")))
+    }
+}
+
+/// 凭据库读取 access 过期时刻（**遗留条目**：旧 service 名下，macOS
+/// 文件缺失时的回退读取）。macOS 专属（同 [`keyring_legacy_token`]）。
+#[cfg(target_os = "macos")]
+fn keyring_token_expires() -> Option<chrono::DateTime<chrono::Utc>> {
+    keychain_aux_get_legacy(KEYCHAIN_EXPIRES_ACCOUNT)
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(&raw).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// 非 macOS 主路径的迁移式过期时刻读取（同 [`keyring_token_migrated`]
+/// 的 D57 语义：新名 miss → 旧名回退 + 写回）。
+#[cfg(not(target_os = "macos"))]
+fn keychain_aux_get_migrated(dirs: &crate::paths::AppDirs, account: &str) -> Option<String> {
+    crate::keychain::get_with_migration(
+        crate::keychain::SERVICE,
+        Some(crate::keychain::SERVICE_LEGACY),
+        account,
+        &dirs.config_dir,
+    )
 }
 
 /// 读取记录的 access 过期时刻（RFC3339）：开启过期模式的授权/续期成功
 /// 时写入；关闭过期的授权没有该记录（`None` = 无从判断，交给同步路径
 /// 的 401 被动续期兜底）。
 ///
+/// macOS（D56）：凭据文件优先；文件缺失该字段时**才**回退遗留凭据库条目
+/// （只读，惰性求值——文件已有值时不触碰钥匙串，见实现内注释）。
+///
 /// # Errors
-/// - [`Error::Keyring`]：凭据库本身异常（读不到条目不算异常，返回 `None`）。
-pub fn keychain_token_expires() -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-    let Some(raw) = keychain_aux_get(KEYCHAIN_EXPIRES_ACCOUNT) else {
-        return Ok(None);
-    };
-    Ok(chrono::DateTime::parse_from_rfc3339(&raw)
-        .ok()
-        .map(|t| t.with_timezone(&chrono::Utc)))
+/// - [`Error::Keyring`]：凭据库本身异常（非 macOS 路径；读不到条目不算
+///   异常，返回 `None`）。
+pub fn keychain_token_expires(
+    dirs: &crate::paths::AppDirs,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    #[cfg(target_os = "macos")]
+    {
+        let file = github_credentials_load(dirs);
+        let file_expires = file
+            .expires_at
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(&raw).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
+        // 文件没有该字段才回退遗留条目（惰性求值：迁移完成后不再触碰钥匙串
+        // ——遗留条目的每次访问都可能触发授权弹窗，违背 D56 治理目标；
+        // 顺带留痕，弹窗异常时可据此定位到具体条目）
+        if file_expires.is_none() {
+            let legacy = keyring_token_expires();
+            if legacy.is_some() {
+                crate::log::info(
+                    "github",
+                    "expires read from legacy keychain entry (missing in credentials file)",
+                );
+            }
+            return Ok(legacy);
+        }
+        Ok(file_expires)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(keychain_aux_get_migrated(dirs, KEYCHAIN_EXPIRES_ACCOUNT)
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(&raw).ok())
+            .map(|t| t.with_timezone(&chrono::Utc)))
+    }
 }
 
 /// 记录 access 过期时刻。
 ///
 /// # Errors
-/// - [`Error::Keyring`]：写入失败。
-pub fn keychain_set_token_expires(at: chrono::DateTime<chrono::Utc>) -> Result<()> {
-    keychain_aux_set(KEYCHAIN_EXPIRES_ACCOUNT, &at.to_rfc3339())
+/// - macOS：[`Error::Io`] / [`Error::Usage`]（凭据文件写入失败）；
+/// - 其他平台：[`Error::Keyring`]（凭据库写入失败）。
+pub fn keychain_set_token_expires(
+    dirs: &crate::paths::AppDirs,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut file = github_credentials_load(dirs);
+        file.expires_at = Some(at.to_rfc3339());
+        github_credentials_save(dirs, &file)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dirs;
+        keychain_aux_set(KEYCHAIN_EXPIRES_ACCOUNT, &at.to_rfc3339())
+    }
 }
 
-/// 清除 access 过期时刻记录（宽松：失败静默——残留条目只会让启动续期
-/// 多尝试一次注定失败的刷新，无害）。
-fn keychain_delete_token_expires() {
-    let _ = keychain_aux_delete(KEYCHAIN_EXPIRES_ACCOUNT);
-}
-
-/// 凭据库辅助条目（token 主条目之外的少量元数据）的统一读取。
+/// 凭据库读取**遗留**辅助条目（旧 service 名下；macOS 文件回退专用）。
 /// 打不开 / 读不到 / 后端异常一律 `None`（元数据缺失只降级，不失败）。
-fn keychain_aux_get(account: &str) -> Option<String> {
-    let entry = keyring::Entry::new(crate::keychain::SERVICE, account).ok()?;
+#[cfg(target_os = "macos")]
+fn keychain_aux_get_legacy(account: &str) -> Option<String> {
+    let entry = keyring::Entry::new(crate::keychain::SERVICE_LEGACY, account).ok()?;
     entry.get_password().ok()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn keychain_aux_set(account: &str, value: &str) -> Result<()> {
     let entry = keyring::Entry::new(crate::keychain::SERVICE, account)
         .map_err(|e| Error::Keyring(format!("failed to open the credential store entry: {e}")))?;
@@ -539,29 +735,48 @@ fn keychain_aux_set(account: &str, value: &str) -> Result<()> {
         .map_err(|e| Error::Keyring(format!("failed to write to the credential store: {e}")))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn keychain_aux_delete(account: &str) -> Result<bool> {
     let entry = keyring::Entry::new(crate::keychain::SERVICE, account)
         .map_err(|e| Error::Keyring(format!("failed to open the credential store entry: {e}")))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(e) => Err(Error::Keyring(format!(
-            "failed to delete the credential store entry: {e}"
-        ))),
+    let removed = match entry.delete_credential() {
+        Ok(()) => true,
+        Err(keyring::Error::NoEntry) => false,
+        Err(e) => {
+            return Err(Error::Keyring(format!(
+                "failed to delete the credential store entry: {e}"
+            )))
+        }
+    };
+    // D57：旧 service 名下的同 account 条目尽力清理（非 macOS 凭据库
+    // 无授权弹窗，清理零成本，避免元数据残留）
+    if let Ok(legacy) = keyring::Entry::new(crate::keychain::SERVICE_LEGACY, account) {
+        let _ = legacy.delete_credential();
     }
+    Ok(removed)
 }
 
 /// 授权/续期成功后记录 access 过期时刻：开启过期模式（`expires_in`
-/// 存在）→ `now + expires_in`；关闭过期 → 清条目（配合 2026-11-03 的
+/// 存在）→ `now + expires_in`；关闭过期 → 清记录（配合 2026-11-03 的
 /// 重新授权残留清理）。
-fn record_token_expiry(ok: &TokenOk) -> Result<()> {
+fn record_token_expiry(dirs: &crate::paths::AppDirs, ok: &TokenOk) -> Result<()> {
     let Some(secs) = ok.expires_in else {
-        keychain_delete_token_expires();
+        // 关闭过期：清过期记录（macOS 写 None 入文件；其他平台删条目）
+        #[cfg(target_os = "macos")]
+        {
+            let mut file = github_credentials_load(dirs);
+            file.expires_at = None;
+            github_credentials_save(dirs, &file)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = keychain_aux_delete(KEYCHAIN_EXPIRES_ACCOUNT);
+        }
         return Ok(());
     };
     // u64→i64 防回绕:GitHub 实际回 28800(8h),异常巨值按"永不过期"处理
     let secs = i64::try_from(secs).unwrap_or(i64::MAX);
-    keychain_set_token_expires(chrono::Utc::now() + chrono::Duration::seconds(secs))
+    keychain_set_token_expires(dirs, chrono::Utc::now() + chrono::Duration::seconds(secs))
 }
 
 /// 判断 access 是否临近/已过期（10 分钟提前量：启动时刻恰在过期边缘
@@ -573,38 +788,76 @@ fn token_needs_refresh(
     now >= expires_at - chrono::Duration::seconds(600)
 }
 
-/// 清除 GitHub token（access 与 refresh 两个条目一并删除）。
+/// 清除 GitHub token（access 与 refresh 一并清除）。
 ///
 /// 只删 access 会留下 refresh 残留——自动续期（`refresh_access_token`）
 /// 可拿它换回有效令牌，"清除授权/解绑"对用户承诺的干净状态就被悄悄
 /// 破坏（2026-10-31 修复）。
 ///
-/// 返回是否清到了任一条目。
+/// macOS（D56）：清空凭据文件即可；**遗留凭据库条目不主动删除**——
+/// 删除同样触发钥匙串授权弹窗（违背 D56 治理目标），残留由用户手动
+/// 清理。仅 client_secret 调试条目照旧尝试删除（多数机器不存在，
+/// NoEntry 不弹窗；存在则属调试残留，清理合理）。
+///
+/// 返回是否清到了任一存储。
 ///
 /// # Errors
-/// - [`Error::Keyring`]：条目存在但删除失败。
-pub fn keychain_delete_token() -> Result<bool> {
-    let mut deleted = false;
-    for account in [
-        KEYCHAIN_ACCOUNT,
-        KEYCHAIN_REFRESH_ACCOUNT,
-        KEYCHAIN_EXPIRES_ACCOUNT,
-        KEYCHAIN_SECRET_ACCOUNT,
-    ] {
-        let entry = keyring::Entry::new(crate::keychain::SERVICE, account).map_err(|e| {
-            Error::Keyring(format!("failed to open the credential store entry: {e}"))
-        })?;
-        match entry.delete_credential() {
-            Ok(()) => deleted = true,
-            Err(keyring::Error::NoEntry) => {}
-            Err(e) => {
-                return Err(Error::Keyring(format!(
-                    "failed to delete the credential store entry: {e}"
-                )))
+/// - macOS：[`Error::Io`] / [`Error::Usage`]（凭据文件写入失败）/
+///   [`Error::Keyring`]（调试条目存在但删除失败）；
+/// - 其他平台：[`Error::Keyring`]：条目存在但删除失败。
+pub fn keychain_delete_token(dirs: &crate::paths::AppDirs) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        github_credentials_clear(dirs)?;
+        // 调试条目在旧 service 名下（历史遗留，D57 前 client_secret 曾存
+        // 凭据库）——多数机器不存在，NoEntry 不弹窗；存在则属调试残留
+        if let Ok(entry) =
+            keyring::Entry::new(crate::keychain::SERVICE_LEGACY, KEYCHAIN_SECRET_ACCOUNT)
+        {
+            match entry.delete_credential() {
+                Ok(()) => return Ok(true),
+                Err(keyring::Error::NoEntry) => {}
+                Err(e) => {
+                    return Err(Error::Keyring(format!(
+                        "failed to delete the credential store entry: {e}"
+                    )))
+                }
             }
         }
+        Ok(true)
     }
-    Ok(deleted)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dirs;
+        let mut deleted = false;
+        for account in [
+            KEYCHAIN_ACCOUNT,
+            KEYCHAIN_REFRESH_ACCOUNT,
+            KEYCHAIN_EXPIRES_ACCOUNT,
+            KEYCHAIN_SECRET_ACCOUNT,
+        ] {
+            let entry = keyring::Entry::new(crate::keychain::SERVICE, account).map_err(|e| {
+                Error::Keyring(format!("failed to open the credential store entry: {e}"))
+            })?;
+            match entry.delete_credential() {
+                Ok(()) => deleted = true,
+                Err(keyring::Error::NoEntry) => {}
+                Err(e) => {
+                    return Err(Error::Keyring(format!(
+                        "failed to delete the credential store entry: {e}"
+                    )))
+                }
+            }
+            // D57：旧 service 名下的同 account 条目尽力清理（凭据库删除
+            // 无弹窗成本，解绑承诺的「干净状态」应覆盖历史条目）
+            if let Ok(legacy) = keyring::Entry::new(crate::keychain::SERVICE_LEGACY, account) {
+                if legacy.delete_credential().is_ok() {
+                    deleted = true;
+                }
+            }
+        }
+        Ok(deleted)
+    }
 }
 
 /// 读取 GitHub App client secret：环境变量 [`CLIENT_SECRET_ENV`] 优先，
@@ -624,7 +877,8 @@ pub fn client_secret() -> Result<Option<String>> {
             return Ok(Some(s.trim().to_string()));
         }
     }
-    let Ok(entry) = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_SECRET_ACCOUNT) else {
+    let Ok(entry) = keyring::Entry::new(crate::keychain::SERVICE_LEGACY, KEYCHAIN_SECRET_ACCOUNT)
+    else {
         return Ok(embedded_client_secret());
     };
     Ok(entry
@@ -634,7 +888,8 @@ pub fn client_secret() -> Result<Option<String>> {
         .or_else(embedded_client_secret))
 }
 
-/// 清除已存的 client secret。
+/// 清除已存的 client secret。D57：历史条目在旧 service 名下（读取与
+/// 清理的主目标），新名条目（如有）一并尽力清理。
 ///
 /// # Returns
 /// - `Ok(true)`：清掉了条目；`Ok(false)`：本来就没有。
@@ -642,61 +897,119 @@ pub fn client_secret() -> Result<Option<String>> {
 /// # Errors
 /// - [`Error::Keyring`]：条目存在但删除失败。
 pub fn keychain_delete_client_secret() -> Result<bool> {
-    let entry = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_SECRET_ACCOUNT)
+    let entry = keyring::Entry::new(crate::keychain::SERVICE_LEGACY, KEYCHAIN_SECRET_ACCOUNT)
         .map_err(|e| Error::Keyring(format!("failed to open the credential store entry: {e}")))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(e) => Err(Error::Keyring(format!(
-            "failed to delete the credential store entry: {e}"
-        ))),
+    let removed = match entry.delete_credential() {
+        Ok(()) => true,
+        Err(keyring::Error::NoEntry) => false,
+        Err(e) => {
+            return Err(Error::Keyring(format!(
+                "failed to delete the credential store entry: {e}"
+            )))
+        }
+    };
+    if let Ok(current) = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_SECRET_ACCOUNT) {
+        let _ = current.delete_credential();
     }
+    Ok(removed)
+}
+
+/// 凭据库读取刷新令牌（**遗留条目**：旧 service 名下，macOS 文件缺失
+/// 时的回退读取 / 迁移时的取值来源）。macOS 专属（同
+/// [`keyring_legacy_token`]）。
+#[cfg(target_os = "macos")]
+fn keyring_refresh_token() -> Option<String> {
+    let entry =
+        keyring::Entry::new(crate::keychain::SERVICE_LEGACY, KEYCHAIN_REFRESH_ACCOUNT).ok()?;
+    entry.get_password().ok()
+}
+
+/// 非 macOS 主路径的迁移式刷新令牌读取（D57 语义同 access token）。
+#[cfg(not(target_os = "macos"))]
+fn keyring_refresh_token_migrated(dirs: &crate::paths::AppDirs) -> Option<String> {
+    crate::keychain::get_with_migration(
+        crate::keychain::SERVICE,
+        Some(crate::keychain::SERVICE_LEGACY),
+        KEYCHAIN_REFRESH_ACCOUNT,
+        &dirs.config_dir,
+    )
 }
 
 /// 读取已存的刷新令牌（没有则 `None`）。
 ///
-/// # Returns
-/// - `Ok(Some(token))`：有刷新令牌；
-/// - `Ok(None)`：没记住 / 凭据库打不开或读取异常。
-///
-/// # Errors
-/// 不失败：三种缺失/异常情形统一降级为 `Ok(None)`，调用方以
-/// "no refresh token stored" 指引重新授权。保留 `Result` 与同族函数签名一致。
-pub fn keychain_refresh_token() -> Result<Option<String>> {
-    let Ok(entry) = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_REFRESH_ACCOUNT) else {
-        return Ok(None);
-    };
-    match entry.get_password() {
-        Ok(p) => Ok(Some(p)),
-        Err(_) => Ok(None),
+/// macOS（D56）：凭据文件优先，缺失时回退遗留凭据库条目（只读——
+/// 后续的刷新写入会自然把完整凭据迁入文件）。其他平台读凭据库。
+pub fn keychain_refresh_token(dirs: &crate::paths::AppDirs) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let file = github_credentials_load(dirs);
+        file.refresh_token.or_else(keyring_refresh_token)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        keyring_refresh_token_migrated(dirs)
     }
 }
 
 /// 保存刷新令牌。
 ///
 /// # Errors
-/// - [`Error::Keyring`]：写入失败。
-pub fn keychain_set_refresh_token(token: &str) -> Result<()> {
-    let entry = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_REFRESH_ACCOUNT)
-        .map_err(|e| Error::Keyring(format!("failed to open the credential store entry: {e}")))?;
-    entry
-        .set_password(token)
-        .map_err(|e| Error::Keyring(format!("failed to write to the credential store: {e}")))
+/// - macOS：[`Error::Io`] / [`Error::Usage`]（凭据文件写入失败）；
+/// - 其他平台：[`Error::Keyring`]（凭据库写入失败）。
+pub fn keychain_set_refresh_token(dirs: &crate::paths::AppDirs, token: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut file = github_credentials_load(dirs);
+        file.refresh_token = Some(token.to_string());
+        github_credentials_save(dirs, &file)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dirs;
+        let entry = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_REFRESH_ACCOUNT)
+            .map_err(|e| {
+                Error::Keyring(format!("failed to open the credential store entry: {e}"))
+            })?;
+        entry
+            .set_password(token)
+            .map_err(|e| Error::Keyring(format!("failed to write to the credential store: {e}")))
+    }
 }
 
 /// 清除刷新令牌（forget 时与 access token 一起清）。
 ///
 /// # Errors
-/// - [`Error::Keyring`]：条目存在但删除失败。
-pub fn keychain_delete_refresh_token() -> Result<bool> {
-    let entry = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_REFRESH_ACCOUNT)
-        .map_err(|e| Error::Keyring(format!("failed to open the credential store entry: {e}")))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(e) => Err(Error::Keyring(format!(
-            "failed to delete the credential store entry: {e}"
-        ))),
+/// - macOS：[`Error::Io`] / [`Error::Usage`]（凭据文件写入失败）；
+/// - 其他平台：[`Error::Keyring`]：条目存在但删除失败。
+pub fn keychain_delete_refresh_token(dirs: &crate::paths::AppDirs) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        // 遗留条目不删（同 D56 治理：删除会弹窗），只清凭据文件
+        let mut file = github_credentials_load(dirs);
+        file.refresh_token = None;
+        github_credentials_save(dirs, &file).map(|()| true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dirs;
+        let entry = keyring::Entry::new(crate::keychain::SERVICE, KEYCHAIN_REFRESH_ACCOUNT)
+            .map_err(|e| {
+                Error::Keyring(format!("failed to open the credential store entry: {e}"))
+            })?;
+        let removed = match entry.delete_credential() {
+            Ok(()) => true,
+            Err(keyring::Error::NoEntry) => false,
+            Err(e) => Err(Error::Keyring(format!(
+                "failed to delete the credential store entry: {e}"
+            )))?,
+        };
+        // D57：旧 service 名下的同 account 条目尽力清理
+        if let Ok(legacy) =
+            keyring::Entry::new(crate::keychain::SERVICE_LEGACY, KEYCHAIN_REFRESH_ACCOUNT)
+        {
+            let _ = legacy.delete_credential();
+        }
+        Ok(removed)
     }
 }
 
@@ -706,7 +1019,7 @@ pub fn keychain_delete_refresh_token() -> Result<bool> {
 /// # Errors
 /// - 无刷新令牌 / 刷新失败（`invalid_grant` 等，通常意味着必须重走
 ///   设备授权流）。
-pub fn refresh_access_token(client_id: &str) -> Result<AuthTokens> {
+pub fn refresh_access_token(dirs: &crate::paths::AppDirs, client_id: &str) -> Result<AuthTokens> {
     // 刷新串行锁：启动主动续期与 401 被动续期并发时，同一 refresh
     // token 被双双提交，后到者必因轮换被拒（2026-11-03 加固）。锁内
     // 每次重新读 keychain——前一个续期写回的新令牌能被后一个直接使用
@@ -714,7 +1027,7 @@ pub fn refresh_access_token(client_id: &str) -> Result<AuthTokens> {
     let _guard = REFRESH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(rt) = keychain_refresh_token()? else {
+    let Some(rt) = keychain_refresh_token(dirs) else {
         let msg = "no refresh token stored; run `makara init --github` to authorize";
         crate::log::error("github", msg);
         return Err(Error::Usage(msg.into()));
@@ -772,14 +1085,14 @@ pub fn refresh_access_token(client_id: &str) -> Result<AuthTokens> {
             ok.expires_in.unwrap_or(0)
         ),
     );
-    record_token_expiry(&ok)?;
+    record_token_expiry(dirs, &ok)?;
     // 新 access token 必须落库:GitHub 每次刷新都轮换 access token——
-    // 响应里的新令牌若不入 keychain,重试时构造的 GitHubStore 仍带旧
+    // 响应里的新令牌若不入存储,重试时构造的 GitHubStore 仍带旧
     // (已过期)令牌,表现为"刷新成功但紧接着的请求依旧 401"
     // (2026-11-08 日志实测:refreshed 后紧跟 GET 401)
-    keychain_set_token(&ok.access_token)?;
+    keychain_set_token(dirs, &ok.access_token)?;
     if let Some(new_rt) = &ok.refresh_token {
-        keychain_set_refresh_token(new_rt)?;
+        keychain_set_refresh_token(dirs, new_rt)?;
     }
     Ok(AuthTokens {
         access_token: ok.access_token,
@@ -803,17 +1116,17 @@ pub fn refresh_access_token(client_id: &str) -> Result<AuthTokens> {
 ///
 /// # Errors
 /// - 凭据库读写失败 / GitHub 拒绝刷新（原因透出）。
-pub fn try_refresh_if_expired(client_id: &str) -> Result<bool> {
-    let Some(expires_at) = keychain_token_expires()? else {
+pub fn try_refresh_if_expired(dirs: &crate::paths::AppDirs, client_id: &str) -> Result<bool> {
+    let Some(expires_at) = keychain_token_expires(dirs)? else {
         return Ok(false);
     };
-    if keychain_token()?.is_none() {
+    if keychain_token(dirs)?.is_none() {
         return Ok(false);
     }
     if !token_needs_refresh(chrono::Utc::now(), expires_at) {
         return Ok(false);
     }
-    refresh_access_token(client_id)?;
+    refresh_access_token(dirs, client_id)?;
     Ok(true)
 }
 
@@ -954,19 +1267,19 @@ fn token_is_valid(token: &str) -> Option<bool> {
 /// 取"确认仍有效"的 GitHub token。
 ///
 /// 与 [`keychain_token`] 的差别：读出后先验证。已存的 token 失效（401）时
-/// **顺手清除条目**并返回 `None`，让调用方回落到重新设备授权——否则每次
+/// **顺手清除存储**并返回 `None`，让调用方回落到重新设备授权——否则每次
 /// 都带着坏 token 撞 401，且 git 对私有仓库只报语焉不详的
 /// "Repository not found"。网络异常等无法判定的情况按"有效"处理，不误删。
 ///
 /// # Errors
 /// - [`Error::Keyring`]：凭据库本身异常。
-pub fn valid_keychain_token() -> Result<Option<String>> {
-    let Some(token) = keychain_token()? else {
+pub fn valid_keychain_token(dirs: &crate::paths::AppDirs) -> Result<Option<String>> {
+    let Some(token) = keychain_token(dirs)? else {
         return Ok(None);
     };
     match token_is_valid(&token) {
         Some(false) => {
-            let _ = keychain_delete_token();
+            let _ = keychain_delete_token(dirs);
             Ok(None)
         }
         // 有效，或网络原因无法判定：交给调用方使用
@@ -1370,5 +1683,63 @@ mod tests {
         let ok: TokenOk = serde_json::from_str(raw).expect("解析失败");
         assert_eq!(ok.expires_in, Some(28800));
         assert_eq!(ok.refresh_token.as_deref(), Some("ghr_new"));
+    }
+
+    /// D56：GitHub 凭据文件 roundtrip——三件套写入/读回一致，清除后
+    /// 全空；文件权限 0600（仅 macOS 文件路径，不触碰系统凭据库）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn github_credentials_file_roundtrip() {
+        use crate::paths::AppDirs;
+        let root = std::env::temp_dir().join(format!("mak-github-cred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dirs = AppDirs {
+            config_dir: root.clone(),
+            repo_dir: root.join("repo"),
+            vault_path: root.join("repo/vault.mkv"),
+            config_path: root.join("config.toml"),
+            check_cache_path: root.join("check_cache.json"),
+            lock_path: root.join("vault.lock"),
+            from_env: true,
+        };
+
+        // 只打文件层：pub 的 keychain_* 读路径带钥匙串遗留回退，会读
+        // 本机真实凭据库，无法在测试里构造干净环境（D56）
+
+        // 空起点：读不到任何凭据
+        assert!(github_credentials_load(&dirs).access_token.is_none());
+
+        // 三件套写入 → 读回一致
+        let creds = StoredGithubCredentials {
+            access_token: Some("ghp_test".into()),
+            refresh_token: Some("ghr_test".into()),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(8)).to_rfc3339()),
+        };
+        github_credentials_save(&dirs, &creds).unwrap();
+        let read = github_credentials_load(&dirs);
+        assert_eq!(read.access_token.as_deref(), Some("ghp_test"));
+        assert_eq!(read.refresh_token.as_deref(), Some("ghr_test"));
+        let read_back = read
+            .expires_at
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(&raw).ok())
+            .expect("过期时刻");
+        assert!(read_back > chrono::Utc::now());
+
+        // 文件权限 0600
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(github_credentials_path(&dirs))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "凭据文件必须是 0600");
+
+        // 清除后全空
+        github_credentials_clear(&dirs).unwrap();
+        assert!(github_credentials_load(&dirs).access_token.is_none());
+        assert!(github_credentials_load(&dirs).refresh_token.is_none());
+        assert!(github_credentials_load(&dirs).expires_at.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

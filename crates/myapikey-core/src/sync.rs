@@ -302,10 +302,21 @@ pub fn sync(
         return Err(Error::NotInitialized);
     }
     let local_bytes = std::fs::read(&dirs.vault_path)?;
-    let mut local_data = vault::decrypt(&local_bytes, passphrase)?;
+    // 本地解密延迟到真正需要本地明文的分支（D55）：干净本地（上次对账
+    // 后无改动）走「下载替换 / 幂等对账」时根本不用本地明文——若强求
+    // 先解本地，换绑到「主密码不同的远端」会被本地旧密码堵死拉取路径
+    // （2026-11-12 用户真实踩中：输入远端主密码，本地旧 vault 解不开，
+    // sync 整体失败）。dirty 分支（基线上传 / LWW 合并）必然要本地
+    // 明文，在此统一解密
+    let local_dirty = cfg.push_pending || cfg.last_sync_sha.is_none();
+    let mut local_data = if local_dirty {
+        Some(vault::decrypt(&local_bytes, passphrase)?)
+    } else {
+        None
+    };
 
     let mut out = SyncOutcome {
-        alive_records: count_alive(&local_data),
+        alive_records: local_data.as_ref().map_or(0, count_alive),
         remote: Some(cfg_remote_label(cfg)),
         ..Default::default()
     };
@@ -316,6 +327,8 @@ pub fn sync(
 
     loop {
         let local_dirty = cfg.push_pending || cfg.last_sync_sha.is_none();
+        // dirty 分支的 local_data 必为 Some（入口统一解密）；各 dirty 分支
+        // 的 ok_or_else 兜底是不可达防御——触发即程序 bug，报 internal error
         match (local_dirty, &head) {
             // 本地干净 + 远端未变：无事（幂等——上次 PUT 成功但记账未及
             // 写盘时，远端内容 == 本地内容，下次按 behind 重下也无害）。
@@ -335,43 +348,52 @@ pub fn sync(
             }
             // 本地干净 + 远端无文件（仓库被删重建）：以本地为准创建
             (false, None) => {
+                // 本地是唯一事实源：解密取真实活跃数（干净路径到此尚未
+                // 解过本地——密码在此处校验失败 = 用户输错，如实上抛）
+                let data = vault::decrypt(&local_bytes, passphrase)?;
+                let alive = count_alive(&data);
                 let bytes = std::fs::read(&dirs.vault_path)?;
-                push_one(remote, dirs, cfg, &bytes, None, out.alive_records)?;
+                push_one(remote, dirs, cfg, &bytes, None, alive)?;
                 out.pushed = true;
+                out.alive_records = alive;
             }
             // 本地 dirty + 远端无文件：直接创建
             (true, None) => {
-                let bytes = vault::encrypt(&local_data, passphrase)?;
-                push_one(remote, dirs, cfg, &bytes, None, count_alive(&local_data))?;
+                let local = local_data.as_ref().ok_or_else(|| {
+                    Error::Usage("internal error: dirty local vault was not decrypted".into())
+                })?;
+                let bytes = vault::encrypt(local, passphrase)?;
+                push_one(remote, dirs, cfg, &bytes, None, count_alive(local))?;
                 out.pushed = true;
             }
             // 本地 dirty + 远端未变：直接上传
             (true, Some(h)) if Some(h.sha.as_str()) == cfg.last_sync_sha.as_deref() => {
-                let bytes = vault::encrypt(&local_data, passphrase)?;
+                let local = local_data.as_ref().ok_or_else(|| {
+                    Error::Usage("internal error: dirty local vault was not decrypted".into())
+                })?;
+                let bytes = vault::encrypt(local, passphrase)?;
                 push_one(
                     remote,
                     dirs,
                     cfg,
                     &bytes,
                     Some(h.sha.as_str()),
-                    count_alive(&local_data),
+                    count_alive(local),
                 )?;
                 out.pushed = true;
             }
             // 双方都有新数据（或首次迁移建基线）：数据层 LWW 合并
             (true, Some(h)) => {
+                let local = local_data.as_ref().ok_or_else(|| {
+                    Error::Usage("internal error: dirty local vault was not decrypted".into())
+                })?;
                 let remote_data =
                     vault::decrypt(&h.bytes, passphrase).map_err(remote_password_error)?;
-                let merged = merge_vaults(
-                    &local_data,
-                    &remote_data,
-                    chrono::Utc::now(),
-                    tombstone_days,
-                );
+                let merged = merge_vaults(local, &remote_data, chrono::Utc::now(), tombstone_days);
+                let merged_alive = count_alive(&merged);
                 let bytes = vault::encrypt(&merged, passphrase)?;
                 atomic_write_vault(dirs, &bytes)?;
-                local_data = merged;
-                let merged_alive = count_alive(&local_data);
+                local_data = Some(merged);
                 match push_one(
                     remote,
                     dirs,
@@ -582,6 +604,31 @@ mod tests {
         assert!(out.pulled && !out.merged && !out.pushed);
         assert_eq!(digest(&load(&dirs, "pw")), "from-remote");
         assert_eq!(cfg.last_sync_sha.as_deref(), Some("sha-r1"));
+        assert!(!cfg.push_pending);
+    }
+
+    /// 场景 1b（D55 真实事件）：换绑到「主密码不同的远端」——本地干净
+    /// 时下载替换不应要求本地旧密码可解。旧实现在入口先解本地，用户
+    /// 输入远端主密码反而被本地旧 vault 堵死（2026-11-12 Mac 换绑实测）。
+    #[test]
+    fn adopt_remote_with_different_passphrase_on_clean_local() {
+        let (dirs, mut cfg) = dirs_at("adopt");
+        let mem = Rc::new(MemStore::default());
+        let remote_vault = vault_with("real", 10);
+        let bytes = vault::encrypt(&remote_vault, "real-pw").unwrap();
+        mem.0.borrow_mut().sha = "sha-real".into();
+        mem.0.borrow_mut().bytes = bytes;
+
+        // 本地旧 vault 用另一把密码加密；本地干净（无 pending，有旧 sha）
+        let stale = vault_with("stale", 30);
+        let lb = vault::encrypt(&stale, "old-pw").unwrap();
+        std::fs::write(&dirs.vault_path, &lb).unwrap();
+        cfg.last_sync_sha = Some("sha-old".into());
+
+        let out = sync(&dirs, "real-pw", mem.as_ref(), 30, &mut cfg).unwrap();
+        assert!(out.pulled && !out.merged && !out.pushed);
+        assert_eq!(digest(&load(&dirs, "real-pw")), "real");
+        assert_eq!(cfg.last_sync_sha.as_deref(), Some("sha-real"));
         assert!(!cfg.push_pending);
     }
 

@@ -5,8 +5,11 @@
 //! - macOS：Keychain
 //! - Linux：Secret Service（GNOME Keyring / KWallet）
 //!
-//! 条目约定：service = `myapikey`，account = `default`
+//! 条目约定（D57 起）：service = `makara`，account = `default`
 //! （account 预留命名空间，未来多 vault 时每个 vault 一个 account）。
+//! D57 前的条目在旧 service 名 `myapikey` 下——读路径「新名 miss →
+//! 旧名回退 + 迁移写回」兼容既有用户；旧条目不主动删除（macOS 上
+//! 删除同样触发授权弹窗，见 [`SERVICE_LEGACY`]）。
 //! 存储内容是**解锁密码本身**而非派生密钥——这样 KDF 参数可随 vault
 //! 版本演进，改参数不需要动凭据库。
 //!
@@ -28,12 +31,21 @@ use crate::paths::AppDirs;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// 凭据库 service 名（github.rs 的 token 条目共用同一 service）。
-pub(crate) const SERVICE: &str = "myapikey";
+/// 凭据库 service 名（D57 起为 `makara`，产品统一命名；非 macOS 平台的
+/// github.rs 令牌条目共用同一 service。授权弹窗里向用户展示的就是它——
+/// 旧名 `myapikey` 与产品名割裂，见 [`SERVICE_LEGACY`]）。
+pub(crate) const SERVICE: &str = "makara";
+/// D57 前的旧 service 名：主密码副本与（D56 前各平台的）GitHub 令牌的
+/// 历史条目都在其下。读路径回退到这里并迁移写回新名；**旧条目一律不
+/// 主动删除**——macOS 上删除同样触发授权弹窗，违背 D56 治理目标
+/// （`forget`/`remote unset` 的清理路径除外：读路径授权过则删除自然
+/// 免弹，对旧条目尽力删除、失败静默）。
+pub(crate) const SERVICE_LEGACY: &str = "myapikey";
 /// `MYAPIKEY_HOME` 覆盖（测试/便携）环境使用的隔离 service 名。
 ///
 /// 这些环境的凭据条目必须与正式安装分开：不仅避免测试互相串扰，
 /// 更防止隔离环境里的清理操作（如锁定清除记住密码）误删真实条目。
+/// 命名历史独立，不随 D57 改名（隔离条目无跨版本迁移语义）。
 const SERVICE_ISOLATED: &str = "myapikey-isolated";
 /// 凭据库 account 名（多 vault 预留）。
 const ACCOUNT: &str = "default";
@@ -165,12 +177,101 @@ pub fn delete(dirs: &AppDirs) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 /// 从凭据库读密码；后端不可用或无条目一律 `Ok(None)`（降级为手动输入）。
+///
+/// D57 迁移：新 service 名下无条目时回退读旧名（`myapikey`）——命中即
+/// 迁入新名（写回）+ 日志留痕。隔离环境跳过回退（[`SERVICE_ISOLATED`]
+/// 无历史条目，没有迁移语义）。
 fn get_raw(dirs: &AppDirs) -> Option<String> {
-    let entry = keyring::Entry::new(service_of(dirs), ACCOUNT).ok()?;
-    entry.get_password().ok()
+    let svc = service_of(dirs);
+    let legacy_svc = if dirs.from_env {
+        None
+    } else {
+        Some(SERVICE_LEGACY)
+    };
+    get_with_migration(svc, legacy_svc, ACCOUNT, &dirs.config_dir)
 }
 
-/// 直接写凭据库（不带 TTL）。
+/// 迁移完成标记文件（放应用 config 目录，存在即表示遗留条目已清账）。
+/// 仅 macOS 使用（防授权弹窗反复的标记；其他平台凭据库回退无弹窗成本，
+/// 不需要标记——见 [`get_with_migration`]）。
+#[cfg(target_os = "macos")]
+const MIGRATED_FLAG: &str = "keychain-migrated.flag";
+
+/// 按「当前 service + 可选遗留 service」读取的迁移式读取核心。
+///
+/// 供 [`get_raw`]、github.rs 的令牌读取与 macOS 专属测试共用：新条目
+/// 命中直接返回；miss 且给定了遗留名时读遗留条目，命中即迁移（写回
+/// 新名，失败静默——迁移写回只是优化，下次会再触发回退，不丢失数据）。
+/// 两次读取都失败返回 `None`。
+///
+/// D57 增补——**迁移标记（仅 macOS）**：命中迁移、或确认遗留条目根本
+/// 不存在（NoEntry）时写 [`MIGRATED_FLAG`]；标记存在则不再回退读取。
+/// 动因：TTL 到期/锁定清理只删新名条目，若无标记，macOS 上每个清理
+/// 周期后都会再次回退读遗留条目、反复触发授权弹窗（实测）。保守边界
+/// ——遗留条目「存在但读取失败」（如授权被拒）不写标记，下次仍会尝试。
+///
+/// **2026-11-13 Windows 实测修正——标记必须平台门控**：标记是全局一个
+/// 文件，而主密码副本与 GitHub 令牌是两条独立迁移线——主密码先迁移
+/// 落标记后，令牌的回退读取被标记误杀，导致已绑定用户被折叠成
+/// standalone（靶机真实数据复现）。Windows/Linux 凭据库无授权弹窗
+/// 成本，回退永远安全，标记逻辑 `cfg` 门控为 macOS 专属。
+pub(crate) fn get_with_migration(
+    service: &str,
+    legacy_service: Option<&str>,
+    account: &str,
+    config_dir: &std::path::Path,
+) -> Option<String> {
+    let current = keyring::Entry::new(service, account).ok()?;
+    if let Ok(p) = current.get_password() {
+        return Some(p);
+    }
+    // 非 macOS 不用标记（config_dir 仅 macOS 的防弹窗标记需要）
+    #[cfg(not(target_os = "macos"))]
+    let _ = config_dir;
+    let legacy_service = legacy_service?;
+    #[cfg(target_os = "macos")]
+    {
+        let flag = config_dir.join(MIGRATED_FLAG);
+        if flag.exists() {
+            return None;
+        }
+    }
+    let legacy_entry = keyring::Entry::new(legacy_service, account).ok()?;
+    match legacy_entry.get_password() {
+        // 命中迁移：写回新条目 + 直接返回迁移值（不再回读新条目——少
+        // 一次凭据库访问，macOS 上少一次弹窗风险）。**标记只在写回成功
+        // 后落**：写回失败（凭据库写异常，如 Windows 非交互会话）时若
+        // 落标记，下次新条目 miss + 标记挡回退 = 副本静默丢失
+        Ok(p) => {
+            crate::log::info(
+                "keychain",
+                "legacy service entry hit (myapikey); migrating passphrase copy to makara",
+            );
+            let written = current.set_password(&p).is_ok();
+            #[cfg(target_os = "macos")]
+            if written {
+                let _ = std::fs::write(config_dir.join(MIGRATED_FLAG), "1");
+            }
+            // 非 macOS 不落标记，written 无人消费——显式消化免 unused 警告
+            #[cfg(not(target_os = "macos"))]
+            let _ = written;
+            Some(p)
+        }
+        // 旧条目根本不存在：无可迁移之物，标记后永不再回退（仅 macOS
+        // 需要标记防弹窗；其他平台条目不存在本就无害）
+        Err(keyring::Error::NoEntry) => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::fs::write(config_dir.join(MIGRATED_FLAG), "1");
+            }
+            None
+        }
+        // 存在但读取失败（授权被拒/后端异常）：保守不标记，下次重试
+        Err(_) => None,
+    }
+}
+
+/// 直接写凭据库（不带 TTL）。始终写新 service 名（[`SERVICE`]）。
 ///
 /// # Errors
 /// - [`Error::Keyring`]：后端不可用或写入失败。
@@ -182,20 +283,35 @@ fn set_raw(dirs: &AppDirs, passphrase: &str) -> Result<()> {
         .map_err(|e| Error::Keyring(format!("failed to write to credential store: {e}")))
 }
 
-/// 直接删凭据库条目。
+/// 直接删凭据库条目。D57 起对旧 service 名条目**尽力删除、失败静默**：
+/// `forget` 的语义是清掉所有记住的副本，残留旧条目等于留下孤儿密码；
+/// 而 macOS 上读路径（解锁）已对旧条目授权过，删除自然免弹——未授权
+/// 的场景删除失败也不值得为它失败（残留由用户手动清理）。
 ///
 /// # Errors
-/// - [`Error::Keyring`]：条目存在但删除失败。
+/// - [`Error::Keyring`]：新名条目存在但删除失败。
 fn delete_raw(dirs: &AppDirs) -> Result<bool> {
     let entry = keyring::Entry::new(service_of(dirs), ACCOUNT)
         .map_err(|e| Error::Keyring(format!("failed to open credential store entry: {e}")))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(e) => Err(Error::Keyring(format!(
-            "failed to delete credential store entry: {e}"
-        ))),
+    let mut removed = match entry.delete_credential() {
+        Ok(()) => true,
+        Err(keyring::Error::NoEntry) => false,
+        Err(e) => {
+            return Err(Error::Keyring(format!(
+                "failed to delete credential store entry: {e}"
+            )));
+        }
+    };
+    if !dirs.from_env {
+        if let Ok(legacy) = keyring::Entry::new(SERVICE_LEGACY, ACCOUNT) {
+            // 旧条目删成功也算「清掉了记住的副本」——只删掉新条目
+            // NoEntry 而旧条目清掉的场合，forget 报 false 是误报
+            if legacy.delete_credential().is_ok() {
+                removed = true;
+            }
+        }
     }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -259,5 +375,103 @@ mod tests {
         .unwrap();
         assert_eq!(expires_at(&dirs).unwrap(), None);
         let _ = std::fs::remove_dir_all(dirs.config_dir);
+    }
+
+    /// D57 迁移核心（[`get_with_migration`]）的行为测试：自建一对测试
+    /// service 条目验证「旧名命中 → 迁移写回新名 → 再读走新名」。条目
+    /// 由本测试创建（创建者隐式授权，不触发弹窗），结束即清理；keyring
+    /// 后端不可用（无头 Linux）时整段断言无意义，直接跳过。
+    /// 仅 macOS 跑：Windows/Linux CI 的凭据库语义与开发机差异大，且
+    /// 本测试的治理目标（授权弹窗）是 macOS 特有，其余平台由既有
+    /// 集成测试与真机冒烟覆盖。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn migration_moves_entry_from_legacy_to_current_service() {
+        use uuid::Uuid;
+
+        // 随机 service 名：测试自隔离，绝不触碰真实 makara/myapikey 条目
+        let svc = format!("mak-test-{}", Uuid::now_v7().simple());
+        let legacy_svc = format!("mak-test-legacy-{}", Uuid::now_v7().simple());
+        let acct = "test";
+        let dir = std::env::temp_dir().join(format!(
+            "mak-migration-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flag = dir.join(MIGRATED_FLAG);
+        let write = |service: &str, value: &str| {
+            keyring::Entry::new(service, acct)
+                .unwrap()
+                .set_password(value)
+                .unwrap();
+        };
+        let read_current = |service: &str| {
+            keyring::Entry::new(service, acct)
+                .unwrap()
+                .get_password()
+                .ok()
+        };
+        let cleanup = || {
+            for s in [&svc, &legacy_svc] {
+                if let Ok(e) = keyring::Entry::new(s, acct) {
+                    let _ = e.delete_credential();
+                }
+            }
+        };
+        cleanup(); // 防理论上的同名碰撞（uuid 碰撞可忽略，防御性清理）
+        write(&legacy_svc, "old-passphrase");
+        assert_eq!(read_current(&svc), None, "新条目尚未存在");
+
+        // 第一次读：新名 miss → 旧名命中 → 迁移写回 + 落标记
+        let got = get_with_migration(&svc, Some(&legacy_svc), acct, &dir);
+        assert_eq!(got.as_deref(), Some("old-passphrase"));
+        assert!(flag.exists(), "迁移完成应落标记");
+        // 迁移落地：新条目已存在（下次读取不再回退）
+        assert_eq!(
+            read_current(&svc).as_deref(),
+            Some("old-passphrase"),
+            "迁移应写入新条目"
+        );
+        // 第二次读：直接走新条目
+        assert_eq!(
+            get_with_migration(&svc, Some(&legacy_svc), acct, &dir).as_deref(),
+            Some("old-passphrase")
+        );
+
+        // 标记生效（D57 增补的核心）：清掉新条目后读取**不再回退**——
+        // TTL 清理周期后不得反复回退读遗留条目触发授权弹窗
+        keyring::Entry::new(&svc, acct)
+            .unwrap()
+            .delete_credential()
+            .unwrap();
+        assert_eq!(
+            get_with_migration(&svc, Some(&legacy_svc), acct, &dir),
+            None
+        );
+
+        // 无遗留条目（NoEntry）也落标记：防某些环境反复撞弹窗授权
+        // （前提：先删标记，否则标记存在时不会走到遗留读取）
+        cleanup();
+        let _ = std::fs::remove_file(&flag);
+        assert_eq!(
+            get_with_migration(&svc, Some(&legacy_svc), acct, &dir),
+            None
+        );
+        assert_eq!(
+            std::fs::read_to_string(&flag).unwrap(),
+            "1",
+            "NoEntry 应落标记"
+        );
+        // 遗留名 None（隔离语义）：只读当前，miss 即 None
+        write(&svc, "current-only");
+        assert_eq!(
+            get_with_migration(&svc, None, acct, &dir).as_deref(),
+            Some("current-only")
+        );
+        cleanup();
     }
 }

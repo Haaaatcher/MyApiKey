@@ -114,9 +114,14 @@ export function mockInvoke<T>(cmd: string, rawArgs?: Record<string, unknown>): P
       return ok({
         initialized: s.initialized,
         unlocked: s.unlocked,
-        has_remembered: s.initialized, // mock：初始化过就允许一键解锁
         git_ok: !localStorage.getItem("mak-mock-no-git"), // 调试开关：置 mak-mock-no-git 可预览 git 缺失引导页
       } as T);
+    case "remembered_status":
+      // 调试开关：置 mak-mock-no-remember 可预览解锁页（含 D57 引导条）
+      return ok((s.initialized && !localStorage.getItem("mak-mock-no-remember")) as T);
+    case "keychain_hint":
+      // mock 常显 true：便于浏览器目检解锁页引导条样式
+      return ok(true as T);
     case "init_start": {
       if (s.initialized) return err("already initialized on this machine");
       // 两阶段（对齐真实后端）：init_start 不再收主密码。

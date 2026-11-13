@@ -3,10 +3,15 @@
 //!
 //! 发布版隐藏控制台（`windows_subsystem`），开发版保留便于看日志。
 //!
-//! 窗口与托盘策略（2026-10-25 需求）：
-//! - **关闭与最小化都收进系统托盘**，进程与解锁会话保活——从托盘
+//! 窗口与托盘策略（2026-10-25 需求；平台行为矩阵见 D54）：
+//! - **关闭收进系统托盘**（两端一致），进程与解锁会话保活——从托盘
 //!   恢复窗口时仍是离开时的状态，不必重输主密码；
-//! - 托盘菜单提供「显示主窗口 / 退出」，只有显式退出才结束进程；
+//! - **最小化**：Windows 藏窗、任务栏不占位；macOS 走系统默认进
+//!   Dock（「兼容 macOS 习惯」的唯一实质差异，D54）；
+//! - 托盘/菜单栏菜单提供「显示主窗口 / 退出」，只有显式退出才结束
+//!   进程；macOS 另有系统默认菜单的 Cmd+Q（tauri 未设菜单时自动挂载）；
+//! - **Dock 图标点击恢复窗口**（macOS Reopen 事件，关窗收托盘后
+//!   Dock 是除托盘外的另一唤起入口）；
 //! - **单实例**：二次启动不创建新进程，而是把已有窗口调到前台
 //!   （tauri-plugin-single-instance，官方插件）。
 
@@ -106,13 +111,16 @@ fn main() {
             myapikey_core::log::info("app", "startup");
 
             let refresh_handle = app.handle().clone();
+            let refresh_shared = std::sync::Arc::clone(&shared);
             std::thread::spawn(move || {
                 // 错开启动 IO 尖峰;晚几秒续期无影响(提前量 10 分钟)
                 std::thread::sleep(Duration::from_secs(2));
                 let Ok(client_id) = myapikey_core::github::effective_client_id() else {
                     return;
                 };
-                if let Err(e) = myapikey_core::github::try_refresh_if_expired(&client_id) {
+                if let Err(e) =
+                    myapikey_core::github::try_refresh_if_expired(&refresh_shared.dirs, &client_id)
+                {
                     // 完整原因落文件日志;网络抖动不再 emit(2026-11-05):
                     // 只有 GitHub 明确拒绝才弹「授权已失效」引导
                     let msg = e.to_string();
@@ -208,8 +216,11 @@ fn main() {
                     api.prevent_close();
                     let _ = window.hide();
                 }
-                // 最小化：直接藏进托盘，任务栏不占位（用户 2026-10-25 要求）
+                // 最小化：Windows 藏窗、任务栏不占位（用户 2026-10-25 要求）；
+                // macOS 走系统默认进 Dock（D54：「兼容 macOS 习惯」的唯一
+                // 实质差异），Dock 图标点击由 run 回调的 Reopen 事件恢复
                 WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
+                    #[cfg(not(target_os = "macos"))]
                     let _ = window.hide();
                 }
                 _ => {}
@@ -218,6 +229,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             set_ui_lang,
             commands::gui_state,
+            commands::keychain_hint,
+            commands::remembered_status,
             commands::unlock,
             commands::unlock_remembered,
             commands::lock,
@@ -251,6 +264,18 @@ fn main() {
             commands::check_update,
             commands::apply_update,
         ])
-        .run(tauri::generate_context!())
-        .expect("tauri 应用启动失败");
+        .build(tauri::generate_context!())
+        .expect("tauri 应用启动失败")
+        .run(|app_handle, event| {
+            // Dock 图标点击恢复窗口（macOS applicationShouldHandleReopen；
+            // D54：关窗收托盘后，Dock 与托盘是并列的两个唤起入口）。
+            // Reopen 变体仅 macOS 存在（tauri 侧 cfg 门控），全限定路径
+            // 避免其他平台出现未使用导入
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main_window(app_handle);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app_handle, event);
+        });
 }

@@ -227,7 +227,7 @@ mod tests {
             rec(id_b, "stale-import", "2026-11-01T00:00:00Z"),
             rec(id_new, "brand-new", "2020-01-01T00:00:00Z"),
         ];
-        let (report) = import_records(&mut data, imported, now);
+        let report = import_records(&mut data, imported, now);
         assert_eq!((report.added, report.updated), (1, 0), "仅新 id 计入 added");
         assert_eq!(report.overwritten.len(), 0, "无覆盖");
         assert_eq!(data.records.len(), 3);

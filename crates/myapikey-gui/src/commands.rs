@@ -45,6 +45,27 @@ pub async fn gui_state(state: State<'_, SharedState>) -> Result<crate::GuiState,
         .map_err(|e| err_str(&e))
 }
 
+/// 解锁页钥匙串授权引导（D57）：新构建首次为 true，检测即确认（写回
+/// 构建指纹）。文件 IO 放线程池。
+#[tauri::command]
+pub async fn keychain_hint(state: State<'_, SharedState>) -> Result<bool, String> {
+    let shared = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || crate::keychain_hint(&shared))
+        .await
+        .map_err(|e| join_err(&e))
+}
+
+/// 「一键解锁」可用性（读凭据库，可能触发系统授权弹窗——独立于
+/// `gui_state`，保证首帧先渲染，2026-11-13 拆分，放线程池）。
+#[tauri::command]
+pub async fn remembered_status(state: State<'_, SharedState>) -> Result<bool, String> {
+    let shared = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || crate::remembered_status(&shared))
+        .await
+        .map_err(|e| join_err(&e))?
+        .map_err(|e| err_str(&e))
+}
+
 /// 手动输入解锁（Argon2 派生约 1 秒，放线程池）。
 #[tauri::command]
 pub async fn unlock(passphrase: String, state: State<'_, SharedState>) -> Result<(), String> {

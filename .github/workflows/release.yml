@@ -4,8 +4,9 @@
 # - 推送 v* 标签：构建三平台二进制并创建 GitHub Release；
 # - 手动触发（workflow_dispatch）：只构建并上传 artifact（不打 Release）。
 #
-# 产物：每个目标平台一个压缩包，内含 mak 与 myapikey 两个等价二进制；
-# 另有 Windows GUI 的 NSIS 安装包（Tauri 2，见 build-windows-gui job）。
+# 产物：每个目标平台一个压缩包（平铺单 bin makara，D40）；
+# 另有 Windows GUI 的 NSIS 安装包（build-windows-gui job）与
+# macOS GUI 的 dmg 安装包（build-macos-gui job，D54）。
 # macOS 提供 aarch64（Apple Silicon）与 x86_64 两个包。
 #
 # 已知限制（如实记录）：未购买 Apple 开发者账号，产物未签名/公证，
@@ -162,10 +163,67 @@ jobs:
             target/release/bundle/nsis/*.sig
           if-no-files-found: error
 
+  # macOS GUI 安装包（dmg，仅 Apple Silicon，D26/D54）。人装 = dmg；
+  # updater 机制件 .app.tar.gz + .sig 由 createUpdaterArtifacts 自动产出，
+  # 是 latest.json darwin-aarch64 键的指向目标（dmg 本身不进更新清单）
+  build-macos-gui:
+    name: build macos-gui (dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/myapikey-gui/ui/package-lock.json
+
+      - name: Install UI deps
+        working-directory: crates/myapikey-gui/ui
+        run: npm ci
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          key: macos-gui
+
+      # 与 Windows GUI job 同款注入：core 的 build.rs 从仓库根与 crate
+      # 目录两处读 client-secret.txt（缺注入 = 用户自动续期失败）
+      - name: Inject GitHub App client secret (embedded, GUI)
+        shell: bash
+        env:
+          MYAPIKEY_CLIENT_SECRET: ${{ secrets.MYAPIKEY_CLIENT_SECRET }}
+        run: |
+          printf '%s' "$MYAPIKEY_CLIENT_SECRET" > client-secret.txt
+          printf '%s' "$MYAPIKEY_CLIENT_SECRET" > crates/myapikey-core/client-secret.txt
+
+      - name: Build GUI bundle
+        working-directory: crates/myapikey-gui
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ui/node_modules/.bin/tauri build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: myapikey-macos-gui-bundle
+          path: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.app.tar.gz
+            target/release/bundle/macos/*.app.tar.gz.sig
+          if-no-files-found: error
+
   # 仅打标签时创建 Release 并挂上全部产物
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, build-windows-gui]
+    needs: [build, build-windows-gui, build-macos-gui]
     runs-on: ubuntu-24.04
     steps:
       - name: Download all artifacts
@@ -182,25 +240,38 @@ jobs:
       - name: Generate updater latest.json
         run: |
           python3 - <<'PYEOF'
-          import json, glob, os, datetime
+          import json, glob, os, datetime, sys
           tag = os.environ['GITHUB_REF_NAME']
           version = tag.lstrip('v')
-          # 品牌更名（2026-11-09）后产物名 Makara_<version>_*：glob 必须跟上，
-          # 找不到签名文件会让 release job 崩溃（D52 修复的第二个发版定时炸弹）
-          sig = glob.glob(f'dist/**/Makara_{version}_*.sig', recursive=True)[0]
-          exe = sig[:-len('.sig')]
-          name = os.path.basename(exe)
+          # 品牌更名（2026-11-09）后产物名 Makara_<version>_*：glob 必须跟上。
+          # 缺产物时明确报错退出而非裸 IndexError——错误信息直指对应的
+          # 构建 job（2026-11-13 审查建议）。D54 起 latest.json 覆盖双平台键：
+          # windows-x86_64（nsis 安装包）与 darwin-aarch64（.app.tar.gz 机制件，
+          # 人装的 dmg 不进更新清单）
+          platforms = {}
+          win_sigs = glob.glob(f'dist/**/Makara_{version}_*.sig', recursive=True)
+          if not win_sigs:
+              sys.exit('发布中止：未找到 Windows 安装包签名件（期望 dist/**/Makara_<版本>_x64-setup.exe.sig）——检查 build-windows-gui job 是否成功且签名 secret 已注入')
+          win_sig = win_sigs[0]
+          win_exe = win_sig[:-len('.sig')]
+          platforms['windows-x86_64'] = {
+              'signature': open(win_sig).read().strip(),
+              'url': f'https://github.com/Haaaatcher/MyApiKey/releases/download/{tag}/{os.path.basename(win_exe)}',
+          }
+          mac_artifacts = glob.glob('dist/**/Makara*.app.tar.gz', recursive=True)
+          if not mac_artifacts:
+              sys.exit('发布中止：未找到 macOS updater 机制件（期望 dist/**/Makara*.app.tar.gz）——检查 build-macos-gui job 是否成功')
+          mac_artifact = mac_artifacts[0]
+          platforms['darwin-aarch64'] = {
+              'signature': open(mac_artifact + '.sig').read().strip(),
+              'url': f'https://github.com/Haaaatcher/MyApiKey/releases/download/{tag}/{os.path.basename(mac_artifact)}',
+          }
           doc = {
               'version': version,
               'notes': 'See the release page for details.',
               'pub_date': datetime.datetime.now(datetime.timezone.utc)
                   .isoformat(timespec='seconds').replace('+00:00', 'Z'),
-              'platforms': {
-                  'windows-x86_64': {
-                      'signature': open(sig).read().strip(),
-                      'url': f'https://github.com/Haaaatcher/MyApiKey/releases/download/{tag}/{name}',
-                  }
-              },
+              'platforms': platforms,
           }
           with open('latest.json', 'w') as f:
               json.dump(doc, f, ensure_ascii=False, indent=2)
@@ -216,5 +287,7 @@ jobs:
             dist/**/*.zip
             dist/**/*.sha256
             dist/**/*.exe
+            dist/**/*.dmg
+            dist/**/*.app.tar.gz
             dist/**/*.sig
             latest.json
