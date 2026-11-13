@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/logo.png" width="140" alt="MyApiKey logo" />
+<img src="assets/logo.png" width="140" alt="Makara logo" />
 
-# MyApiKey
+# Makara
 
 **跨平台的 AI API 凭证记录与同步工具**
 
@@ -21,7 +21,7 @@
 ---
 
 > [!IMPORTANT]
-> 当前状态：**v1.2.1 已发布**（M0 – M5 完成）。CLI 从源码安装：`cargo install --git https://github.com/Haaaatcher/MyApiKey`；窗口应用（Tauri 2，Windows 与 macOS Apple Silicon）安装包与各平台 CLI 见 [Release](../../releases)。
+> 当前状态：**v1.2.1 已发布**（M0 – M5 完成）。CLI 从源码安装：`cargo install --git https://github.com/Haaaatcher/Makara`；窗口应用（Tauri 2，Windows 与 macOS Apple Silicon）安装包与各平台 CLI 见 [Release](../../releases)。
 
 ## ✨ 特性
 

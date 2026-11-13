@@ -256,7 +256,7 @@ jobs:
           win_exe = win_sig[:-len('.sig')]
           platforms['windows-x86_64'] = {
               'signature': open(win_sig).read().strip(),
-              'url': f'https://github.com/Haaaatcher/MyApiKey/releases/download/{tag}/{os.path.basename(win_exe)}',
+              'url': f'https://github.com/' + os.environ.get('GITHUB_REPOSITORY', 'Haaaatcher/Makara') + '/releases/download/{tag}/{os.path.basename(win_exe)}',
           }
           mac_artifacts = glob.glob('dist/**/Makara*.app.tar.gz', recursive=True)
           if not mac_artifacts:
@@ -264,7 +264,7 @@ jobs:
           mac_artifact = mac_artifacts[0]
           platforms['darwin-aarch64'] = {
               'signature': open(mac_artifact + '.sig').read().strip(),
-              'url': f'https://github.com/Haaaatcher/MyApiKey/releases/download/{tag}/{os.path.basename(mac_artifact)}',
+              'url': f'https://github.com/' + os.environ.get('GITHUB_REPOSITORY', 'Haaaatcher/Makara') + '/releases/download/{tag}/{os.path.basename(mac_artifact)}',
           }
           doc = {
               'version': version,

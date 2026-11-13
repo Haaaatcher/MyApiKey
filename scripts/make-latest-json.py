@@ -22,7 +22,7 @@ import json
 import pathlib
 import sys
 
-REPO = "Haaaatcher/MyApiKey"
+REPO = "Haaaatcher/Makara"
 BUNDLE_DIR = pathlib.Path("target/release/bundle")
 
 

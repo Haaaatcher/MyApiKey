@@ -1,4 +1,4 @@
-# MyApiKey 使用指南
+# Makara 使用指南
 
 > 加密记录你的 AI API 凭证（`base_url` + `api_key`），并通过你自己的 GitHub 私有仓库同步到所有设备（零外部依赖：不需要安装 git）。
 > 程序界面为英文，本指南为中文说明。
@@ -261,13 +261,13 @@ Options:
 
 ```bash
 # 方式一：源码安装（当前可用，需要 Rust 工具链）
-cargo install --git https://github.com/Haaaatcher/MyApiKey
+cargo install --git https://github.com/Haaaatcher/Makara
 
 # 无桌面环境的 Linux 服务器（无 D-Bus / libdbus 开发库）：
-cargo install --git https://github.com/Haaaatcher/MyApiKey --no-default-features
+cargo install --git https://github.com/Haaaatcher/Makara --no-default-features
 
 # 方式二：下载预编译可执行文件（发布后可用，零依赖）
-# → GitHub Releases: https://github.com/Haaaatcher/MyApiKey/releases
+# → GitHub Releases: https://github.com/Haaaatcher/Makara/releases
 ```
 
 安装后得到两个等价命令：`makara`（短）与 `myapikey`（全称）。
