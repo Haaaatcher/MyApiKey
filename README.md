@@ -9,7 +9,7 @@
 `base_url` + `api_key` · 加密存储 · GitHub 同步 · 多设备
 
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational)
-![Status](https://img.shields.io/badge/status-v1.0.0-blue)
+![Status](https://img.shields.io/badge/status-v1.2.1-blue)
 ![Rust](https://img.shields.io/badge/rust-stable-dea584?logo=rust)
 ![GUI](https://img.shields.io/badge/GUI-Tauri%202-blue)
 ![License](https://img.shields.io/badge/license-PolyForm--NC%201.0.0-blue)
@@ -21,7 +21,7 @@
 ---
 
 > [!IMPORTANT]
-> 当前状态：**v1.0.0 已发布**（M0 – M4 完成）。CLI 从源码安装：`cargo install --git https://github.com/Haaaatcher/MyApiKey`；Windows 窗口应用（Tauri 2）安装包与各平台 CLI 见 [Release](../../releases)。
+> 当前状态：**v1.2.1 已发布**（M0 – M5 完成）。CLI 从源码安装：`cargo install --git https://github.com/Haaaatcher/MyApiKey`；窗口应用（Tauri 2，Windows 与 macOS Apple Silicon）安装包与各平台 CLI 见 [Release](../../releases)。
 
 ## ✨ 特性
 
@@ -31,7 +31,7 @@
 - 🐙 **GitHub 一键初始化** —— `makara init` 交互中选同步即可：浏览器授权一次，自动创建/识别私有同步仓库；选否则纯单机使用
 - 🩺 **key 校验** —— 按协议调 `GET /models` 探测 key 状态：有效 / 无效 / 无法验证，失败不阻塞保存
 - 🏷️ **协议即标签** —— OpenAI（Responses）/ OpenAI Chat / Anthropic（Messages）/ Anthropic Complete / 自定义，由用户手填，兼容任意三方平台与网关，不做自动推断
-- 🖥️ **双形态** —— CLI（`myapikey` / `makara`，三平台）+ 窗口应用（Tauri 2，首发 Windows）：宽屏多列卡片列表 / 编辑草稿防丢 / 全字段行内校验 / 设置 / 同步，空闲自动锁，复制到剪贴板的 key 30 秒后自动清空，托盘常驻 + 单实例
+- 🖥️ **双形态** —— CLI（`myapikey` / `makara`，三平台）+ 窗口应用（Tauri 2，Windows 与 macOS）：宽屏多列卡片列表 / 编辑草稿防丢 / 全字段行内校验 / 设置 / 同步，空闲自动锁，复制到剪贴板的 key 30 秒后自动清空，托盘常驻 + 单实例
 - 🔎 **模糊搜索** —— 两端同源评分（fzf 风格）：子串精确优先、URL 按斜线分词、备注可搜，协议类型也可搜（OpenAI / Anthropic / 形态词）；CLI `makara search`，GUI 逐键即时过滤
 - ⬆️ **应用内更新** —— GUI 设置页检查更新，下载 + Ed25519 验签 + 静默安装一条龙；CLI `makara update` 零依赖自更新（下载 Release 压缩包替换自身，无需 cargo）；破坏性版本自动拦截引导手动升级
 
@@ -134,7 +134,7 @@ cargo fmt           # 格式化
 - [x] M3 打磨与发布（导入导出、自动锁、剪贴板清除、三平台 CI 产物 + Windows NSIS 安装包、Linux 无头安装 `--no-default-features`）
 - [x] 追加：体验打磨（应用内更新 D16、两端模糊搜索、CLI dialoguer 交互菜单、三批代码审查修复，2026-10-26）
 - [x] M4 零外部依赖（D25，2026-10-29）：移除系统 git，同步改 GitHub API 直连（嵌入式 git 因 gitoxide push 未实现不可行）；应用不再要求安装 git
-- [ ] M5 macOS GUI 适配（D26/D54，进行中）：窗口应用发布 macOS 版，仅支持 Apple Silicon（M 系列，aarch64）
+- [x] M5 macOS GUI 适配（D26/D54，v1.2.1 发布，2026-11-13）：窗口应用发布 macOS 版，仅支持 Apple Silicon（M 系列，aarch64，dmg 安装 + 应用内更新）；同批凭据治理——凭据库条目改名 makara 并自动迁移、macOS 令牌改本地凭据文件（钥匙串授权弹窗 4 → 1）、绑定后立即对账与三层同步修复（D55–D57）
 
 决策记录与完整设计见 [docs/design.md](docs/design.md)。
 
