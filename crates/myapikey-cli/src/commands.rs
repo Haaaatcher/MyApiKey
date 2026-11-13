@@ -769,7 +769,7 @@ pub fn check(target: Option<&str>) -> Result<()> {
             table::pad_to(status.label(), 12),
             table::pad_to(&table::truncate_width(&r.name, 18), 18),
             r.base_url,
-            http.map(|h| format!("(HTTP {h})")).unwrap_or_default()
+            http.map_or_default(|h| format!("(HTTP {h})"))
         );
     } else {
         // 全部：核心层并发探测（2026-10-31 一键检测全部）——总耗时从
@@ -787,7 +787,7 @@ pub fn check(target: Option<&str>) -> Result<()> {
                 table::pad_to(status.label(), 12),
                 table::pad_to(&table::truncate_width(&r.name, 18), 18),
                 r.base_url,
-                http.map(|h| format!("(HTTP {h})")).unwrap_or_default()
+                http.map_or_default(|h| format!("(HTTP {h})"))
             );
         }
     }
@@ -813,7 +813,7 @@ fn run_probe(c: &Ctx, data: &VaultData, id: &uuid::Uuid) {
     println!(
         "Key check: {} {}",
         status.label(),
-        http.map(|h| format!("(HTTP {h})")).unwrap_or_default()
+        http.map_or_default(|h| format!("(HTTP {h})"))
     );
     let mut cache = check_cache::CheckCache::load(&c.dirs);
     cache.put(*id, status, http);
